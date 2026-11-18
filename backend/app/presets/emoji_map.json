@@ -1,0 +1,17 @@
+{
+  "_doc": "Keyword -> emoji used by the auto-emoji feature. Matching is on lowercased word stems (prefix match). PNGs live in backend/assets/emoji/<codepoints>.png.",
+  "money": "💰", "cash": "💵", "dollar": "💵", "rich": "🤑", "million": "💸", "billion": "💸", "pay": "💵", "price": "🏷️", "profit": "📈",
+  "fire": "🔥", "hot": "🔥", "lit": "🔥", "insane": "🤯", "crazy": "🤯", "mind": "🤯", "shock": "😱", "scared": "😱", "scary": "😱",
+  "laugh": "😂", "funny": "😂", "joke": "😂", "lol": "😂", "cry": "😭", "sad": "😢",
+  "love": "❤️", "heart": "❤️", "hate": "😤", "angry": "😡", "mad": "😡",
+  "win": "🏆", "winner": "🏆", "champion": "🏆", "best": "🥇", "first": "🥇", "goal": "🎯", "target": "🎯",
+  "time": "⏰", "fast": "⚡", "quick": "⚡", "speed": "⚡", "energy": "⚡", "power": "💪", "strong": "💪", "gym": "💪", "work": "💼",
+  "business": "💼", "brain": "🧠", "smart": "🧠", "think": "🤔", "idea": "💡", "secret": "🤫", "truth": "💯", "real": "💯", "facts": "💯",
+  "stop": "🛑", "no": "🚫", "never": "🚫", "warning": "⚠️", "danger": "⚠️", "dead": "💀", "die": "💀",
+  "car": "🚗", "house": "🏠", "home": "🏠", "phone": "📱", "game": "🎮", "gaming": "🎮", "music": "🎵", "song": "🎵",
+  "eat": "🍔", "food": "🍔", "water": "💧", "world": "🌍", "growth": "📈", "grow": "📈", "up": "📈", "down": "📉",
+  "rocket": "🚀", "launch": "🚀", "start": "🚀", "god": "🙏", "pray": "🙏", "please": "🙏", "thank": "🙏",
+  "eyes": "👀", "look": "👀", "watch": "👀", "see": "👀", "wow": "😮", "omg": "😱", "yes": "✅", "right": "✅", "wrong": "❌",
+  "king": "👑", "queen": "👑", "boss": "😎", "cool": "😎", "party": "🎉", "celebrate": "🎉", "birthday": "🎂",
+  "baby": "👶", "family": "👨‍👩‍👧", "friend": "🤝", "deal": "🤝", "team": "🤝", "learn": "📚", "book": "📚", "school": "🏫"
+}

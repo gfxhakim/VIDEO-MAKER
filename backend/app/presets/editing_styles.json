@@ -1,0 +1,53 @@
+{
+  "_doc": "Editing style presets. 'layout' picks the reframing engine in app/pipeline/reframe.py. Add a new preset by copying one block; only 'layout' must be a known engine.",
+  "face_track_zoom": {
+    "name": "Dynamic Face-Tracking Zoom",
+    "description": "Smooth camera follows the active face, with punch-in zooms on high-energy words.",
+    "layout": "face_track",
+    "zoom_on_emphasis": true,
+    "zoom_amount": 1.18,
+    "smoothing": 0.82,
+    "dead_zone": 0.06,
+    "caption_y": 0.62,
+    "hook_card": false
+  },
+  "talking_head": {
+    "name": "Talking Head Clean Cut",
+    "description": "Locked-off crop on the speaker. Calm, clean, no camera moves.",
+    "layout": "face_static",
+    "zoom_on_emphasis": false,
+    "caption_y": 0.68,
+    "hook_card": false
+  },
+  "podcast_split": {
+    "name": "Podcast Split-Screen",
+    "description": "Two speakers stacked top and bottom. Falls back to face tracking when only one person is on screen.",
+    "layout": "split_faces",
+    "caption_y": 0.5,
+    "hook_card": false
+  },
+  "gaming_fast": {
+    "name": "Gaming / Action Fast-Paced",
+    "description": "Gameplay on top, facecam on the bottom, quick zooms and a punchy hook line.",
+    "layout": "gameplay_facecam",
+    "zoom_on_emphasis": true,
+    "zoom_amount": 1.12,
+    "caption_y": 0.5,
+    "hook_card": false
+  },
+  "blur_fill_reaction": {
+    "name": "Blurred Fill + Hook Title",
+    "description": "Full 16:9 frame over a blurred backdrop with a white hook-title card on top (stream-clip / reaction look).",
+    "layout": "blur_fill",
+    "foreground_y": 0.5,
+    "caption_y": 0.74,
+    "hook_card": true
+  },
+  "center_crop": {
+    "name": "Simple Center Crop",
+    "description": "Fastest render. Plain 9:16 center crop, no analysis.",
+    "layout": "center",
+    "caption_y": 0.66,
+    "hook_card": false
+  }
+}
