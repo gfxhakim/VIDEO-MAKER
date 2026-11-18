@@ -74,6 +74,7 @@ class ClipOut(BaseModel):
     hashtags: list[str]
     status: str
     review_status: str
+    posted: dict[str, Any]
     error: Optional[str]
     video_url: Optional[str]
     thumb_url: Optional[str]
@@ -98,57 +99,6 @@ class MusicOut(BaseModel):
     url: str
 
 
-class AccountOut(BaseModel):
-    id: int
+class PostedUpdate(BaseModel):
     platform: str
-    display_name: str
-    external_id: str
-    avatar_url: Optional[str]
-    enabled: bool
-    daily_limit: int
-    min_interval_minutes: int
-    token_expires_at: Optional[datetime]
-    connected: bool
-    created_at: datetime
-
-
-class AccountUpdate(BaseModel):
-    enabled: Optional[bool] = None
-    daily_limit: Optional[int] = Field(None, ge=1, le=100)
-    min_interval_minutes: Optional[int] = Field(None, ge=5, le=24 * 60)
-    display_name: Optional[str] = None
-
-
-class ScheduleRequest(BaseModel):
-    clip_ids: list[int]
-    account_ids: list[int]
-    start_at: Optional[datetime] = None  # UTC; None = now
-    interval_minutes: int = Field(60, ge=0, le=7 * 24 * 60)  # gap between clips on the same account
-    account_offset_minutes: int = Field(7, ge=0, le=24 * 60)  # stagger between accounts
-    jitter_minutes: int = Field(5, ge=0, le=120)
-    privacy: str = "public"
-    publish_now: bool = False
-
-
-class PublishJobOut(BaseModel):
-    id: int
-    clip_id: int
-    account_id: int
-    platform: str
-    account_name: str
-    clip_title: str
-    thumb_url: Optional[str]
-    scheduled_at: datetime
-    status: str
-    attempts: int
-    remote_url: Optional[str]
-    error: Optional[str]
-    published_at: Optional[datetime]
-
-
-class PublishJobUpdate(BaseModel):
-    scheduled_at: Optional[datetime] = None
-    title: Optional[str] = None
-    description: Optional[str] = None
-    tags: Optional[list[str]] = None
-    status: Optional[str] = None  # only "cancelled" or "scheduled" (retry)
+    posted: bool = True

@@ -4,21 +4,24 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlmodel import Session, col, select
 
 from ..db import get_session
 from ..models import Clip, Job, Project, utcnow
+from ..config import get_settings
+from ..pipeline.publish_kit import PLATFORMS, build_kit, build_zip
 from ..pipeline.tasks import project_dir
 from ..presets import caption_styles, editing_styles
 from ..queue import enqueue
-from ..schemas import ClipOut, ClipUpdate, GenerationSettings, ProjectCreateURL, ProjectOut
-from .deps import media_url
+from ..schemas import ClipOut, ClipUpdate, GenerationSettings, PostedUpdate, ProjectCreateURL, ProjectOut
+from .deps import current_user, media_url
 
-router = APIRouter(prefix="/api", tags=["projects"])
+router = APIRouter(prefix="/api", tags=["projects"], dependencies=[Depends(current_user)])
 
 
 def _validate(settings: GenerationSettings) -> GenerationSettings:
@@ -197,6 +200,59 @@ def download_clip(cid: int, session: Session = Depends(get_session)):
         raise HTTPException(404, "Clip not rendered")
     safe = re.sub(r"[^A-Za-z0-9 _-]", "", c.title)[:60].strip() or f"clip-{cid}"
     return FileResponse(c.video_path, media_type="video/mp4", filename=f"{safe}.mp4")
+
+
+# ------------------------------------------------------------------ manual publishing
+@router.get("/clips/{cid}/kit")
+def clip_kit(cid: int, session: Session = Depends(get_session)):
+    """Copy-ready title / caption / hashtags for every platform."""
+    c = session.get(Clip, cid)
+    if not c:
+        raise HTTPException(404, "Clip not found")
+    return build_kit(c.title, c.description, c.hashtags)
+
+
+@router.post("/clips/{cid}/posted", response_model=ClipOut)
+def mark_posted(cid: int, body: PostedUpdate, session: Session = Depends(get_session)):
+    """Track where you've manually posted a clip."""
+    if body.platform not in PLATFORMS:
+        raise HTTPException(400, f"platform must be one of {', '.join(PLATFORMS)}")
+    c = session.get(Clip, cid)
+    if not c:
+        raise HTTPException(404, "Clip not found")
+    posted = dict(c.posted or {})
+    if body.posted:
+        posted[body.platform] = utcnow().isoformat()
+    else:
+        posted.pop(body.platform, None)
+    c.posted = posted
+    if body.posted and c.review_status == "pending":
+        c.review_status = "approved"
+    c.updated_at = utcnow()
+    session.add(c)
+    session.commit()
+    session.refresh(c)
+    return clip_out(c)
+
+
+@router.get("/projects/{pid}/export.zip")
+def export_zip(pid: int, background: BackgroundTasks, scope: str = "approved", session: Session = Depends(get_session)):
+    """Download clips + caption files as one ZIP. scope = approved | all"""
+    p = session.get(Project, pid)
+    if not p:
+        raise HTTPException(404, "Project not found")
+    q = select(Clip).where(Clip.project_id == pid, Clip.status == "ready")
+    if scope == "approved":
+        q = q.where(Clip.review_status == "approved")
+    clips = session.exec(q.order_by(col(Clip.rank))).all()
+    if not clips:
+        raise HTTPException(404, "No clips to export" + (" (approve some first)" if scope == "approved" else ""))
+    tmp = get_settings().data_dir / "tmp"
+    tmp.mkdir(exist_ok=True)
+    dest = build_zip(clips, tmp / f"export-{pid}-{uuid.uuid4().hex[:8]}.zip")
+    background.add_task(dest.unlink, missing_ok=True)
+    name = re.sub(r"[^A-Za-z0-9 _-]", "", p.name)[:50].strip() or f"project-{pid}"
+    return FileResponse(dest, media_type="application/zip", filename=f"{name} - clips.zip")
 
 
 @router.get("/jobs")

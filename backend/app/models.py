@@ -13,13 +13,6 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def to_utc(dt: datetime) -> datetime:
-    """Naive datetimes from clients are treated as UTC."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
 class Project(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
@@ -55,6 +48,8 @@ class Clip(SQLModel, table=True):
     music_track_id: Optional[int] = None
     status: str = "pending"  # pending | rendering | ready | failed
     review_status: str = "pending"  # pending | approved | rejected
+    # manual publishing tracker: {"tiktok": "2026-11-18T18:00:00Z", ...}
+    posted: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     error: Optional[str] = None
     video_path: Optional[str] = None
     thumb_path: Optional[str] = None
@@ -74,47 +69,11 @@ class MusicTrack(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
-class SocialAccount(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    platform: str = Field(index=True)  # youtube | tiktok | instagram | facebook
-    display_name: str = ""
-    external_id: str = ""  # channel id / open_id / ig user id / page id
-    avatar_url: Optional[str] = None
-    # encrypted with APP_SECRET_KEY (see core/crypto.py)
-    access_token_enc: Optional[str] = None
-    refresh_token_enc: Optional[str] = None
-    token_expires_at: Optional[datetime] = None
-    extra: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    enabled: bool = True
-    # anti-spam knobs, per account
-    daily_limit: int = 6
-    min_interval_minutes: int = 90
-    created_at: datetime = Field(default_factory=utcnow)
-
-
-class PublishJob(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    clip_id: int = Field(foreign_key="clip.id", index=True)
-    account_id: int = Field(foreign_key="socialaccount.id", index=True)
-    scheduled_at: datetime = Field(default_factory=utcnow, index=True)
-    status: str = "scheduled"  # scheduled | publishing | published | failed | cancelled
-    title: str = ""
-    description: str = ""
-    tags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    privacy: str = "public"  # public | unlisted | private (platform-mapped)
-    attempts: int = 0
-    remote_id: Optional[str] = None
-    remote_url: Optional[str] = None
-    error: Optional[str] = None
-    published_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=utcnow)
-
-
 class Job(SQLModel, table=True):
     """Background work item for the worker queue."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    kind: str = Field(index=True)  # analyze_project | render_clip | analyze_music | publish
+    kind: str = Field(index=True)  # analyze_project | render_clip | analyze_music
     payload: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     status: str = Field(default="queued", index=True)  # queued | running | done | failed
     priority: int = 0  # higher runs first
@@ -128,10 +87,11 @@ class Job(SQLModel, table=True):
     finished_at: Optional[datetime] = None
 
 
-class OAuthState(SQLModel, table=True):
-    """Short-lived OAuth state + PKCE verifier."""
+class User(SQLModel, table=True):
+    """Self-hosted login. The first person to open the app creates the owner account."""
 
-    state: str = Field(primary_key=True)
-    platform: str
-    code_verifier: Optional[str] = None
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True)
+    name: str = ""
+    password_hash: str
     created_at: datetime = Field(default_factory=utcnow)

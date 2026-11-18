@@ -4,8 +4,6 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 sqlmodel>=0.0.50  # stores/returns timezone-aware UTC datetimes
 pydantic-settings>=2.4
-httpx>=0.27
-cryptography>=43
 
 # --- Media / AI ---
 numpy>=1.26

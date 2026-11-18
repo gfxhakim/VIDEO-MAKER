@@ -1,5 +1,5 @@
-// Typed client for the FastAPI backend.
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/$/, "");
+// Typed client for the FastAPI backend. Same origin in production and in dev (via rewrites).
+export const API_URL = "";
 
 export type GenerationSettings = {
   clip_count: number;
@@ -99,6 +99,7 @@ export type Clip = {
   hashtags: string[];
   status: "pending" | "rendering" | "ready" | "failed";
   review_status: "pending" | "approved" | "rejected";
+  posted: Partial<Record<Platform, string>>;
   error: string | null;
   video_url: string | null;
   thumb_url: string | null;
@@ -115,47 +116,12 @@ export type MusicTrack = {
   url: string;
 };
 
-export type Platform = "youtube" | "tiktok" | "instagram" | "facebook";
-export type Account = {
-  id: number;
-  platform: Platform;
-  display_name: string;
-  external_id: string;
-  avatar_url: string | null;
-  enabled: boolean;
-  daily_limit: number;
-  min_interval_minutes: number;
-  token_expires_at: string | null;
-  connected: boolean;
-  created_at: string;
-};
+export type Platform = "tiktok" | "instagram" | "youtube" | "facebook";
+export type KitEntry = { label: string; title: string; caption: string; hashtags: string[] };
+export type PublishKit = Record<Platform, KitEntry>;
 
-export type ProviderInfo = {
-  slug: "youtube" | "tiktok" | "meta";
-  label: string;
-  configured: boolean;
-  env_keys: string[];
-  redirect_uri: string;
-  docs_url: string;
-  platforms: Platform[];
-};
-export type PlatformsInfo = { dry_run: boolean; redirect_base: string; providers: ProviderInfo[] };
-
-export type PublishJob = {
-  id: number;
-  clip_id: number;
-  account_id: number;
-  platform: Platform;
-  account_name: string;
-  clip_title: string;
-  thumb_url: string | null;
-  scheduled_at: string;
-  status: "scheduled" | "publishing" | "published" | "failed" | "cancelled";
-  attempts: number;
-  remote_url: string | null;
-  error: string | null;
-  published_at: string | null;
-};
+export type User = { id: number; email: string; name: string };
+export type AuthStatus = { needs_setup: boolean; signup_open: boolean; user: User | null };
 
 export class ApiError extends Error {
   status: number;
@@ -166,7 +132,10 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, init);
+  const res = await fetch(`${API_URL}${path}`, { credentials: "include", ...init });
+  if (res.status === 401 && typeof window !== "undefined" && !path.startsWith("/api/auth")) {
+    window.location.href = "/signin";
+  }
   if (!res.ok) {
     let msg = res.statusText;
     try {
@@ -200,6 +169,7 @@ export const api = {
       fd.append("settings", JSON.stringify(settings));
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${API_URL}/api/projects/upload`);
+      xhr.withCredentials = true;
       xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.((e.loaded / e.total) * 100);
       xhr.onload = () => {
         if (xhr.status < 300) resolve(JSON.parse(xhr.responseText));
@@ -224,22 +194,15 @@ export const api = {
   },
   deleteMusic: (id: number) => request(`/api/music/${id}`, { method: "DELETE" }),
 
-  oauthStartUrl: (slug: string) => `${API_URL}/api/oauth/${slug}/start`,
-  addSandbox: (platform: Platform) => request<Account>(`/api/accounts/sandbox?platform=${platform}`, json("POST")),
-  updateAccount: (id: number, body: Partial<Pick<Account, "enabled" | "daily_limit" | "min_interval_minutes" | "display_name">>) =>
-    request<Account>(`/api/accounts/${id}`, json("PATCH", body)),
-  deleteAccount: (id: number) => request(`/api/accounts/${id}`, { method: "DELETE" }),
+  kit: (id: number) => request<PublishKit>(`/api/clips/${id}/kit`),
+  markPosted: (id: number, platform: Platform, posted: boolean) =>
+    request<Clip>(`/api/clips/${id}/posted`, json("POST", { platform, posted })),
+  exportZipUrl: (projectId: number, scope: "approved" | "all") => `${API_URL}/api/projects/${projectId}/export.zip?scope=${scope}`,
 
-  schedule: (body: {
-    clip_ids: number[];
-    account_ids: number[];
-    start_at?: string | null;
-    interval_minutes: number;
-    account_offset_minutes: number;
-    jitter_minutes: number;
-    privacy: string;
-    publish_now: boolean;
-  }) => request<PublishJob[]>("/api/publish/schedule", json("POST", body)),
-  updatePublishJob: (id: number, body: Partial<{ status: string; scheduled_at: string; title: string }>) =>
-    request<PublishJob>(`/api/publish/jobs/${id}`, json("PATCH", body)),
+  authStatus: () => request<AuthStatus>("/api/auth/status"),
+  signin: (email: string, password: string) => request<User>("/api/auth/signin", json("POST", { email, password })),
+  signup: (email: string, password: string, name: string) => request<User>("/api/auth/signup", json("POST", { email, password, name })),
+  signout: () => request("/api/auth/signout", json("POST")),
+  changePassword: (current_password: string, new_password: string) =>
+    request("/api/auth/password", json("POST", { current_password, new_password })),
 };

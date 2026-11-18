@@ -49,11 +49,11 @@ export default function MusicPage() {
       {!tracks ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : tracks.length === 0 ? (
-        <div className="rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground"><Music2 className="mx-auto mb-2 size-7" />No songs yet.</div>
+        <div className="glass rounded-3xl border border-dashed p-12 text-center text-sm text-muted-foreground"><Music2 className="mx-auto mb-2 size-7" />No songs yet.</div>
       ) : (
         <div className="flex flex-col gap-2">
           {tracks.map((t) => (
-            <Card key={t.id} className="py-3">
+            <Card key={t.id} className="glass rounded-2xl py-3">
               <CardContent className="flex flex-wrap items-center gap-4 px-4">
                 <Music2 className="size-5 text-primary" />
                 <div className="min-w-40 flex-1">
@@ -68,7 +68,7 @@ export default function MusicPage() {
                 ) : (
                   <Badge variant="warning"><Loader2 className="animate-spin" /> analyzing</Badge>
                 )}
-                <audio src={t.url} controls preload="none" className="h-8 w-56" />
+                <audio src={t.url} controls preload="none" className="h-8 w-full sm:w-56" />
                 <Button variant="ghost" size="icon" onClick={async () => { await api.deleteMusic(t.id); mutate(); }}><Trash2 /></Button>
               </CardContent>
             </Card>

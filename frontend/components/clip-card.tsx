@@ -1,161 +1,89 @@
 "use client";
 
-import { useState } from "react";
-import { toast } from "sonner";
-import { Check, Download, Flame, Loader2, Pencil, RefreshCw, Save, X } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { api, type Clip } from "@/lib/api";
+import { useRef, useState } from "react";
+import { motion } from "motion/react";
+import { Check, Flame, Loader2, Play, RefreshCw, TriangleAlert } from "lucide-react";
+import { PlatformIcon } from "@/components/platform-icon";
+import { api, type Clip, type Platform } from "@/lib/api";
 import { cn, fmtDuration } from "@/lib/utils";
 
-const SIGNALS: [string, string][] = [
-  ["hook", "Hook"],
-  ["energy", "Energy"],
-  ["emotion", "Emotion"],
-  ["density", "Pace"],
-  ["spikes", "Spikes"],
-  ["action", "Action"],
-];
-
-export function ScoreBars({ b }: { b: Clip["score_breakdown"] }) {
+export function ScoreRing({ score, size = 40 }: { score: number; size?: number }) {
+  const r = size / 2 - 3;
+  const c = 2 * Math.PI * r;
+  const color = score >= 70 ? "#f97316" : score >= 50 ? "#d946ef" : "#8b5cf6";
   return (
-    <div className="grid grid-cols-3 gap-x-3 gap-y-1">
-      {SIGNALS.map(([k, label]) => {
-        const v = Number(b[k] ?? 0);
-        return (
-          <div key={k} className="text-[10px] text-muted-foreground">
-            <div className="flex justify-between"><span>{label}</span><span>{Math.round(v * 100)}</span></div>
-            <div className="h-1 rounded bg-muted"><div className="h-1 rounded bg-primary" style={{ width: `${v * 100}%` }} /></div>
-          </div>
-        );
-      })}
-    </div>
+    <span className="relative grid place-items-center" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="-rotate-90">
+        <circle cx={size / 2} cy={size / 2} r={r} stroke="rgba(255,255,255,.15)" strokeWidth={3} fill="rgba(0,0,0,.55)" />
+        <circle cx={size / 2} cy={size / 2} r={r} stroke={color} strokeWidth={3} fill="none" strokeLinecap="round" strokeDasharray={c} strokeDashoffset={c * (1 - score / 100)} />
+      </svg>
+      <span className="absolute text-[11px] font-semibold text-white tabular-nums">{Math.round(score)}</span>
+    </span>
   );
 }
 
-export function ClipCard({
-  clip,
-  selected,
-  onSelect,
-  onChange,
-}: {
-  clip: Clip;
-  selected?: boolean;
-  onSelect?: (v: boolean) => void;
-  onChange?: (c: Clip) => void;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [title, setTitle] = useState(clip.title);
-  const [hook, setHook] = useState(clip.hook);
-  const [desc, setDesc] = useState(clip.description);
-  const [tags, setTags] = useState(clip.hashtags.join(" "));
-  const [busy, setBusy] = useState(false);
-
-  async function patch(body: Parameters<typeof api.updateClip>[1]) {
-    setBusy(true);
-    try {
-      const c = await api.updateClip(clip.id, body);
-      onChange?.(c);
-      return c;
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function save(rerender: boolean) {
-    const c = await patch({ title, description: desc, hook, hashtags: tags.split(/[\s,]+/).filter(Boolean) });
-    if (c && rerender) {
-      onChange?.(await api.rerenderClip(clip.id));
-      toast.success("Re-rendering with the new hook title");
-    }
-    setEditing(false);
-  }
-
+/** Thumbnail that plays (muted) on hover; click opens the clip studio. */
+export function ClipCard({ clip, index = 0, onOpen, onChange }: { clip: Clip; index?: number; onOpen: () => void; onChange?: (c: Clip) => void }) {
+  const video = useRef<HTMLVideoElement>(null);
+  const [hover, setHover] = useState(false);
   const ready = clip.status === "ready";
+  const posted = Object.keys(clip.posted ?? {}) as Platform[];
+
   return (
-    <div className={cn("flex flex-col overflow-hidden rounded-xl border bg-card transition-colors", selected && "border-primary ring-1 ring-primary", clip.review_status === "rejected" && "opacity-50")}>
-      <div className="relative aspect-[9/16] bg-black">
+    <motion.div
+      layout
+      initial={{ opacity: 0, y: 14 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: Math.min(index * 0.03, 0.4) }}
+      className={cn("group relative", clip.review_status === "rejected" && "opacity-45")}
+    >
+      <button
+        type="button"
+        disabled={!ready}
+        onClick={onOpen}
+        onMouseEnter={() => { setHover(true); video.current?.play().catch(() => {}); }}
+        onMouseLeave={() => { setHover(false); if (video.current) { video.current.pause(); video.current.currentTime = 0; } }}
+        className="relative block aspect-[9/16] w-full overflow-hidden rounded-2xl border border-white/10 bg-zinc-900 text-left shadow-lg transition duration-300 hover:-translate-y-1 hover:border-white/25 hover:shadow-2xl hover:shadow-fuchsia-500/10"
+      >
         {ready && clip.video_url ? (
-          <video src={clip.video_url} poster={clip.thumb_url ?? undefined} controls preload="none" playsInline className="h-full w-full object-contain" />
-        ) : (
-          <div className="grid h-full place-items-center p-4 text-center text-xs text-muted-foreground">
-            {clip.status === "failed" ? (
-              <span className="text-destructive">Render failed<br />{clip.error?.slice(-180)}</span>
-            ) : (
-              <span className="flex flex-col items-center gap-2"><Loader2 className="size-6 animate-spin text-primary" />{clip.status === "rendering" ? "Rendering…" : "Queued"}</span>
-            )}
-          </div>
-        )}
-        <div className="pointer-events-none absolute top-2 left-2 flex gap-1">
-          <Badge className="pointer-events-auto gap-1 bg-black/70 text-white"><Flame className="text-orange-400" />{Math.round(clip.score)}</Badge>
-          <Badge variant="secondary" className="bg-black/70">#{clip.rank}</Badge>
-        </div>
-        {onSelect && ready && (
-          <div className="absolute top-2 right-2 rounded bg-black/60 p-1">
-            <Checkbox checked={selected} onCheckedChange={(v) => onSelect(v === true)} aria-label="Select clip" />
-          </div>
-        )}
-      </div>
-      <div className="flex flex-1 flex-col gap-3 p-3">
-        {editing ? (
-          <div className="flex flex-col gap-2">
-            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Post title" />
-            <Input value={hook} onChange={(e) => setHook(e.target.value)} placeholder="On-screen hook title" />
-            <Textarea value={desc} onChange={(e) => setDesc(e.target.value)} rows={3} placeholder="Description" />
-            <Input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="#tags separated by spaces" />
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={() => save(false)} disabled={busy}><Save /> Save</Button>
-              <Button size="sm" variant="secondary" onClick={() => save(true)} disabled={busy}><RefreshCw /> Save + re-render</Button>
-              <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
-            </div>
-          </div>
-        ) : (
           <>
-            <div>
-              <div className="line-clamp-2 text-sm font-medium">{clip.title}</div>
-              <div className="mt-1 flex flex-wrap gap-1">
-                {clip.hashtags.slice(0, 5).map((t) => <span key={t} className="text-[11px] text-primary">{t}</span>)}
-              </div>
-              <div className="mt-1 text-[11px] text-muted-foreground">
-                {fmtDuration(clip.start)} → {fmtDuration(clip.end)} · {Math.round(clip.duration)}s
-                {clip.score_breakdown.layout ? ` · ${String(clip.score_breakdown.layout).replace("_", " ")}` : ""}
-              </div>
-            </div>
-            <ScoreBars b={clip.score_breakdown} />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            {clip.thumb_url && <img src={clip.thumb_url} alt="" className={cn("absolute inset-0 h-full w-full object-cover transition-opacity", hover && "opacity-0")} />}
+            <video ref={video} src={hover ? clip.video_url : undefined} muted playsInline loop preload="none" className="absolute inset-0 h-full w-full object-cover" />
           </>
-        )}
-        {!editing && (
-          <div className="mt-auto flex items-center gap-1">
-            <Button
-              size="sm"
-              variant={clip.review_status === "approved" ? "default" : "outline"}
-              disabled={!ready || busy}
-              onClick={() => patch({ review_status: clip.review_status === "approved" ? "pending" : "approved" })}
-            >
-              <Check /> {clip.review_status === "approved" ? "Approved" : "Approve"}
-            </Button>
-            <Button size="icon" variant="ghost" className="size-8" title="Reject" disabled={busy}
-              onClick={() => patch({ review_status: clip.review_status === "rejected" ? "pending" : "rejected" })}>
-              <X />
-            </Button>
-            <Button size="icon" variant="ghost" className="size-8" title="Edit title & tags" onClick={() => setEditing(true)}><Pencil /></Button>
-            {ready && (
-              <Button size="icon" variant="ghost" className="ml-auto size-8" title="Download" asChild>
-                <a href={api.clipDownloadUrl(clip.id)}><Download /></a>
-              </Button>
-            )}
-            {clip.status === "failed" && (
-              <Button size="icon" variant="ghost" className="ml-auto size-8" title="Retry render"
-                onClick={async () => onChange?.(await api.rerenderClip(clip.id))}><RefreshCw /></Button>
+        ) : (
+          <div className="skeleton absolute inset-0 grid place-items-center p-4 text-center text-xs text-muted-foreground">
+            {clip.status === "failed" ? (
+              <span className="flex flex-col items-center gap-2 text-destructive"><TriangleAlert className="size-6" />Render failed</span>
+            ) : (
+              <span className="flex flex-col items-center gap-2"><Loader2 className="size-6 animate-spin text-primary" />{clip.status === "rendering" ? "Rendering…" : "In queue"}</span>
             )}
           </div>
         )}
-      </div>
-    </div>
+        <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/0 to-black/30" />
+        <div className="absolute top-2.5 left-2.5"><ScoreRing score={clip.score} /></div>
+        <div className="absolute top-3 right-3 flex gap-1">
+          {clip.review_status === "approved" && <span className="grid size-6 place-items-center rounded-full bg-emerald-500 text-white shadow"><Check className="size-3.5" /></span>}
+        </div>
+        {ready && (
+          <span className="absolute top-1/2 left-1/2 grid size-12 -translate-x-1/2 -translate-y-1/2 scale-75 place-items-center rounded-full bg-white/20 opacity-0 backdrop-blur transition group-hover:scale-100 group-hover:opacity-100">
+            <Play className="size-5 fill-white text-white" />
+          </span>
+        )}
+        <div className="absolute inset-x-0 bottom-0 p-3">
+          <div className="line-clamp-2 text-[13px] leading-snug font-semibold text-white drop-shadow">{clip.title}</div>
+          <div className="mt-1.5 flex items-center justify-between text-[11px] text-white/70">
+            <span className="flex items-center gap-1"><Flame className="size-3 text-orange-400" />#{clip.rank} · {Math.round(clip.duration)}s</span>
+            <span className="flex -space-x-1">{posted.map((p) => <PlatformIcon key={p} platform={p} className="size-4 text-[6px] ring-2 ring-black" />)}</span>
+          </div>
+        </div>
+      </button>
+      {clip.status === "failed" && (
+        <button onClick={async () => onChange?.(await api.rerenderClip(clip.id))} className="absolute right-2 bottom-2 flex items-center gap-1 rounded-lg bg-white/10 px-2 py-1 text-xs backdrop-blur hover:bg-white/20">
+          <RefreshCw className="size-3" /> Retry
+        </button>
+      )}
+      <div className="sr-only">{fmtDuration(clip.start)}</div>
+    </motion.div>
   );
 }

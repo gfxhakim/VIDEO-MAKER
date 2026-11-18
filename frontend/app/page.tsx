@@ -2,29 +2,50 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import useSWR from "swr";
+import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
-import { FileVideo, FolderOpen, Link2, Loader2, Sparkles, Trash2, UploadCloud, Wand2 } from "lucide-react";
+import { ArrowRight, CheckCircle2, Clapperboard, Film, FileVideo, FolderOpen, Link2, Loader2, Sparkles, Trash2, UploadCloud, Wand2, X } from "lucide-react";
 import { PageHeader } from "@/components/app-shell";
-import { StyleSelector } from "@/components/style-selector";
+import { useAuth } from "@/components/auth-provider";
 import { StatusBadge } from "@/components/status-badge";
+import { StyleSelector } from "@/components/style-selector";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { api, DEFAULT_SETTINGS, fetcher, type GenerationSettings, type Project } from "@/lib/api";
+import { api, DEFAULT_SETTINGS, fetcher, type Clip, type GenerationSettings, type Project } from "@/lib/api";
 import { cn, fmtDuration } from "@/lib/utils";
 
-export default function Dashboard() {
+const SOURCES = [
+  { key: "upload", label: "Upload", short: "Upload", icon: UploadCloud },
+  { key: "url", label: "Video link", short: "Link", icon: Link2 },
+  { key: "path", label: "Server path", short: "Path", icon: FolderOpen },
+] as const;
+
+function greeting() {
+  const h = new Date().getHours();
+  return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+}
+
+function Stat({ label, value, icon: Icon, delay }: { label: string; value: number | string; icon: React.ElementType; delay: number }) {
+  return (
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay }} className="glass rounded-2xl border p-4">
+      <div className="flex items-center justify-between text-xs text-muted-foreground">{label}<Icon className="size-4" /></div>
+      <div className="mt-2 text-2xl font-semibold tabular-nums">{value}</div>
+    </motion.div>
+  );
+}
+
+export default function Studio() {
   const router = useRouter();
+  const { user } = useAuth();
   const { data: projects, mutate } = useSWR<Project[]>("/api/projects", fetcher, {
-    refreshInterval: (d) => (d?.some((p) => p.status === "queued" || p.status === "processing") ? 2000 : 15000),
+    refreshInterval: (d) => (d?.some((p) => p.status === "queued" || p.status === "processing") ? 2000 : 20000),
   });
-  const [tab, setTab] = useState("upload");
+  const { data: clips } = useSWR<Clip[]>("/api/clips", fetcher);
+  const [source, setSource] = useState<(typeof SOURCES)[number]["key"]>("upload");
   const [url, setUrl] = useState("");
   const [path, setPath] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -34,25 +55,27 @@ export default function Dashboard() {
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [drag, setDrag] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  const composer = useRef<HTMLDivElement>(null);
 
-  const sourceReady = (tab === "upload" && file) || (tab === "url" && /^https?:\/\//.test(url.trim())) || (tab === "path" && path.trim());
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("new")) composer.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
+
+  const ready = (source === "upload" && !!file) || (source === "url" && /^https?:\/\//.test(url.trim())) || (source === "path" && !!path.trim());
 
   async function generate() {
     setBusy(true);
     try {
       let p: Project;
-      if (tab === "upload" && file) {
+      if (source === "upload" && file) {
         setUploadPct(0);
         p = await api.createFromUpload(file, settings, setUploadPct);
-      } else if (tab === "url") {
-        p = await api.createFromLink({ url: url.trim(), settings });
-      } else {
-        p = await api.createFromLink({ path: path.trim(), settings });
-      }
-      toast.success("Generation started", { description: `${settings.clip_count} clips are on the way.` });
+      } else if (source === "url") p = await api.createFromLink({ url: url.trim(), settings });
+      else p = await api.createFromLink({ path: path.trim(), settings });
+      toast.success("Your clips are cooking", { description: `${settings.clip_count} clips on the way.` });
       setStyleOpen(false);
       mutate();
-      router.push(`/projects/${p.id}`);
+      router.push(`/project?id=${p.id}`);
     } catch (e) {
       toast.error("Could not start", { description: (e as Error).message });
     } finally {
@@ -61,125 +84,184 @@ export default function Dashboard() {
     }
   }
 
+  const readyClips = clips?.length ?? 0;
+  const approved = clips?.filter((c) => c.review_status === "approved").length ?? 0;
+  const posted = clips?.filter((c) => Object.keys(c.posted ?? {}).length).length ?? 0;
+
   return (
     <div className="mx-auto max-w-6xl">
-      <PageHeader title="Create viral clips" description="Drop in a long video, pick a style, get 10 to 50 vertical clips with captions and music." />
+      <PageHeader
+        eyebrow={greeting()}
+        title={<>Hey {user?.name ?? "there"}, let&apos;s make something <span className="text-gradient">go viral</span>.</>}
+        description="Drop in a long video and get 10 to 50 vertical clips with captions, smart framing and music."
+      />
 
-      <Card className="mb-10 overflow-hidden border-primary/20">
-        <CardContent className="grid gap-6 lg:grid-cols-[1fr_320px]">
-          <Tabs value={tab} onValueChange={setTab}>
-            <TabsList>
-              <TabsTrigger value="upload"><UploadCloud /> Upload</TabsTrigger>
-              <TabsTrigger value="url"><Link2 /> URL</TabsTrigger>
-              <TabsTrigger value="path"><FolderOpen /> Local path</TabsTrigger>
-            </TabsList>
-            <TabsContent value="upload">
-              <div
-                onClick={() => fileInput.current?.click()}
-                onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
-                onDragLeave={() => setDrag(false)}
-                onDrop={(e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) setFile(f); }}
-                className={cn("grid h-40 cursor-pointer place-items-center rounded-lg border-2 border-dashed text-center transition-colors hover:border-primary/60", drag && "border-primary bg-primary/5")}
-              >
-                {file ? (
-                  <div className="flex items-center gap-3 text-sm"><FileVideo className="size-6 text-primary" /> {file.name} <span className="text-muted-foreground">{(file.size / 1e6).toFixed(0)} MB</span></div>
-                ) : (
-                  <div className="text-sm text-muted-foreground"><UploadCloud className="mx-auto mb-2 size-7" />Drag a video here or click to browse<div className="text-xs">MP4, MOV, MKV, WEBM</div></div>
-                )}
-                <input ref={fileInput} type="file" accept="video/*" hidden onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-              </div>
-            </TabsContent>
-            <TabsContent value="url">
-              <div className="flex h-40 flex-col justify-center gap-2">
-                <Input placeholder="https://www.youtube.com/watch?v=…  (YouTube, Twitch VODs, Vimeo, X, TikTok…)" value={url} onChange={(e) => setUrl(e.target.value)} className="h-11" />
-                <p className="text-xs text-muted-foreground">Downloaded with yt-dlp at up to 1080p. Only use content you own or have the rights to.</p>
-              </div>
-            </TabsContent>
-            <TabsContent value="path">
-              <div className="flex h-40 flex-col justify-center gap-2">
-                <Input placeholder="/Users/me/Videos/stream-2024-10-01.mp4" value={path} onChange={(e) => setPath(e.target.value)} className="h-11 font-mono text-sm" />
-                <p className="text-xs text-muted-foreground">A file on the machine running the backend. No upload needed, great for huge files.</p>
-              </div>
-            </TabsContent>
-          </Tabs>
-
-          <div className="flex flex-col justify-between gap-5 rounded-lg border bg-background/40 p-4">
-            <div>
-              <div className="mb-1 flex items-baseline justify-between">
-                <span className="text-sm font-medium">Clips per run</span>
-                <span className="text-3xl font-semibold tabular-nums text-primary">{settings.clip_count}</span>
-              </div>
-              <Slider min={10} max={50} step={1} value={[settings.clip_count]} onValueChange={([v]) => setSettings({ ...settings, clip_count: v })} />
-              <div className="flex justify-between text-[11px] text-muted-foreground"><span>10</span><span>50</span></div>
+      {/* composer */}
+      <motion.div ref={composer} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }}
+        className="glass relative mb-8 overflow-hidden rounded-3xl border p-4 sm:p-6">
+        <div className="pointer-events-none absolute -top-24 -right-24 size-72 rounded-full bg-fuchsia-500/20 blur-3xl" />
+        <div className="relative grid gap-6 lg:grid-cols-[1fr_300px]">
+          <div>
+            <div className="mb-4 flex rounded-xl bg-white/[.04] p-1 sm:w-fit">
+              {SOURCES.map(({ key, label, short, icon: Icon }) => (
+                <button key={key} onClick={() => setSource(key)} className={cn("relative flex flex-1 items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm whitespace-nowrap transition sm:flex-none sm:px-4", source === key ? "text-foreground" : "text-muted-foreground hover:text-foreground")}>
+                  {source === key && <motion.span layoutId="src-pill" className="absolute inset-0 rounded-lg bg-white/10 ring-1 ring-white/10" />}
+                  <Icon className="relative size-4" /><span className="relative sm:hidden">{short}</span><span className="relative hidden sm:inline">{label}</span>
+                </button>
+              ))}
             </div>
-            <Button size="lg" disabled={!sourceReady} onClick={() => setStyleOpen(true)}>
-              <Wand2 /> Choose style & generate
-            </Button>
+            <AnimatePresence mode="wait">
+              <motion.div key={source} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.15 }}>
+                {source === "upload" && (
+                  <div
+                    onClick={() => fileInput.current?.click()}
+                    onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+                    onDragLeave={() => setDrag(false)}
+                    onDrop={(e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) setFile(f); }}
+                    className={cn("relative grid h-44 cursor-pointer place-items-center rounded-2xl border-2 border-dashed border-white/15 text-center transition", drag ? "scale-[1.01] border-primary bg-primary/10" : "hover:border-white/30 hover:bg-white/[.02]")}
+                  >
+                    {file ? (
+                      <div className="flex items-center gap-3 px-4 text-sm">
+                        <span className="bg-brand grid size-11 shrink-0 place-items-center rounded-xl"><FileVideo className="size-5 text-white" /></span>
+                        <div className="min-w-0 text-left"><div className="truncate font-medium">{file.name}</div><div className="text-xs text-muted-foreground">{(file.size / 1e6).toFixed(0)} MB · ready</div></div>
+                        <button onClick={(e) => { e.stopPropagation(); setFile(null); }} className="rounded-md p-1 text-muted-foreground hover:bg-white/10"><X className="size-4" /></button>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-muted-foreground">
+                        <motion.div animate={{ y: drag ? -4 : [0, -4, 0] }} transition={{ repeat: drag ? 0 : Infinity, duration: 2.4 }}>
+                          <UploadCloud className="mx-auto mb-3 size-9 text-primary" />
+                        </motion.div>
+                        <span className="text-foreground">Drop your video here</span> or click to browse
+                        <div className="mt-1 text-xs">MP4 · MOV · MKV · WEBM</div>
+                      </div>
+                    )}
+                    <input ref={fileInput} type="file" accept="video/*" hidden onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+                  </div>
+                )}
+                {source === "url" && (
+                  <div className="flex h-44 flex-col justify-center gap-3">
+                    <div className="flex h-14 items-center gap-3 rounded-2xl border border-white/10 bg-white/[.03] px-4 focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/15">
+                      <Link2 className="size-5 text-muted-foreground" />
+                      <input autoFocus value={url} onChange={(e) => setUrl(e.target.value)} placeholder="Paste a YouTube, Twitch, Vimeo or X link" className="h-full flex-1 bg-transparent text-sm outline-none" />
+                    </div>
+                    <p className="text-xs text-muted-foreground">Downloaded at up to 1080p. Only use videos you own or have permission to use.</p>
+                  </div>
+                )}
+                {source === "path" && (
+                  <div className="flex h-44 flex-col justify-center gap-3">
+                    <div className="flex h-14 items-center gap-3 rounded-2xl border border-white/10 bg-white/[.03] px-4 focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/15">
+                      <FolderOpen className="size-5 text-muted-foreground" />
+                      <input autoFocus value={path} onChange={(e) => setPath(e.target.value)} placeholder="/data/videos/stream.mp4" className="h-full flex-1 bg-transparent font-mono text-sm outline-none" />
+                    </div>
+                    <p className="text-xs text-muted-foreground">A file already on the server. Skips the upload for huge recordings.</p>
+                  </div>
+                )}
+              </motion.div>
+            </AnimatePresence>
           </div>
-        </CardContent>
-      </Card>
+
+          <div className="flex flex-col justify-between gap-5 rounded-2xl border border-white/10 bg-black/20 p-5">
+            <div>
+              <div className="text-sm text-muted-foreground">Clips to generate</div>
+              <motion.div key={settings.clip_count} initial={{ scale: 0.9, opacity: 0.5 }} animate={{ scale: 1, opacity: 1 }} className="text-gradient my-1 text-6xl font-bold tabular-nums">
+                {settings.clip_count}
+              </motion.div>
+              <Slider min={10} max={50} step={1} value={[settings.clip_count]} onValueChange={([v]) => setSettings({ ...settings, clip_count: v })} />
+              <div className="mt-2 flex gap-1.5">
+                {[10, 20, 30, 50].map((n) => (
+                  <button key={n} onClick={() => setSettings({ ...settings, clip_count: n })} className={cn("flex-1 rounded-lg border py-1 text-xs transition", settings.clip_count === n ? "border-primary/60 bg-primary/15 text-foreground" : "border-white/10 text-muted-foreground hover:bg-white/5")}>{n}</button>
+                ))}
+              </div>
+            </div>
+            <motion.button whileTap={{ scale: 0.97 }} disabled={!ready} onClick={() => setStyleOpen(true)}
+              className="bg-brand group flex h-12 items-center justify-center gap-2 rounded-xl font-semibold text-white shadow-lg shadow-fuchsia-500/25 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
+              <Wand2 className="size-4" /> Choose style <ArrowRight className="size-4 transition group-hover:translate-x-0.5" />
+            </motion.button>
+          </div>
+        </div>
+      </motion.div>
+
+      {/* stats */}
+      <div className="mb-10 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Projects" value={projects?.length ?? "–"} icon={Clapperboard} delay={0.1} />
+        <Stat label="Clips ready" value={clips ? readyClips : "–"} icon={Film} delay={0.15} />
+        <Stat label="Approved" value={clips ? approved : "–"} icon={CheckCircle2} delay={0.2} />
+        <Stat label="Posted" value={clips ? posted : "–"} icon={Sparkles} delay={0.25} />
+      </div>
 
       <Dialog open={styleOpen} onOpenChange={(o) => !busy && setStyleOpen(o)}>
         <DialogContent className="max-w-4xl">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><Sparkles className="size-5 text-primary" /> Style & template</DialogTitle>
-            <DialogDescription>These choices shape every clip in this run. You can re-generate later with a different style without re-transcribing.</DialogDescription>
+            <DialogTitle className="flex items-center gap-2"><Sparkles className="size-5 text-primary" /> Pick your style</DialogTitle>
+            <DialogDescription>Applied to every clip in this run. You can re-style later without transcribing again.</DialogDescription>
           </DialogHeader>
           <StyleSelector value={settings} onChange={setSettings} />
-          <DialogFooter className="sticky -bottom-6 -mx-6 -mb-6 items-center border-t bg-card px-6 py-4">
+          <DialogFooter className="glass sticky -bottom-6 -mx-6 -mb-6 items-center border-t px-6 py-4">
             {uploadPct !== null && <div className="mr-auto flex w-56 items-center gap-2 text-xs text-muted-foreground"><Progress value={uploadPct} /> {Math.round(uploadPct)}%</div>}
             <Button variant="ghost" onClick={() => setStyleOpen(false)} disabled={busy}>Back</Button>
-            <Button size="lg" onClick={generate} disabled={busy}>
+            <Button size="lg" onClick={generate} disabled={busy} className="bg-brand text-white hover:brightness-110">
               {busy ? <Loader2 className="animate-spin" /> : <Sparkles />} Generate {settings.clip_count} clips
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      <h2 className="mb-4 text-lg font-semibold">Projects</h2>
+      {/* projects */}
+      <div className="mb-4 flex items-end justify-between">
+        <h2 className="text-lg font-semibold">Your projects</h2>
+        {!!clips?.length && <Link href="/library" className="text-sm text-primary hover:underline">All clips →</Link>}
+      </div>
       {!projects ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">{[0, 1, 2].map((i) => <div key={i} className="skeleton h-56 rounded-2xl" />)}</div>
       ) : projects.length === 0 ? (
-        <p className="rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground">No projects yet. Your first run shows up here.</p>
+        <div className="glass rounded-3xl border border-dashed p-12 text-center">
+          <Clapperboard className="mx-auto mb-3 size-8 text-primary" />
+          <div className="font-medium">No projects yet</div>
+          <p className="mt-1 text-sm text-muted-foreground">Your first run will show up here.</p>
+        </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {projects.map((p) => (
-            <Card key={p.id} className="group gap-3 py-0 transition-colors hover:border-primary/40">
-              <Link href={`/projects/${p.id}`} className="block">
-                <div className="relative aspect-video overflow-hidden rounded-t-xl bg-muted">
-                  {p.thumb_url ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={p.thumb_url} alt="" className="h-full w-full object-cover opacity-80 blur-[1px] transition group-hover:opacity-100" />
-                  ) : (
-                    <div className="grid h-full place-items-center text-muted-foreground"><FileVideo className="size-8" /></div>
-                  )}
-                  <div className="absolute top-2 left-2"><StatusBadge status={p.status} /></div>
-                  {p.duration ? <div className="absolute right-2 bottom-2 rounded bg-black/70 px-1.5 text-xs">{fmtDuration(p.duration)}</div> : null}
+          {projects.map((p, i) => {
+            const live = p.status === "processing" || p.status === "queued";
+            return (
+              <motion.div key={p.id} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: Math.min(i * 0.04, 0.3) }}
+                className="group glass relative overflow-hidden rounded-2xl border transition hover:-translate-y-0.5 hover:border-white/20">
+                <Link href={`/project?id=${p.id}`} className="block">
+                  <div className="relative aspect-video overflow-hidden bg-zinc-900">
+                    {p.thumb_url ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={p.thumb_url} alt="" className="h-full w-full scale-110 object-cover opacity-70 blur-sm transition duration-500 group-hover:scale-100 group-hover:opacity-90 group-hover:blur-0" />
+                    ) : (
+                      <div className={cn("grid h-full place-items-center", live && "skeleton")}><FileVideo className="size-8 text-muted-foreground" /></div>
+                    )}
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+                    <div className="absolute top-3 left-3"><StatusBadge status={p.status} /></div>
+                    {p.duration ? <div className="absolute top-3 right-3 rounded-md bg-black/60 px-1.5 py-0.5 text-xs">{fmtDuration(p.duration)}</div> : null}
+                    <div className="absolute inset-x-3 bottom-3">
+                      <div className="truncate font-medium text-white">{p.name}</div>
+                      <div className="mt-0.5 text-xs text-white/70">
+                        {p.status === "done" ? `${p.ready_count} clips ready` : p.status === "failed" ? "Something went wrong" : p.stage || "Waiting to start"}
+                      </div>
+                    </div>
+                  </div>
+                </Link>
+                <div className="flex items-center gap-3 px-3 py-2.5">
+                  {live ? <Progress value={p.progress * 100} /> : <span className="truncate text-xs text-muted-foreground capitalize">{p.settings.editing_style.replaceAll("_", " ")} · {p.settings.caption_style.replaceAll("_", " ")}</span>}
+                  <button
+                    className="ml-auto rounded-md p-1.5 text-muted-foreground opacity-100 transition hover:bg-white/5 hover:text-destructive sm:opacity-0 sm:group-hover:opacity-100"
+                    aria-label="Delete project"
+                    onClick={async () => {
+                      if (!confirm(`Delete "${p.name}" and all its clips?`)) return;
+                      await api.deleteProject(p.id);
+                      mutate();
+                    }}
+                  >
+                    <Trash2 className="size-4" />
+                  </button>
                 </div>
-              </Link>
-              <CardHeader className="px-4">
-                <CardTitle className="truncate text-sm"><Link href={`/projects/${p.id}`}>{p.name}</Link></CardTitle>
-                <CardDescription className="text-xs">
-                  {p.status === "done" ? `${p.ready_count} clips ready` : p.status === "failed" ? <span className="text-destructive">{p.error?.slice(0, 90)}</span> : p.stage || "Waiting"}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex items-center gap-3 px-4 pb-4">
-                {(p.status === "processing" || p.status === "queued") && <Progress value={p.progress * 100} />}
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="ml-auto size-7 text-muted-foreground opacity-0 group-hover:opacity-100"
-                  onClick={async () => {
-                    if (!confirm(`Delete "${p.name}" and all its clips?`)) return;
-                    await api.deleteProject(p.id);
-                    mutate();
-                  }}
-                >
-                  <Trash2 className="size-4" />
-                </Button>
-              </CardContent>
-            </Card>
-          ))}
+              </motion.div>
+            );
+          })}
         </div>
       )}
     </div>

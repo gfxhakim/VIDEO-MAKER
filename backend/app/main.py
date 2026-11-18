@@ -1,17 +1,21 @@
-"""AutoClip Studio API.
+"""AutoClip Studio API (+ the built frontend in production).
 
-    uvicorn app.main:app --reload --port 8000
+    uvicorn app.main:app --port 8000
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import music, projects, publish
+from .api import auth as auth_api
+from .api import music, projects
+from .api.deps import current_user
+from .auth import request_user_id
 from .config import get_settings
 from .db import init_db
 from .jobs import register_all
@@ -30,34 +34,41 @@ async def lifespan(app: FastAPI):
     bins = check_binaries()
     if not all(bins.values()):
         log.error("FFmpeg/ffprobe not found on PATH: %s. Install FFmpeg before generating clips.", bins)
-    worker = scheduler = None
+    worker = None
     if s.embedded_worker:
-        from .publishing.scheduler import Scheduler
         from .queue import Worker
 
-        worker, scheduler = Worker(), Scheduler()
+        worker = Worker()
         worker.start()
-        scheduler.start()
         log.info("embedded worker started (concurrency=%s)", worker.concurrency)
     yield
     if worker:
         worker.stop()
-    if scheduler:
-        scheduler.stop()
 
 
-app = FastAPI(title="AutoClip Studio API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="AutoClip Studio API", version="0.2.0", lifespan=lifespan)
 _settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in _settings.cors_origins.split(",")],
+    allow_origins=[o.strip() for o in _settings.cors_origins.split(",") if o.strip()],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def protect_media(request: Request, call_next):
+    """Rendered videos, thumbnails and music are only served to signed-in users."""
+    if request.url.path.startswith("/media/") and request_user_id(request) is None:
+        return JSONResponse({"detail": "Not signed in"}, status_code=401)
+    return await call_next(request)
+
+
+app.include_router(auth_api.router)
 app.include_router(projects.router)
 app.include_router(music.router)
-app.include_router(publish.router)
-# Rendered clips, thumbnails and music are served from here (Range requests supported).
+# Range requests are supported, so videos seek instantly.
 app.mount("/media/projects", StaticFiles(directory=_settings.projects_dir), name="media-projects")
 app.mount("/media/music", StaticFiles(directory=_settings.music_dir), name="media-music")
 
@@ -71,11 +82,10 @@ def health():
         "transcribe_backend": s.transcribe_backend,
         "whisper_model": s.whisper_model,
         "embedded_worker": s.embedded_worker,
-        "publish_dry_run": s.publish_dry_run,
     }
 
 
-@app.get("/api/presets")
+@app.get("/api/presets", dependencies=[Depends(current_user)])
 def presets():
     """Everything the style selector needs."""
     return {
@@ -84,3 +94,10 @@ def presets():
         "aspect_ratios": [{"key": k, "width": w, "height": h} for k, (w, h) in ASPECT_RATIOS.items()],
         "clip_count": {"min": 10, "max": 50, "default": 20},
     }
+
+
+# Production: serve the statically exported Next.js app from the same origin (one
+# Railway service, one volume, cookies just work). Mounted last so /api wins.
+if _settings.static_dir and (_settings.static_dir / "index.html").exists():
+    app.mount("/", StaticFiles(directory=_settings.static_dir, html=True), name="frontend")
+    log.info("serving frontend from %s", _settings.static_dir)

@@ -1,7 +1,8 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Anton, Bebas_Neue, DM_Serif_Display, Inter, Montserrat, Poppins } from "next/font/google";
 import { Toaster } from "sonner";
 import { AppShell } from "@/components/app-shell";
+import { AuthProvider } from "@/components/auth-provider";
 import "./globals.css";
 
 const inter = Inter({ variable: "--font-inter", subsets: ["latin"] });
@@ -14,17 +15,19 @@ const poppins = Poppins({ variable: "--font-poppins", subsets: ["latin"], weight
 
 export const metadata: Metadata = {
   title: "AutoClip Studio",
-  description: "Turn long videos into viral vertical clips, then auto-publish them.",
+  description: "Turn long videos into viral vertical clips.",
 };
+
+export const viewport: Viewport = { themeColor: "#121218", width: "device-width", initialScale: 1 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className="dark">
-      <body
-        className={`${inter.variable} ${montserrat.variable} ${anton.variable} ${bebas.variable} ${dmSerif.variable} ${poppins.variable} font-sans`}
-      >
-        <AppShell>{children}</AppShell>
-        <Toaster theme="dark" richColors position="bottom-right" />
+      <body className={`${inter.variable} ${montserrat.variable} ${anton.variable} ${bebas.variable} ${dmSerif.variable} ${poppins.variable} font-sans`}>
+        <AuthProvider>
+          <AppShell>{children}</AppShell>
+        </AuthProvider>
+        <Toaster theme="dark" richColors position="top-center" />
       </body>
     </html>
   );

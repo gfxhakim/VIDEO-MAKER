@@ -13,9 +13,9 @@ from ..db import get_session
 from ..models import MusicTrack
 from ..queue import enqueue
 from ..schemas import MusicOut
-from .deps import media_url
+from .deps import current_user, media_url
 
-router = APIRouter(prefix="/api/music", tags=["music"])
+router = APIRouter(prefix="/api/music", tags=["music"], dependencies=[Depends(current_user)])
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"}
 
 

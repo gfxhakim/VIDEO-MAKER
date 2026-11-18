@@ -21,7 +21,6 @@ FAMILIES = [
     "Bebas+Neue",
     "DM+Serif+Display",
     "Poppins:wght@600;700;800",
-    "Noto+Color+Emoji",
 ]
 UA = "Mozilla/4.0"
 

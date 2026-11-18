@@ -1,11 +1,10 @@
 """Word-level transcription.
 
-Backends (TRANSCRIBE_BACKEND):
-  local  - faster-whisper (CTranslate2). CPU int8 'base' runs ~5-10x realtime on a laptop
-           without a GPU. Use 'tiny' for weaker machines, 'small'/'medium' for accuracy.
-  openai - OpenAI whisper-1 API with word timestamps (nothing runs locally).
-  groq   - Groq's OpenAI-compatible whisper-large-v3 API (has a free tier, very fast).
-  none   - no speech; highlight scoring falls back to audio energy only.
+Everything runs locally with faster-whisper (CTranslate2): no API keys, no cloud.
+  TRANSCRIBE_BACKEND=local  CPU int8 'base' runs ~5-10x realtime without a GPU. Use
+                            WHISPER_MODEL=tiny on weak machines, small/medium for accuracy.
+  TRANSCRIBE_BACKEND=none   skip speech; highlight scoring uses audio energy only.
+The model downloads once into DATA_DIR/models (kept on the Railway volume).
 
 Output format (saved as transcript.json):
   {"language": "en", "words": [{"word": "Hello", "start": 0.0, "end": 0.32}, ...],
@@ -17,8 +16,6 @@ import logging
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
-
-import httpx
 
 from ..config import get_settings
 from .media import MediaError, run
@@ -36,9 +33,7 @@ def transcribe(audio_path: Path, language: Optional[str] = None, on_progress: Op
         return {"language": language or "", "words": [], "segments": []}
     if backend == "local":
         return _local(audio_path, language, on_progress, duration)
-    if backend in ("openai", "groq"):
-        return _api(audio_path, language, backend)
-    raise MediaError(f"Unknown TRANSCRIBE_BACKEND '{backend}'")
+    raise MediaError(f"Unknown TRANSCRIBE_BACKEND '{backend}' (use local or none)")
 
 
 # ---------------------------------------------------------------- local
@@ -50,9 +45,10 @@ def _get_local_model():
             try:
                 from faster_whisper import WhisperModel
             except ImportError as e:
-                raise MediaError("faster-whisper not installed. pip install faster-whisper, or set TRANSCRIBE_BACKEND=groq/openai") from e
-            log.info("loading whisper model %s", key)
-            _model_cache[key] = WhisperModel(s.whisper_model, device=s.whisper_device, compute_type=s.whisper_compute_type)
+                raise MediaError("faster-whisper is not installed: pip install faster-whisper") from e
+            log.info("loading whisper model %s (first run downloads it)", key)
+            _model_cache[key] = WhisperModel(s.whisper_model, device=s.whisper_device, compute_type=s.whisper_compute_type,
+                                             download_root=str(s.models_dir), cpu_threads=s.whisper_threads)
         return _model_cache[key]
 
 
@@ -74,47 +70,3 @@ def _local(audio_path: Path, language, on_progress, duration) -> dict:
         if on_progress and total:
             on_progress(min(0.99, seg.end / total))
     return {"language": info.language, "words": words, "segments": segments}
-
-
-# ---------------------------------------------------------------- API
-API_LIMIT_BYTES = 24 * 1024 * 1024
-
-
-def _api(audio_path: Path, language, backend: str) -> dict:
-    s = get_settings()
-    if backend == "openai":
-        url, key, model = "https://api.openai.com/v1/audio/transcriptions", s.openai_api_key, "whisper-1"
-    else:
-        url, key, model = "https://api.groq.com/openai/v1/audio/transcriptions", s.groq_api_key, "whisper-large-v3-turbo"
-    if not key:
-        raise MediaError(f"{backend.upper()}_API_KEY is not set")
-
-    # APIs cap uploads at 25 MB: send compressed mono opus in ~10 min chunks.
-    chunks = _chunk_audio(audio_path, seconds=600)
-    words, segments, lang = [], [], language or ""
-    for offset, chunk in chunks:
-        data = {"model": model, "response_format": "verbose_json", "timestamp_granularities[]": ["word", "segment"]}
-        if language:
-            data["language"] = language
-        with open(chunk, "rb") as f:
-            resp = httpx.post(url, headers={"Authorization": f"Bearer {key}"}, data=data,
-                              files={"file": (chunk.name, f, "audio/ogg")}, timeout=600)
-        if resp.status_code >= 400:
-            raise MediaError(f"{backend} transcription failed: {resp.status_code} {resp.text[:300]}")
-        j = resp.json()
-        lang = lang or j.get("language", "")
-        for w in j.get("words", []) or []:
-            words.append({"word": w["word"].strip(), "start": w["start"] + offset, "end": w["end"] + offset})
-        for sg in j.get("segments", []) or []:
-            segments.append({"start": sg["start"] + offset, "end": sg["end"] + offset, "text": sg["text"].strip()})
-    return {"language": lang, "words": [w for w in words if w["word"]], "segments": segments}
-
-
-def _chunk_audio(audio_path: Path, seconds: int) -> list[tuple[float, Path]]:
-    s = get_settings()
-    out_dir = audio_path.parent / "chunks"
-    out_dir.mkdir(exist_ok=True)
-    run([s.ffmpeg_bin, "-y", "-v", "error", "-i", str(audio_path), "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "32k",
-         "-f", "segment", "-segment_time", str(seconds), str(out_dir / "c%03d.ogg")])
-    files = sorted(out_dir.glob("c*.ogg"))
-    return [(i * float(seconds), f) for i, f in enumerate(files)]
