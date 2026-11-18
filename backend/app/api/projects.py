@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
@@ -14,6 +15,7 @@ from sqlmodel import Session, col, select
 from ..db import get_session
 from ..models import Clip, Job, Project, utcnow
 from ..config import get_settings
+from ..pipeline.ingest import VIDEO_EXTS
 from ..pipeline.publish_kit import PLATFORMS, build_kit, build_zip
 from ..pipeline.tasks import project_dir
 from ..presets import caption_styles, editing_styles
@@ -90,15 +92,23 @@ def create_from_upload(file: UploadFile = File(...), settings: Optional[str] = F
         gs = _validate(GenerationSettings(**json.loads(settings)) if settings else GenerationSettings())
     except (ValueError, TypeError) as e:
         raise HTTPException(400, f"Invalid settings: {e}") from e
-    p = Project(name=name or (file.filename or "Upload").rsplit(".", 1)[0][:120], source_type="upload",
-                source=file.filename or "upload.mp4", settings=gs.model_dump())
+    fname = re.split(r"[\\/]", file.filename or "upload.mp4")[-1] or "upload.mp4"
+    ext = Path(fname).suffix.lower()
+    if ext not in VIDEO_EXTS:  # checked before a project row exists
+        raise HTTPException(400, f"Unsupported file type '{ext or fname}'. Use MP4, MOV, MKV or WEBM.")
+    p = Project(name=name or Path(fname).stem[:120], source_type="upload", source=fname, settings=gs.model_dump())
     session.add(p)
     session.commit()
     session.refresh(p)
-    ext = "." + (file.filename or "x.mp4").rsplit(".", 1)[-1].lower()[:5]
     dest = project_dir(p.id) / f"source{ext}"
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(file.file, out, length=8 * 1024 * 1024)
+    try:
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(file.file, out, length=8 * 1024 * 1024)
+    except OSError:  # e.g. volume full: do not leave an empty project behind
+        shutil.rmtree(project_dir(p.id), ignore_errors=True)
+        session.delete(p)
+        session.commit()
+        raise HTTPException(507, "The server ran out of storage. Delete old projects or make the volume bigger.") from None
     p.source_path = str(dest)
     session.add(p)
     session.commit()

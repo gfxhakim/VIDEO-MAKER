@@ -3,6 +3,7 @@ import { Anton, Bebas_Neue, DM_Serif_Display, Inter, Montserrat, Poppins } from 
 import { Toaster } from "sonner";
 import { AppShell } from "@/components/app-shell";
 import { AuthProvider } from "@/components/auth-provider";
+import { UploadProvider } from "@/components/upload-provider";
 import "./globals.css";
 
 const inter = Inter({ variable: "--font-inter", subsets: ["latin"] });
@@ -25,7 +26,9 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     <html lang="en" className="dark">
       <body className={`${inter.variable} ${montserrat.variable} ${anton.variable} ${bebas.variable} ${dmSerif.variable} ${poppins.variable} font-sans`}>
         <AuthProvider>
-          <AppShell>{children}</AppShell>
+          <UploadProvider>
+            <AppShell>{children}</AppShell>
+          </UploadProvider>
         </AuthProvider>
         <Toaster theme="dark" richColors position="top-center" />
       </body>

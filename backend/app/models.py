@@ -69,6 +69,24 @@ class MusicTrack(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+class Upload(SQLModel, table=True):
+    """A chunked, resumable upload. The bytes live in DATA_DIR/uploads/<id>/ until it is
+    completed, then the file is moved (not copied) into the new project's folder."""
+
+    id: str = Field(primary_key=True)  # uuid4 hex made by the server; the only thing used to build paths
+    user_id: int = Field(foreign_key="user.id", index=True)
+    filename: str  # display name only
+    ext: str  # whitelisted extension, e.g. ".mp4"
+    size: int
+    chunk_size: int
+    total_chunks: int
+    fingerprint: str = Field(default="", index=True)  # client-side file identity, used to resume
+    status: str = "uploading"  # uploading | completing | completed
+    project_id: Optional[int] = None
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class Job(SQLModel, table=True):
     """Background work item for the worker queue."""
 

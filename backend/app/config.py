@@ -1,6 +1,8 @@
 """Central settings, loaded from environment variables / backend/.env."""
 from __future__ import annotations
 
+import math
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -49,6 +51,15 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "int8"
     whisper_threads: int = 0  # 0 = let CTranslate2 decide
 
+    # uploads (chunked + resumable, see api/uploads.py)
+    # One chunk = one short request. Railway's proxy requires a request body to finish
+    # uploading within 5 minutes, so chunks must stay small enough for slow home uplinks.
+    upload_chunk_mb: int = 4
+    max_upload_gb: float = 10
+    upload_ttl_hours: int = 24  # unfinished uploads are deleted after this long without a new chunk
+    upload_min_free_mb: int = 512  # keep this much of the volume free for renders
+    max_active_uploads: int = 3  # unfinished uploads kept per user (oldest is dropped)
+
     # downloads
     ytdlp_format: str = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"
     allow_local_paths: bool = True
@@ -61,6 +72,10 @@ class Settings(BaseSettings):
     @property
     def projects_dir(self) -> Path:
         return self.data_dir / "projects"
+
+    @property
+    def uploads_dir(self) -> Path:
+        return self.data_dir / "uploads"
 
     @property
     def music_dir(self) -> Path:
@@ -79,8 +94,46 @@ class Settings(BaseSettings):
         return BACKEND_DIR / "assets"
 
     def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.projects_dir, self.music_dir, self.models_dir):
+        for d in (self.data_dir, self.projects_dir, self.uploads_dir, self.music_dir, self.models_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache
+def effective_cpus() -> int:
+    """CPU cores this process may really use. Never below 1.
+
+    Containers often see every core of the host while a cgroup quota allows far
+    fewer, so thread counts based on os.cpu_count() waste memory and get slower.
+    Order: CPU_LIMIT env override, then scheduler affinity capped by the cgroup quota.
+    """
+    override = os.environ.get("CPU_LIMIT", "").strip()
+    if override:
+        try:
+            return max(1, int(math.ceil(float(override))))
+        except ValueError:
+            pass
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    quota = None
+    try:  # cgroup v2: "max 100000" or "200000 100000"
+        raw = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if len(raw) == 2 and raw[0] != "max":
+            quota = float(raw[0]) / float(raw[1])
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    if quota is None:
+        try:  # cgroup v1
+            q = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+            per = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+            if q > 0 and per > 0:
+                quota = q / per
+        except (OSError, ValueError):
+            pass
+    if quota is not None:
+        n = min(n, int(math.ceil(quota)))
+    return max(1, n)
 
 
 @lru_cache

@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import auth as auth_api
-from .api import music, projects
+from .api import music, projects, uploads
 from .api.deps import current_user
 from .auth import request_user_id
 from .config import get_settings
@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
     s = get_settings()
     init_db()
     register_all()
+    uploads.recover_uploads()
     bins = check_binaries()
     if not all(bins.values()):
         log.error("FFmpeg/ffprobe not found on PATH: %s. Install FFmpeg before generating clips.", bins)
@@ -57,16 +58,24 @@ app.add_middleware(
 )
 
 
+# Requests with a (possibly huge) body: turned away before the body is read when not signed in.
+_BODY_PATHS = ("/api/uploads", "/api/projects/upload", "/api/music")
+
+
 @app.middleware("http")
 async def protect_media(request: Request, call_next):
-    """Rendered videos, thumbnails and music are only served to signed-in users."""
-    if request.url.path.startswith("/media/") and request_user_id(request) is None:
+    """Rendered videos, thumbnails and music are only served to signed-in users,
+    and nobody can make the server swallow an upload without a session."""
+    path = request.url.path
+    guarded = path.startswith("/media/") or (request.method in ("POST", "PUT") and path.startswith(_BODY_PATHS))
+    if guarded and request_user_id(request) is None:
         return JSONResponse({"detail": "Not signed in"}, status_code=401)
     return await call_next(request)
 
 
 app.include_router(auth_api.router)
 app.include_router(projects.router)
+app.include_router(uploads.router)
 app.include_router(music.router)
 # Range requests are supported, so videos seek instantly.
 app.mount("/media/projects", StaticFiles(directory=_settings.projects_dir), name="media-projects")

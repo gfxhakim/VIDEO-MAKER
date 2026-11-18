@@ -6,17 +6,18 @@ import { useEffect, useRef, useState } from "react";
 import useSWR from "swr";
 import { AnimatePresence, motion } from "motion/react";
 import { toast } from "sonner";
-import { ArrowRight, CheckCircle2, Clapperboard, Film, FileVideo, FolderOpen, Link2, Loader2, Sparkles, Trash2, UploadCloud, Wand2, X } from "lucide-react";
+import { ArrowRight, CheckCircle2, Clapperboard, Film, FileVideo, FolderOpen, Link2, Loader2, Sparkles, Trash2, UploadCloud, Wand2 } from "lucide-react";
 import { PageHeader } from "@/components/app-shell";
 import { useAuth } from "@/components/auth-provider";
 import { StatusBadge } from "@/components/status-badge";
 import { StyleSelector } from "@/components/style-selector";
+import { UploadProgress, useUpload } from "@/components/upload-provider";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { api, DEFAULT_SETTINGS, fetcher, type Clip, type GenerationSettings, type Project } from "@/lib/api";
-import { cn, fmtDuration } from "@/lib/utils";
+import { cn, fmtBytes, fmtDuration } from "@/lib/utils";
 
 const SOURCES = [
   { key: "upload", label: "Upload", short: "Upload", icon: UploadCloud },
@@ -48,11 +49,12 @@ export default function Studio() {
   const [source, setSource] = useState<(typeof SOURCES)[number]["key"]>("upload");
   const [url, setUrl] = useState("");
   const [path, setPath] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const up = useUpload(); // lives above the pages: the upload keeps going while you pick a style or browse
+  const u = up.upload;
+  const unfinished = up.unfinished.find((x) => x.received_bytes > 0); // left over from an earlier visit
   const [settings, setSettings] = useState<GenerationSettings>(DEFAULT_SETTINGS);
   const [styleOpen, setStyleOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [drag, setDrag] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const composer = useRef<HTMLDivElement>(null);
@@ -61,16 +63,20 @@ export default function Studio() {
     if (new URLSearchParams(window.location.search).get("new")) composer.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
 
-  const ready = (source === "upload" && !!file) || (source === "url" && /^https?:\/\//.test(url.trim())) || (source === "path" && !!path.trim());
+  const ready = (source === "upload" && !!u && u.phase !== "error") || (source === "url" && /^https?:\/\//.test(url.trim())) || (source === "path" && !!path.trim());
 
   async function generate() {
+    if (source === "upload") {
+      if (!u) return;
+      up.generate(settings); // starts now if every byte is in, otherwise the moment the upload finishes
+      setStyleOpen(false);
+      if (u.phase !== "uploaded") toast.success(`${settings.clip_count} clips will start when the upload finishes`, { description: "Keep this tab open. You can use the rest of the app meanwhile." });
+      return; // the upload provider opens the project when it exists
+    }
     setBusy(true);
     try {
       let p: Project;
-      if (source === "upload" && file) {
-        setUploadPct(0);
-        p = await api.createFromUpload(file, settings, setUploadPct);
-      } else if (source === "url") p = await api.createFromLink({ url: url.trim(), settings });
+      if (source === "url") p = await api.createFromLink({ url: url.trim(), settings });
       else p = await api.createFromLink({ path: path.trim(), settings });
       toast.success("Your clips are cooking", { description: `${settings.clip_count} clips on the way.` });
       setStyleOpen(false);
@@ -80,7 +86,6 @@ export default function Studio() {
       toast.error("Could not start", { description: (e as Error).message });
     } finally {
       setBusy(false);
-      setUploadPct(null);
     }
   }
 
@@ -114,17 +119,27 @@ export default function Studio() {
               <motion.div key={source} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.15 }}>
                 {source === "upload" && (
                   <div
-                    onClick={() => fileInput.current?.click()}
+                    onClick={() => !u && fileInput.current?.click()}
                     onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
                     onDragLeave={() => setDrag(false)}
-                    onDrop={(e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) setFile(f); }}
-                    className={cn("relative grid h-44 cursor-pointer place-items-center rounded-2xl border-2 border-dashed border-white/15 text-center transition", drag ? "scale-[1.01] border-primary bg-primary/10" : "hover:border-white/30 hover:bg-white/[.02]")}
+                    onDrop={(e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) up.start(f); }}
+                    className={cn("relative grid min-h-44 place-items-center rounded-2xl border-2 border-dashed border-white/15 text-center transition", !u && "cursor-pointer", drag ? "scale-[1.01] border-primary bg-primary/10" : !u && "hover:border-white/30 hover:bg-white/[.02]")}
                   >
-                    {file ? (
-                      <div className="flex items-center gap-3 px-4 text-sm">
-                        <span className="bg-brand grid size-11 shrink-0 place-items-center rounded-xl"><FileVideo className="size-5 text-white" /></span>
-                        <div className="min-w-0 text-left"><div className="truncate font-medium">{file.name}</div><div className="text-xs text-muted-foreground">{(file.size / 1e6).toFixed(0)} MB · ready</div></div>
-                        <button onClick={(e) => { e.stopPropagation(); setFile(null); }} className="rounded-md p-1 text-muted-foreground hover:bg-white/10"><X className="size-4" /></button>
+                    {u ? (
+                      <div className="w-full max-w-lg px-4 py-5 text-left text-sm">
+                        <div className="mb-3 flex items-center gap-3">
+                          <span className="bg-brand grid size-11 shrink-0 place-items-center rounded-xl"><FileVideo className="size-5 text-white" /></span>
+                          <div className="min-w-0"><div className="truncate font-medium">{u.fileName}</div><div className="text-xs text-muted-foreground">{fmtBytes(u.size)}</div></div>
+                        </div>
+                        <UploadProgress />
+                        {u.autoStart && <p className="mt-2 text-xs text-muted-foreground">Clips start by themselves when the upload finishes. Keep this tab open.</p>}
+                      </div>
+                    ) : unfinished ? (
+                      <div className="px-4 text-sm text-muted-foreground">
+                        <UploadCloud className="mx-auto mb-3 size-9 text-primary" />
+                        <span className="text-foreground">{Math.floor((unfinished.received_bytes / unfinished.size) * 100)}% of &ldquo;{unfinished.filename}&rdquo; is already uploaded</span>
+                        <div className="mt-1 text-xs">Choose the same file again to continue from {fmtBytes(unfinished.received_bytes)}.</div>
+                        <button onClick={(e) => { e.stopPropagation(); up.discard(unfinished.id); }} className="mt-2 text-xs underline underline-offset-2 hover:text-foreground">Discard it</button>
                       </div>
                     ) : (
                       <div className="text-sm text-muted-foreground">
@@ -135,7 +150,7 @@ export default function Studio() {
                         <div className="mt-1 text-xs">MP4 · MOV · MKV · WEBM</div>
                       </div>
                     )}
-                    <input ref={fileInput} type="file" accept="video/*" hidden onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+                    <input ref={fileInput} type="file" accept="video/*,.mkv,.avi,.m4v,.flv,.ts" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) up.start(f); e.target.value = ""; }} />
                   </div>
                 )}
                 {source === "url" && (
@@ -175,7 +190,7 @@ export default function Studio() {
             </div>
             <motion.button whileTap={{ scale: 0.97 }} disabled={!ready} onClick={() => setStyleOpen(true)}
               className="bg-brand group flex h-12 items-center justify-center gap-2 rounded-xl font-semibold text-white shadow-lg shadow-fuchsia-500/25 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40">
-              <Wand2 className="size-4" /> Choose style <ArrowRight className="size-4 transition group-hover:translate-x-0.5" />
+              <Wand2 className="size-4" /> {source === "upload" && u?.autoStart ? "Change style" : "Choose style"} <ArrowRight className="size-4 transition group-hover:translate-x-0.5" />
             </motion.button>
           </div>
         </div>
@@ -196,12 +211,15 @@ export default function Studio() {
             <DialogDescription>Applied to every clip in this run. You can re-style later without transcribing again.</DialogDescription>
           </DialogHeader>
           <StyleSelector value={settings} onChange={setSettings} />
-          <DialogFooter className="glass sticky -bottom-6 -mx-6 -mb-6 items-center border-t px-6 py-4">
-            {uploadPct !== null && <div className="mr-auto flex w-56 items-center gap-2 text-xs text-muted-foreground"><Progress value={uploadPct} /> {Math.round(uploadPct)}%</div>}
-            <Button variant="ghost" onClick={() => setStyleOpen(false)} disabled={busy}>Back</Button>
-            <Button size="lg" onClick={generate} disabled={busy} className="bg-brand text-white hover:brightness-110">
-              {busy ? <Loader2 className="animate-spin" /> : <Sparkles />} Generate {settings.clip_count} clips
-            </Button>
+          {/* opaque (not glass): the options scroll underneath and must not show through the progress text */}
+          <DialogFooter className="sticky -bottom-6 -mx-6 -mb-6 flex-col gap-3 border-t bg-card px-6 py-4 sm:items-center">
+            {source === "upload" && u && <UploadProgress className="sm:mr-auto sm:w-80" />}
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" onClick={() => setStyleOpen(false)} disabled={busy}>Back</Button>
+              <Button size="lg" onClick={generate} disabled={busy} className="bg-brand flex-1 text-white hover:brightness-110 sm:flex-none">
+                {busy ? <Loader2 className="animate-spin" /> : <Sparkles />} Generate {settings.clip_count} clips
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>
