@@ -13,7 +13,7 @@ import { ClipStudio } from "@/components/clip-studio";
 import { StatusBadge } from "@/components/status-badge";
 import { StyleSelector } from "@/components/style-selector";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { api, fetcher, type Clip, type GenerationSettings, type Project } from "@/lib/api";
 import { cn, fmtDuration } from "@/lib/utils";
@@ -115,8 +115,8 @@ function ProjectView() {
       <Dialog open={!!restyle} onOpenChange={(o) => !o && setRestyle(null)}>
         <DialogContent className="max-w-4xl">
           <DialogHeader><DialogTitle>Re-style this project</DialogTitle></DialogHeader>
-          {restyle && <StyleSelector value={restyle} onChange={setRestyle} />}
-          <DialogFooter className="glass sticky -bottom-6 -mx-6 -mb-6 border-t px-6 py-4">
+          <DialogBody>{restyle && <StyleSelector value={restyle} onChange={setRestyle} />}</DialogBody>
+          <DialogFooter>
             <Button className="bg-brand text-white" onClick={async () => {
               try {
                 await api.regenerate(project.id, restyle!);

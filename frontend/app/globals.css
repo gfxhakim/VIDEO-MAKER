@@ -2,9 +2,15 @@
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
+/* Landscape phones and other very short windows: `short:` */
+@custom-variant short (@media (max-height: 520px) and (orientation: landscape));
+/* Tall-enough screens only: `tall:` (use to add vertical breathing room) */
+@custom-variant tall (@media (min-height: 860px));
 
 /* shadcn/ui tokens, dark-first "studio" palette */
 :root {
+  /* dark native scrollbars, form controls and media players */
+  color-scheme: dark;
   --radius: 0.75rem;
   --background: oklch(0.145 0.006 270);
   --foreground: oklch(0.97 0 0);
@@ -60,8 +66,45 @@
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    scrollbar-color: oklch(1 0 0 / 22%) transparent;
+  }
   body {
     @apply bg-background text-foreground antialiased;
+  }
+  /* Tailwind v4 dropped the pointer cursor on buttons */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"],
+  [role="switch"],
+  [role="checkbox"],
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+  /* thin dark scrollbars everywhere (WebKit/Blink; Firefox uses scrollbar-color above) */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: oklch(1 0 0 / 16%);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(1 0 0 / 30%);
+    background-clip: padding-box;
+    border: 2px solid transparent;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
   }
 }
 

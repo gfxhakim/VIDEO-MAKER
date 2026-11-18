@@ -13,7 +13,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { StyleSelector } from "@/components/style-selector";
 import { UploadProgress, useUpload } from "@/components/upload-provider";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { api, DEFAULT_SETTINGS, fetcher, type Clip, type GenerationSettings, type Project } from "@/lib/api";
@@ -210,9 +210,8 @@ export default function Studio() {
             <DialogTitle className="flex items-center gap-2"><Sparkles className="size-5 text-primary" /> Pick your style</DialogTitle>
             <DialogDescription>Applied to every clip in this run. You can re-style later without transcribing again.</DialogDescription>
           </DialogHeader>
-          <StyleSelector value={settings} onChange={setSettings} />
-          {/* opaque (not glass): the options scroll underneath and must not show through the progress text */}
-          <DialogFooter className="sticky -bottom-6 -mx-6 -mb-6 flex-col gap-3 border-t bg-card px-6 py-4 sm:items-center">
+          <DialogBody><StyleSelector value={settings} onChange={setSettings} /></DialogBody>
+          <DialogFooter className="flex-col gap-3">
             {source === "upload" && u && <UploadProgress className="sm:mr-auto sm:w-80" />}
             <div className="flex items-center gap-2">
               <Button variant="ghost" onClick={() => setStyleOpen(false)} disabled={busy}>Back</Button>
