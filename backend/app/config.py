@@ -149,3 +149,16 @@ def get_settings() -> Settings:
             key_file.write_text(secrets.token_urlsafe(48))
         s.app_secret_key = key_file.read_text().strip()
     return s
+
+
+def ffmpeg_thread_count() -> int:
+    """Threads for one ffmpeg process: FFMPEG_THREADS if set, else the usable cores (max 8)."""
+    return get_settings().ffmpeg_threads or min(effective_cpus(), 8)
+
+
+@lru_cache
+def nice_prefix() -> tuple[str, ...]:
+    """Command prefix that runs heavy ffmpeg work at low priority, so the API stays responsive."""
+    import shutil
+
+    return ("nice", "-n", "10") if os.name == "posix" and shutil.which("nice") else ()
