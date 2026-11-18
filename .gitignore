@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# App data (uploads, renders, sqlite db)
+backend/data/
+backend/fonts/*.ttf
+backend/fonts/*.otf
+!backend/fonts/README.md
+backend/.env
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
+
+.DS_Store

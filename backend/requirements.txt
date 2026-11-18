@@ -1,0 +1,18 @@
+# --- API ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+sqlmodel>=0.0.50  # stores/returns timezone-aware UTC datetimes
+pydantic-settings>=2.4
+httpx>=0.27
+cryptography>=43
+
+# --- Media / AI ---
+numpy>=1.26
+opencv-python-headless>=4.8,<5   # face detection (Haar cascades were removed in OpenCV 5)
+pillow>=10.4                    # hook title cards + emoji overlays
+yt-dlp>=2024.10.7               # URL ingestion
+faster-whisper>=1.0.3           # local word-level transcription (CPU int8 friendly)
+
+# --- Dev ---
+pytest>=8
