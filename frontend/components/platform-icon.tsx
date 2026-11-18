@@ -14,15 +14,27 @@ export const PLATFORMS: Platform[] = ["tiktok", "instagram", "youtube", "faceboo
 export function PlatformIcon({ platform, className }: { platform: Platform; className?: string }) {
   const s = STYLE[platform];
   return (
-    <span title={s?.label} className={cn("grid size-6 shrink-0 place-items-center rounded-md text-[9px] font-bold text-white", s?.cls, className)}>
+    <span
+      title={s?.label}
+      className={cn("grid size-6 shrink-0 place-items-center rounded-md text-[0.5625rem] leading-none font-bold text-white select-none", s?.cls, className)}
+    >
       {s?.letter ?? "?"}
     </span>
   );
 }
 
+/** Full product name, for sentences ("Marked as posted on YouTube Shorts"). */
 export const PLATFORM_LABEL: Record<Platform, string> = {
   tiktok: "TikTok",
   instagram: "Instagram",
   youtube: "YouTube Shorts",
+  facebook: "Facebook",
+};
+
+/** One word, for tight spots like the platform picker on a phone. */
+export const PLATFORM_SHORT: Record<Platform, string> = {
+  tiktok: "TikTok",
+  instagram: "Instagram",
+  youtube: "YouTube",
   facebook: "Facebook",
 };
