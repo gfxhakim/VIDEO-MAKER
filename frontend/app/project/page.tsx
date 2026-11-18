@@ -113,7 +113,7 @@ function ProjectView() {
       <ClipStudio clips={playable} index={open} onIndex={setOpen} onClose={() => setOpen(null)} onChange={updateClip} />
 
       <Dialog open={!!restyle} onOpenChange={(o) => !o && setRestyle(null)}>
-        <DialogContent className="max-w-4xl">
+        <DialogContent className="sm:max-w-4xl">
           <DialogHeader><DialogTitle>Re-style this project</DialogTitle></DialogHeader>
           <DialogBody>{restyle && <StyleSelector value={restyle} onChange={setRestyle} />}</DialogBody>
           <DialogFooter>

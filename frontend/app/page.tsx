@@ -205,7 +205,7 @@ export default function Studio() {
       </div>
 
       <Dialog open={styleOpen} onOpenChange={(o) => !busy && setStyleOpen(o)}>
-        <DialogContent className="max-w-4xl">
+        <DialogContent className="sm:max-w-4xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2"><Sparkles className="size-5 text-primary" /> Pick your style</DialogTitle>
             <DialogDescription>Applied to every clip in this run. You can re-style later without transcribing again.</DialogDescription>
