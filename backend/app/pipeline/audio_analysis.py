@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,32 @@ def energy_curve(pcm: np.ndarray, sr: int, step: float = 0.25) -> np.ndarray:
     frames = pcm[: n * hop].reshape(n, hop)
     rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-12)
     return (20 * np.log10(rms + 1e-9)).astype(np.float32)
+
+
+def energy_curve_wav(path: str | Path, step: float = 0.25, block_seconds: float = 60.0) -> np.ndarray:
+    """energy_curve() for a 16-bit mono WAV, read a minute at a time.
+
+    Same numbers as load_pcm() + energy_curve(), but memory stays flat: loading an hour of
+    audio in one piece peaked above 900 MB, enough to get a small server killed.
+    Raises ValueError for anything that is not 16-bit mono PCM.
+    """
+    out: list[np.ndarray] = []
+    with wave.open(str(path), "rb") as w:
+        if w.getnchannels() != 1 or w.getsampwidth() != 2:
+            raise ValueError("expected a 16-bit mono WAV")
+        hop = max(1, int(w.getframerate() * step))
+        block = hop * max(1, int(round(block_seconds / step)))
+        while True:
+            raw = w.readframes(block)
+            n = len(raw) // 2 // hop
+            if n == 0:
+                break
+            frames = np.frombuffer(raw, dtype="<i2", count=n * hop).astype(np.float64) / 32768.0
+            rms = np.sqrt(np.mean(frames.reshape(n, hop) ** 2, axis=1) + 1e-12)
+            out.append((20 * np.log10(rms + 1e-9)).astype(np.float32))
+            if len(raw) < block * 2:
+                break
+    return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
 
 
 def _moving_avg(x: np.ndarray, k: int) -> np.ndarray:

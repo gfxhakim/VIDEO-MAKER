@@ -11,6 +11,7 @@ opencv-python-headless>=4.8,<5   # face detection (Haar cascades were removed in
 pillow>=10.4                    # hook title cards + emoji overlays
 yt-dlp>=2024.10.7               # URL ingestion
 faster-whisper>=1.0.3           # local word-level transcription (CPU int8 friendly)
+av<19                           # PyAV 19 removed an argument faster-whisper's file loader still passes
 
 # --- Dev ---
 pytest>=8

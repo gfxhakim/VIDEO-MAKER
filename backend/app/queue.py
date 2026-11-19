@@ -19,12 +19,14 @@ from typing import Any, Callable
 from sqlalchemy import text
 from sqlmodel import select
 
-from .config import get_settings
+from .config import get_settings, worker_count
 from .db import engine, session_scope
 from .models import Job, utcnow
 
 log = logging.getLogger("autoclip.queue")
 Handler = Callable[[dict], None]
+INTERRUPTED_ERROR = ("The server restarted while this was running, several times in a row. "
+                     "It may have run out of memory: try a shorter video or fewer clips.")
 _handlers: dict[str, Handler] = {}
 _failure_hooks: dict[str, Callable[[dict, str], None]] = {}
 
@@ -35,15 +37,44 @@ def register(kind: str, handler: Handler, on_final_failure: Callable[[dict, str]
         _failure_hooks[kind] = on_final_failure
 
 
-def enqueue(kind: str, payload: dict[str, Any], *, priority: int = 0, delay_seconds: float = 0, max_attempts: int | None = None) -> int:
+def enqueue(kind: str, payload: dict[str, Any], *, priority: int = 0, delay_seconds: float = 0, max_attempts: int | None = None,
+            session=None) -> int | None:
+    """Queue a job. With `session`, the job is only added to it, so it is saved in the same
+    commit as the caller's own changes (both or neither); the id is then not known yet."""
+    job = Job(kind=kind, payload=payload, priority=priority,
+              max_attempts=max_attempts or get_settings().job_max_attempts,
+              run_after=utcnow() + timedelta(seconds=delay_seconds))
+    if session is not None:
+        session.add(job)
+        return None
     with session_scope() as s:
-        job = Job(kind=kind, payload=payload, priority=priority,
-                  max_attempts=max_attempts or get_settings().job_max_attempts,
-                  run_after=utcnow() + timedelta(seconds=delay_seconds))
         s.add(job)
         s.commit()
         s.refresh(job)
         return job.id
+
+
+def cancel_queued(kind: str, match: Callable[[dict], bool]) -> int:
+    """Cancel jobs of `kind` that have not started yet and whose payload matches.
+    Running jobs are left alone (they check for themselves whether their work still matters)."""
+    with session_scope() as s:
+        ids = []
+        for j in s.exec(select(Job).where(Job.kind == kind, Job.status == "queued")).all():
+            try:
+                if match(dict(j.payload or {})):
+                    ids.append(j.id)
+            except Exception:  # noqa: BLE001
+                pass
+    if not ids:
+        return 0
+    now = utcnow().replace(tzinfo=None).isoformat(sep=" ")
+    with engine.begin() as conn:  # only jobs still queued: one a worker claimed meanwhile keeps running
+        res = conn.execute(
+            text("UPDATE job SET status='cancelled', finished_at=:now, error='No longer needed' "
+                 "WHERE status='queued' AND id IN (" + ",".join(str(int(i)) for i in ids) + ")"),
+            {"now": now},
+        )
+    return res.rowcount or 0
 
 
 def _claim(worker_id: str) -> Job | None:
@@ -69,15 +100,36 @@ def _claim(worker_id: str) -> Job | None:
 
 
 def recover_stale_jobs() -> int:
-    """Jobs left 'running' by a crashed/stopped worker go back to the queue."""
+    """Jobs left 'running' by a crashed/stopped worker go back to the queue.
+
+    A job that has already used every attempt is failed instead. Without this a job that
+    kills the whole process (out of memory on a very long video, say) would be picked up
+    again on every restart, forever.
+    """
+    requeued = 0
+    dead: list[tuple[str, dict]] = []
     with session_scope() as s:
         stale = s.exec(select(Job).where(Job.status == "running")).all()
         for j in stale:
-            j.status = "queued"
             j.locked_by = None
+            if j.attempts >= j.max_attempts:
+                j.status, j.finished_at = "failed", utcnow()
+                j.error = (j.error or "") or INTERRUPTED_ERROR
+                dead.append((j.kind, dict(j.payload or {})))
+            else:
+                j.status = "queued"
+                requeued += 1
             s.add(j)
         s.commit()
-        return len(stale)
+    for kind, payload in dead:
+        log.error("job of kind %s was interrupted on its last attempt; marking it failed", kind)
+        hook = _failure_hooks.get(kind)
+        if hook:
+            try:
+                hook(payload, INTERRUPTED_ERROR)
+            except Exception:  # noqa: BLE001
+                log.exception("failure hook crashed")
+    return requeued
 
 
 def _run_one(job: Job) -> None:
@@ -116,7 +168,7 @@ def _run_one(job: Job) -> None:
 
 class Worker:
     def __init__(self, concurrency: int | None = None):
-        self.concurrency = max(1, concurrency or get_settings().worker_concurrency)
+        self.concurrency = max(1, concurrency or worker_count())
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self.id = f"{socket.gethostname()}:{os.getpid()}"

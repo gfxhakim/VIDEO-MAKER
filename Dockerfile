@@ -29,4 +29,4 @@ RUN python scripts/download_fonts.py || echo "font download skipped"
 COPY --from=web /web/out /app/frontend/out
 RUN mkdir -p /data
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*' --timeout-keep-alive 75"]

@@ -2,9 +2,15 @@
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
+/* Landscape phones and other very short windows: `short:` */
+@custom-variant short (@media (max-height: 520px) and (orientation: landscape));
+/* Tall-enough screens only: `tall:` (use to add vertical breathing room) */
+@custom-variant tall (@media (min-height: 860px));
 
 /* shadcn/ui tokens, dark-first "studio" palette */
 :root {
+  /* dark native scrollbars, form controls and media players */
+  color-scheme: dark;
   --radius: 0.75rem;
   --background: oklch(0.145 0.006 270);
   --foreground: oklch(0.97 0 0);
@@ -60,8 +66,82 @@
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    /* the pressed states below replace the grey tap flash on phones */
+    -webkit-tap-highlight-color: transparent;
+  }
   body {
     @apply bg-background text-foreground antialiased;
+  }
+  /* Tailwind v4 dropped the pointer cursor on buttons */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"],
+  [role="switch"],
+  [role="checkbox"],
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+  /* Keyboard focus is always visible. Components that draw their own ring opt out with `outline-none`. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  /* Every button answers a press, also the hand-made ones (a utility such as active:scale-95 still wins). */
+  @media (prefers-reduced-motion: no-preference) {
+    button:not(:disabled):active {
+      scale: 0.98;
+    }
+  }
+
+  /* ---------- scrollbars: slim, dark, pill-shaped ----------
+     Blink and WebKit are styled with the ::-webkit-scrollbar parts. Setting `scrollbar-color` or
+     `scrollbar-width` as well would switch those parts OFF in Chrome 121+ and bring back the wide
+     standard bar, so the standard properties are only given to browsers without the parts (Firefox). */
+  @supports not selector(::-webkit-scrollbar) {
+    html {
+      scrollbar-color: oklch(1 0 0 / 22%) transparent;
+    }
+    * {
+      scrollbar-width: thin;
+    }
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  /* the page's own bar is a little wider, so it is easy to grab at the screen edge
+     (Blink reads the viewport's bar from <body>, WebKit from <html>) */
+  html::-webkit-scrollbar,
+  body::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  /* the see-through border keeps the thumb off the edge, so it never squares off a rounded corner */
+  ::-webkit-scrollbar-thumb {
+    background: oklch(1 0 0 / 18%);
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    min-height: 40px;
+  }
+  ::-webkit-scrollbar-thumb:hover,
+  ::-webkit-scrollbar-thumb:active {
+    background: oklch(1 0 0 / 34%);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-button {
+    display: none;
   }
 }
 
@@ -80,10 +160,18 @@
 .bg-brand {
   background: linear-gradient(120deg, #8b5cf6 0%, #d946ef 50%, #f97316 100%);
 }
+/* Frosted card: blurs what is behind it. Touch devices get a plain near-solid card instead (see below). */
 .glass {
   background: color-mix(in oklch, var(--card) 72%, transparent);
   backdrop-filter: blur(18px) saturate(140%);
   -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+/* App chrome (sidebar, phone top bar, tab bar): denser than a card so page content cannot be read
+   through it, and it keeps its blur on every device (there are only one or two of these on screen). */
+.glass-chrome {
+  background: color-mix(in oklch, var(--card) 86%, transparent);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
 }
 
 /* soft moving color blobs behind the app */
@@ -97,6 +185,8 @@
     radial-gradient(35% 30% at 80% 10%, rgb(217 70 239 / 0.16), transparent 70%),
     radial-gradient(40% 35% at 70% 85%, rgb(249 115 22 / 0.12), transparent 70%);
   filter: blur(30px);
+  /* its own layer: the blur is painted once and only the layer moves */
+  will-change: transform;
   animation: aurora 22s ease-in-out infinite alternate;
 }
 @keyframes aurora {
@@ -113,8 +203,36 @@
   background-size: 800px 100%;
   animation: shimmer 1.4s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) {
-  .aurora, .skeleton { animation: none; }
+
+/* Phones, tablets and "reduce motion": a still backdrop and no per-card blur. A moving layer under
+   a dozen backdrop filters makes the GPU redo every card on every frame, which shows up as janky
+   scrolling on modest phones. The colors stay the same; cards become near-solid instead of frosted. */
+@media (pointer: coarse), (prefers-reduced-motion: reduce) {
+  .aurora {
+    inset: 0;
+    filter: none;
+    will-change: auto;
+    animation: none;
+  }
+  .glass {
+    background: color-mix(in oklch, var(--card) 94%, transparent);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
 }
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+}
+
+/* iOS zooms the whole page when a focused field is smaller than 16px. Not in a layer on purpose,
+   so it also covers fields that set `text-sm` themselves. */
+@media (pointer: coarse) {
+  input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="button"], [type="submit"]),
+  textarea,
+  select {
+    font-size: max(16px, 1em);
+  }
+}
+
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { scrollbar-width: none; }

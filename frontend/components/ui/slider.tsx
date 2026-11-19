@@ -13,7 +13,7 @@ function Slider({ className, ...props }: React.ComponentProps<typeof SliderPrimi
       {Array.from({ length: count }).map((_, i) => (
         <SliderPrimitive.Thumb
           key={i}
-          className="block size-4 rounded-full border border-primary bg-background shadow-sm transition-[color,box-shadow] hover:ring-4 hover:ring-ring/50 focus-visible:ring-4 focus-visible:outline-hidden"
+          className="relative block size-4 rounded-full pointer-coarse:size-5 pointer-coarse:after:absolute pointer-coarse:after:content-[''] pointer-coarse:after:-inset-3 border border-primary bg-background shadow-sm transition-[color,box-shadow] hover:ring-4 hover:ring-ring/50 focus-visible:ring-4 focus-visible:outline-hidden"
         />
       ))}
     </SliderPrimitive.Root>

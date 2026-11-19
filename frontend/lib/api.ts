@@ -83,6 +83,9 @@ export type Project = {
   thumb_url: string | null;
 };
 
+/** Still being worked on by the server (so pages keep polling it). */
+export const isLive = (p?: Pick<Project, "status"> | null) => p?.status === "queued" || p?.status === "processing";
+
 export type Clip = {
   id: number;
   project_id: number;
@@ -131,19 +134,42 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, { credentials: "include", ...init });
-  if (res.status === 401 && typeof window !== "undefined" && !path.startsWith("/api/auth")) {
-    window.location.href = "/signin";
+/** Turns a failed response into one plain sentence (FastAPI sends {"detail": ...}; proxies send HTML). */
+export async function errorMessage(res: Response): Promise<string> {
+  let msg = "";
+  try {
+    const j = await res.clone().json();
+    const d = j?.detail ?? j;
+    if (typeof d === "string") msg = d;
+    else if (Array.isArray(d) && typeof d[0]?.msg === "string") msg = d[0].msg; // validation errors
+    else if (d) msg = JSON.stringify(d);
+  } catch {}
+  if (msg) return msg;
+  if (res.status === 413) return "That file is larger than the server accepts.";
+  if (res.status >= 500) return "The server had a problem. Try again in a moment.";
+  return res.statusText || `Request failed (${res.status})`;
+}
+
+/** Fired on `window` when the server says the session is gone. A listener that can handle it without
+ *  a page load (the upload provider, which would lose the picked file) calls preventDefault(). */
+export const SIGNED_OUT_EVENT = "autoclip:signed-out";
+
+function signedOut() {
+  const handled = !window.dispatchEvent(new Event(SIGNED_OUT_EVENT, { cancelable: true }));
+  if (!handled) window.location.href = "/signin";
+}
+
+async function request<T>(path: string, init?: RequestInit, quiet = false): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, { credentials: "include", ...init });
+  } catch (e) {
+    if ((e as Error)?.name === "AbortError") throw e;
+    throw new ApiError(0, "Cannot reach the server. Check your connection and try again.");
   }
-  if (!res.ok) {
-    let msg = res.statusText;
-    try {
-      const j = await res.json();
-      msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j);
-    } catch {}
-    throw new ApiError(res.status, msg);
-  }
+  if (res.status === 401 && !quiet && typeof window !== "undefined" && !path.startsWith("/api/auth")) signedOut();
+  if (!res.ok) throw new ApiError(res.status, await errorMessage(res));
+  if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
 
@@ -154,6 +180,8 @@ const json = (method: string, body?: unknown): RequestInit => ({
 });
 
 export const fetcher = <T,>(path: string) => request<T>(path);
+/** Same, but a lost session only makes it fail: for requests sent before the session check has answered. */
+export const quietFetcher = <T,>(path: string) => request<T>(path, undefined, true);
 
 export const api = {
   presets: () => request<Presets>("/api/presets"),
@@ -161,23 +189,6 @@ export const api = {
 
   createFromLink: (body: { url?: string; path?: string; name?: string; settings: GenerationSettings }) =>
     request<Project>("/api/projects", json("POST", body)),
-  createFromUpload: (file: File, settings: GenerationSettings, onProgress?: (pct: number) => void) =>
-    new Promise<Project>((resolve, reject) => {
-      // XHR so we can show upload progress for big files
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("settings", JSON.stringify(settings));
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", `${API_URL}/api/projects/upload`);
-      xhr.withCredentials = true;
-      xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.((e.loaded / e.total) * 100);
-      xhr.onload = () => {
-        if (xhr.status < 300) resolve(JSON.parse(xhr.responseText));
-        else reject(new ApiError(xhr.status, xhr.responseText));
-      };
-      xhr.onerror = () => reject(new ApiError(0, "Network error"));
-      xhr.send(fd);
-    }),
   regenerate: (id: number, settings?: GenerationSettings) =>
     request<Project>(`/api/projects/${id}/generate`, json("POST", settings)),
   deleteProject: (id: number) => request(`/api/projects/${id}`, { method: "DELETE" }),
@@ -187,10 +198,32 @@ export const api = {
   rerenderClip: (id: number) => request<Clip>(`/api/clips/${id}/rerender`, json("POST")),
   clipDownloadUrl: (id: number) => `${API_URL}/api/clips/${id}/download`,
 
-  uploadMusic: (files: File[]) => {
+  /** `onProgress` gets 0..100 while the files travel (XHR, because fetch cannot report upload progress). */
+  uploadMusic: (files: File[], onProgress?: (pct: number) => void) => {
     const fd = new FormData();
     files.forEach((f) => fd.append("files", f));
-    return request<MusicTrack[]>("/api/music", { method: "POST", body: fd });
+    if (!onProgress) return request<MusicTrack[]>("/api/music", { method: "POST", body: fd });
+    return new Promise<MusicTrack[]>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_URL}/api/music`);
+      xhr.withCredentials = true;
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && e.total > 0) onProgress(Math.min(100, (e.loaded / e.total) * 100));
+      };
+      xhr.onload = () => {
+        if (xhr.status === 401) signedOut();
+        let body: unknown = null;
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {}
+        if (xhr.status >= 200 && xhr.status < 300 && Array.isArray(body)) return resolve(body as MusicTrack[]);
+        const detail = (body as { detail?: unknown } | null)?.detail;
+        reject(new ApiError(xhr.status, typeof detail === "string" ? detail : xhr.status === 413 ? "That file is larger than the server accepts." : `Upload failed (${xhr.status})`));
+      };
+      xhr.onerror = () => reject(new ApiError(0, "Connection problem during the upload. Check your internet and try again."));
+      xhr.onabort = () => reject(new ApiError(0, "Upload cancelled"));
+      xhr.send(fd);
+    });
   },
   deleteMusic: (id: number) => request(`/api/music/${id}`, { method: "DELETE" }),
 

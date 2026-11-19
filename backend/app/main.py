@@ -11,12 +11,14 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
+from starlette.middleware.gzip import GZipMiddleware
 
 from .api import auth as auth_api
-from .api import music, projects
+from .api import music, projects, uploads
 from .api.deps import current_user
 from .auth import request_user_id
-from .config import get_settings
+from .config import effective_cpus, get_settings, memory_limit_bytes, worker_count
 from .db import init_db
 from .jobs import register_all
 from .pipeline.media import check_binaries
@@ -31,6 +33,7 @@ async def lifespan(app: FastAPI):
     s = get_settings()
     init_db()
     register_all()
+    uploads.recover_uploads()
     bins = check_binaries()
     if not all(bins.values()):
         log.error("FFmpeg/ffprobe not found on PATH: %s. Install FFmpeg before generating clips.", bins)
@@ -57,16 +60,79 @@ app.add_middleware(
 )
 
 
+_TEXT_EXT = (".html", ".js", ".css", ".json", ".txt", ".svg", ".map", ".xml", ".webmanifest")
+
+
+def _compressible(path: str) -> bool:
+    """Pages, scripts and JSON shrink 3-5x with gzip. Video, images, fonts and zips are
+    already compressed, and upload chunks answer with a few bytes: leave those alone."""
+    if path.startswith(("/media/", "/api/uploads")):
+        return False
+    if path.startswith("/api/"):
+        return not path.endswith(("/download", ".zip"))
+    last = path.rsplit("/", 1)[-1]
+    return "." not in last or last.endswith(_TEXT_EXT)
+
+
+def _cache_policy(path: str) -> str | None:
+    if path.startswith("/_next/static/"):
+        return "public, max-age=31536000, immutable"  # file names contain a content hash
+    if path.startswith(("/api/", "/media/")):
+        return None
+    last = path.rsplit("/", 1)[-1]
+    if "." not in last or last.endswith(".html"):
+        return "no-cache"  # pages: always check, so a new deploy shows up at once (a 304 is cheap)
+    return None
+
+
+class FastDelivery:
+    """Makes the app load quicker on a slow connection: gzip for text, long-lived caching
+    for the hashed frontend files. Plain ASGI, so streamed responses are not buffered."""
+
+    def __init__(self, app):
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=1024, compresslevel=5)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        policy = _cache_policy(path)
+
+        async def send_with_cache(message):
+            if message["type"] == "http.response.start":
+                ok = message.get("status") in (200, 206, 304)
+                if policy and (ok or policy == "no-cache"):
+                    headers = MutableHeaders(scope=message)
+                    if "cache-control" not in headers:
+                        headers["Cache-Control"] = policy
+            await send(message)
+
+        handler = self.gzip if _compressible(path) else self.app
+        await handler(scope, receive, send_with_cache if policy else send)
+
+
+app.add_middleware(FastDelivery)
+
+
+# Requests with a (possibly huge) body: turned away before the body is read when not signed in.
+_BODY_PATHS = ("/api/uploads", "/api/projects/upload", "/api/music")
+
+
 @app.middleware("http")
 async def protect_media(request: Request, call_next):
-    """Rendered videos, thumbnails and music are only served to signed-in users."""
-    if request.url.path.startswith("/media/") and request_user_id(request) is None:
+    """Rendered videos, thumbnails and music are only served to signed-in users,
+    and nobody can make the server swallow an upload without a session."""
+    path = request.url.path
+    guarded = path.startswith("/media/") or (request.method in ("POST", "PUT") and path.startswith(_BODY_PATHS))
+    if guarded and request_user_id(request) is None:
         return JSONResponse({"detail": "Not signed in"}, status_code=401)
     return await call_next(request)
 
 
 app.include_router(auth_api.router)
 app.include_router(projects.router)
+app.include_router(uploads.router)
 app.include_router(music.router)
 # Range requests are supported, so videos seek instantly.
 app.mount("/media/projects", StaticFiles(directory=_settings.projects_dir), name="media-projects")
@@ -82,6 +148,10 @@ def health():
         "transcribe_backend": s.transcribe_backend,
         "whisper_model": s.whisper_model,
         "embedded_worker": s.embedded_worker,
+        # what the speed settings were derived from (handy when a server feels slow)
+        "cpus": effective_cpus(),
+        "memory_gb": round(memory_limit_bytes() / 1024**3, 1),
+        "worker_concurrency": worker_count(),
     }
 
 

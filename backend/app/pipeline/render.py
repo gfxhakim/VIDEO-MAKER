@@ -4,11 +4,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from ..config import get_settings
+from ..config import ffmpeg_thread_count, get_settings, nice_prefix
 from .captions import EmojiCue
-from .media import ffmpeg_escape_path, run
+from .media import MediaError, ffmpeg_escape_path, run, run_progress
 
 log = logging.getLogger(__name__)
 
@@ -38,12 +38,16 @@ class RenderSpec:
     hook_png: Optional[Path] = None
     hook_xy: tuple[int, int] = (0, 0)
     music: Optional[MusicSpec] = None
+    fps: float = 0.0  # source frame rate (0 = unknown); above ~31 the render drops to 30 fps first
 
 
 def build_command(spec: RenderSpec) -> list[str]:
     s = get_settings()
     dur = spec.end - spec.start
-    cmd: list[str] = [s.ffmpeg_bin, "-y", "-hide_banner", "-v", "error",
+    # One thread per usable core, at most 8: more buys no speed and costs ~30 MB each.
+    threads = str(ffmpeg_thread_count())
+    cmd: list[str] = [*nice_prefix(), s.ffmpeg_bin, "-y", "-hide_banner", "-v", "error",
+                      "-filter_complex_threads", threads, "-threads", threads,
                       "-ss", f"{spec.start:.3f}", "-t", f"{dur:.3f}", "-i", str(spec.source)]
     n_inputs = 1
     music_idx = None
@@ -67,6 +71,10 @@ def build_command(spec: RenderSpec) -> list[str]:
 
     # ---------------- video
     parts = [spec.video_filter]
+    if spec.fps > 31 and spec.video_filter.count("[0:v]") == 1:
+        # 50/60 fps source: drop to 30 fps before the crop, scale and captions instead of
+        # paying for every frame and throwing half of them away at the encoder.
+        parts = ["[0:v]fps=30[v30]", spec.video_filter.replace("[0:v]", "[v30]")]
     last = "vbase"
     if spec.ass_path:
         fonts = ffmpeg_escape_path(s.fonts_dir)
@@ -115,28 +123,25 @@ def build_command(spec: RenderSpec) -> list[str]:
     elif spec.has_audio:
         cmd += ["-map", "0:a:0"]
     cmd += [
-        "-c:v", "libx264", "-preset", s.ffmpeg_preset, "-crf", str(s.ffmpeg_crf), "-profile:v", "high",
-        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
+        "-c:v", "libx264", "-preset", s.ffmpeg_preset, "-crf", str(s.ffmpeg_crf), "-maxrate", "10M", "-bufsize", "20M",
+        "-profile:v", "high", "-pix_fmt", "yuv420p", "-r", "30", "-g", "60",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-t", f"{dur:.3f}", "-movflags", "+faststart", "-threads", str(s.ffmpeg_threads),
+        "-t", f"{dur:.3f}", "-movflags", "+faststart", "-threads", threads,
         str(spec.out_path),
     ]
     return cmd
 
 
-def render(spec: RenderSpec) -> Path:
+def render(spec: RenderSpec, on_progress: Optional[Callable[[float], None]] = None) -> Path:
+    """Encode the clip. `on_progress` gets a 0..1 fraction about once a second."""
     cmd = build_command(spec)
     (spec.work_dir / "ffmpeg_cmd.txt").write_text(" ".join(f"'{c}'" if " " in c or ";" in c else c for c in cmd))
-    import os
-    import subprocess
-
-    from .media import MediaError
-
-    proc = subprocess.run(cmd, capture_output=True, cwd=spec.work_dir, timeout=max(600, (spec.end - spec.start) * 40))
-    if proc.returncode != 0:
-        tail = proc.stderr.decode(errors="replace")[-2000:]
-        raise MediaError(f"ffmpeg render failed: {tail}")
-    if not spec.out_path.exists() or os.path.getsize(spec.out_path) < 1000:
+    dur = spec.end - spec.start
+    try:
+        run_progress(cmd, dur, on_progress, timeout=max(600, dur * 40), cwd=spec.work_dir)
+    except MediaError as e:
+        raise MediaError(f"ffmpeg render failed: {e}") from e
+    if not spec.out_path.exists() or spec.out_path.stat().st_size < 1000:
         raise MediaError("ffmpeg produced no output")
     return spec.out_path
 

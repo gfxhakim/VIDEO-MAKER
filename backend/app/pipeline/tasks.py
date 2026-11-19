@@ -6,23 +6,32 @@ analyze_music    bpm / beats / drop for an uploaded song
 
 Each clip renders as its own job, so one bad clip never sinks the whole project and
 renders can run in parallel (WORKER_CONCURRENCY).
+
+Everything that only depends on the source video (transcript, loudness curve, scene cuts,
+face tracks) is cached in the project folder, so changing the style or re-rendering a clip
+does not pay for it again.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
+import threading
+import time
+import uuid
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 import numpy as np
 from sqlmodel import select
 
-from ..config import get_settings
+from ..config import effective_cpus, ffmpeg_thread_count, get_settings
 from ..db import session_scope
 from ..models import Clip, MusicTrack, Project, utcnow
 from ..presets import ASPECT_RATIOS, get_caption_style, get_editing_style
-from ..queue import enqueue
+from ..queue import cancel_queued, enqueue
 from . import audio_analysis, captions, highlights, hook_card, ingest, media, reframe, render, transcribe
 
 log = logging.getLogger(__name__)
@@ -35,10 +44,30 @@ def project_dir(project_id: int) -> Path:
     return d
 
 
-def _update_project(project_id: int, **fields) -> None:
+class ProjectGone(BaseException):
+    """The project or clip this job was made for was deleted or replaced while it ran.
+
+    SQLite hands a deleted row's id to the next new row, so without this check a job for a
+    deleted project would write its transcript and clips into the next project, and an old
+    render would overwrite a new clip. A BaseException, so that no `except Exception` on
+    the way (progress callbacks, ffmpeg helpers) swallows it; the job handlers catch it and
+    end quietly.
+    """
+
+
+def stamp(dt) -> str:
+    """Identity of a row beyond its (reusable) id: its creation time, as stored."""
+    return dt.isoformat() if dt else ""
+
+
+def _update_project(project_id: int, *, created: Optional[str] = None, **fields) -> None:
+    """Update the project row. With `created`, raise ProjectGone instead when the row is
+    gone or now belongs to another project."""
     with session_scope() as s:
         p = s.get(Project, project_id)
-        if not p:
+        if not p or (created is not None and stamp(p.created_at) != created):
+            if created is not None:
+                raise ProjectGone(project_id)
             return
         for k, v in fields.items():
             setattr(p, k, v)
@@ -47,80 +76,168 @@ def _update_project(project_id: int, **fields) -> None:
         s.commit()
 
 
-def _stage(project_id: int, stage: str, progress: float) -> None:
-    _update_project(project_id, stage=stage, progress=round(progress, 3), status="processing")
+def _stage(project_id: int, stage: str, progress: float, created: Optional[str] = None) -> None:
+    _update_project(project_id, created=created, stage=stage, progress=round(progress, 3), status="processing")
+
+
+def _still_current(project_id: int, created: str) -> None:
+    """Raise ProjectGone if the project was deleted (or its id reused) since the job began."""
+    with session_scope() as s:
+        p = s.get(Project, project_id)
+        if not p or stamp(p.created_at) != created:
+            raise ProjectGone(project_id)
+
+
+class _Background:
+    """Run one function in a daemon thread (a pool thread would hold up the process exit
+    until a long ffmpeg scan ends)."""
+
+    def __init__(self, fn: Callable[..., Any], *args, **kwargs):
+        self._result: Any = None
+        self._error: Optional[BaseException] = None
+        self._thread = threading.Thread(target=self._run, args=(fn, args, kwargs), daemon=True, name="scene-scan")
+        self._thread.start()
+
+    def _run(self, fn, args, kwargs) -> None:
+        try:
+            self._result = fn(*args, **kwargs)
+        except BaseException as e:  # noqa: BLE001  handed to the caller in result()
+            self._error = e
+
+    def result(self) -> Any:
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        self._thread.join(timeout)
+
+
+def _fresh(cache: Path, source: Path) -> bool:
+    """True when a cached analysis file exists, is not empty and is not older than the source video."""
+    try:
+        st = cache.stat()
+        return st.st_size > 0 and st.st_mtime >= source.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _write_json(path: Path, obj) -> None:
+    """Write through a temp file, so a crash can never leave half a cache file that looks valid."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(obj))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 # =====================================================================  analyze
 def analyze_project(payload: dict) -> None:
+    try:
+        _analyze(payload)
+    except ProjectGone:
+        log.info("project %s was deleted or replaced during analysis; stopped", payload.get("project_id"))
+
+
+def _analyze(payload: dict) -> None:
     pid = int(payload["project_id"])
     with session_scope() as s:
         p = s.get(Project, pid)
         if not p:
             return
+        created = stamp(p.created_at)
+        if payload.get("created", created) != created:
+            return  # queued for a deleted project whose id now belongs to a new one
         source_type, source, source_path, settings = p.source_type, p.source, p.source_path, dict(p.settings)
     pdir = project_dir(pid)
 
-    # 1. ingest ----------------------------------------------------------------
-    _stage(pid, "Fetching video", 0.02)
-    if source_type == "url":
-        def dl_progress(f: float):
-            _stage(pid, f"Downloading video {int(f * 100)}%", 0.02 + 0.13 * f)
+    def stage(text: str, progress: float) -> None:
+        _stage(pid, text, progress, created)
 
-        path, title = ingest.download_url(source, pdir, dl_progress)
-        with session_scope() as s:
-            p = s.get(Project, pid)
-            if p.name.startswith("http") or not p.name:
-                p.name = title[:120]
-            p.source_path = str(path)
-            s.add(p)
-            s.commit()
+    # 1. ingest ----------------------------------------------------------------
+    stage("Fetching video", 0.02)
+    if source_type == "url":
+        have = Path(source_path) if source_path else None
+        if have and have.is_file() and have.stat().st_size > 0:
+            path = have  # already downloaded (new style or a retry): do not fetch it again
+        else:
+            def dl_progress(f: float):
+                # the app shows the overall percentage next to this text, so say what the number is
+                stage(f"Downloading video ({int(f * 100)}% of the file)", 0.02 + 0.13 * f)
+
+            path, title = ingest.download_url(source, pdir, dl_progress)
+            with session_scope() as s:
+                p = s.get(Project, pid)
+                if not p or stamp(p.created_at) != created:
+                    raise ProjectGone(pid)
+                if p.name.startswith("http") or not p.name:
+                    p.name = title[:120]
+                p.source_path = str(path)
+                s.add(p)
+                s.commit()
     elif source_type == "path":
         path = ingest.resolve_local_path(source, pdir)
-        _update_project(pid, source_path=str(path))
+        _update_project(pid, created=created, source_path=str(path))
     else:
         path = Path(source_path or "")
         if not path.exists():
             raise media.MediaError("Uploaded file is missing")
 
     info = media.probe(path)
-    _update_project(pid, duration=info.duration, width=info.width, height=info.height)
+    _update_project(pid, created=created, duration=info.duration, width=info.width, height=info.height)
     if info.duration < 8:
         raise media.MediaError("Video is too short (need at least 8 seconds)")
 
-    # 2. audio + transcript -----------------------------------------------------
-    _stage(pid, "Extracting audio", 0.16)
-    wav = pdir / "audio16k.wav"
-    words: list[dict] = []
-    energy = np.zeros(0, dtype=np.float32)
-    if info.has_audio:
-        media.extract_audio(path, wav)
-        pcm = media.load_pcm(wav, sr=16000)
-        energy = audio_analysis.energy_curve(pcm, 16000, ENERGY_STEP)
-        np.save(pdir / "energy.npy", energy)
+    # 2. scene cuts start now, in the background ---------------------------------
+    # They only need the source file, so they run next to audio and transcription
+    # instead of holding the bar at 62% for minutes afterwards.
+    scenes_path = pdir / "scenes.json"
+    cuts = _load_json(scenes_path) if _fresh(scenes_path, path) else None
+    stop_scan = threading.Event()
+    scan: Optional[_Background] = None
+    if not isinstance(cuts, list):
+        cuts = None
+        spare = max(1, effective_cpus() - transcribe.whisper_cpu_threads())
+        scan = _Background(media.scan_scene_changes, path, threads=min(spare, ffmpeg_thread_count()), stop=stop_scan)
 
-        tpath = pdir / "transcript.json"
-        if tpath.exists():
-            tr = json.loads(tpath.read_text())
-        else:
-            _stage(pid, "Transcribing speech (Whisper)", 0.2)
+    try:
+        # 3. audio + transcript -------------------------------------------------
+        words: list[dict] = []
+        energy = np.zeros(0, dtype=np.float32)
+        if info.has_audio:
+            energy, words = _analyze_audio(pid, created, stage, pdir, path, info, settings)
+            # an audio track can run a little longer than the picture: never clip past the end
+            words = [w for w in words if w["start"] < info.duration]
 
-            def tr_progress(f: float):
-                _stage(pid, f"Transcribing speech {int(f * 100)}%", 0.2 + 0.4 * f)
+        # 4. visual activity ----------------------------------------------------
+        if scan is not None:
+            stage("Detecting scene changes", 0.62)
+            try:
+                cuts = scan.result()
+            except media.MediaError as e:  # only costs the "action" part of the score
+                log.warning("%s", e)
+                cuts = []
+            else:
+                _still_current(pid, created)
+                _write_json(scenes_path, cuts)
+    finally:
+        stop_scan.set()  # if anything above failed, end the background ffmpeg too
+        if scan is not None:
+            scan.wait(30)  # the watcher kills ffmpeg within half a second
 
-            tr = transcribe.transcribe(wav, settings.get("language"), tr_progress, info.duration)
-            tpath.write_text(json.dumps(tr))
-        words = tr.get("words", [])
-
-    # 3. visual activity ------------------------------------------------------
-    _stage(pid, "Detecting scene changes", 0.62)
-    cuts = media.detect_scene_changes(path)
-    (pdir / "scenes.json").write_text(json.dumps(cuts))
-
-    # 4. scoring --------------------------------------------------------------
-    _stage(pid, "Scoring viral moments", 0.68)
+    # 5. scoring --------------------------------------------------------------
+    stage("Scoring viral moments", 0.68)
     chosen = highlights.select_highlights(
-        duration=info.duration, words=words, energy_db=energy, energy_step=ENERGY_STEP, scene_cuts=cuts,
+        duration=info.duration, words=words, energy_db=energy, energy_step=ENERGY_STEP, scene_cuts=cuts or [],
         count=int(settings.get("clip_count", 20)), min_len=float(settings.get("min_duration", 15)),
         max_len=float(settings.get("max_duration", 60)),
     )
@@ -129,8 +246,13 @@ def analyze_project(payload: dict) -> None:
 
     music_ids = list(settings.get("music_track_ids") or [])
     with session_scope() as s:
+        p = s.get(Project, pid)
+        if not p or stamp(p.created_at) != created:
+            raise ProjectGone(pid)
         # re-runs replace earlier clips
+        old_ids: dict[int, str] = {}
         for old in s.exec(select(Clip).where(Clip.project_id == pid)).all():
+            old_ids[old.id] = stamp(old.created_at)
             s.delete(old)
         s.commit()
         clip_ids = []
@@ -146,10 +268,91 @@ def analyze_project(payload: dict) -> None:
             s.add(clip)
             s.commit()
             s.refresh(clip)
-            clip_ids.append(clip.id)
-    _update_project(pid, stage=f"Rendering {len(clip_ids)} clips", progress=0.7, status="processing")
-    for i, cid in enumerate(clip_ids):
-        enqueue("render_clip", {"clip_id": cid}, priority=-i)
+            clip_ids.append((clip.id, stamp(clip.created_at)))
+    # Render retries still waiting for the replaced clips would otherwise run against the
+    # new clips (same ids) and race their real renders. Matched on id and creation time, so
+    # fresh jobs of another project's clips that took over one of these ids stay.
+    cancel_queued("render_clip", lambda pl: same_clip(pl, old_ids))
+    # the files of replaced clips (15-25 MB each) and face tracks nobody uses any more
+    for oid in old_ids:
+        shutil.rmtree(pdir / "clips" / str(oid), ignore_errors=True)
+    hour_ago = time.time() - 3600
+    for d in (pdir / "clips").glob("*.*-*"):  # half-built or retired folders left by a crash
+        try:
+            if d.is_dir() and d.stat().st_mtime < hour_ago:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+    keep = {_face_cache_name(round(c.start, 3), round(c.end, 3)) for c in chosen}
+    for f in (pdir / "faces").glob("*.json"):
+        if f.name not in keep:
+            f.unlink(missing_ok=True)
+
+    _update_project(pid, created=created, stage=f"Rendering {len(clip_ids)} clips", progress=0.7, status="processing")
+    for i, (cid, cstamp) in enumerate(clip_ids):
+        enqueue("render_clip", {"clip_id": cid, "created": cstamp}, priority=-i)
+
+
+def _analyze_audio(pid: int, created: str, stage: Callable[[str, float], None], pdir: Path, path: Path, info,
+                   settings: dict) -> tuple[np.ndarray, list[dict]]:
+    """Loudness curve and word-level transcript for the source, reusing earlier results."""
+    epath, tpath = pdir / "energy.npy", pdir / "transcript.json"
+    backend = get_settings().transcribe_backend.lower()
+    language = settings.get("language") or None
+
+    tr = _load_json(tpath) if _fresh(tpath, path) else None
+    if isinstance(tr, dict):
+        # made with another engine or for another language: do it again
+        if tr.get("backend", backend) != backend or tr.get("requested_language", language) != language:
+            tr = None
+        # an empty transcript from before this check existed (TRANSCRIBE_BACKEND=none, or the
+        # PyAV crash) is not a result worth keeping once speech recognition is on
+        elif "backend" not in tr and not tr.get("words") and backend != "none":
+            tr = None
+    else:
+        tr = None
+    energy = None
+    if _fresh(epath, path):
+        try:
+            energy = np.load(epath)
+        except (OSError, ValueError):
+            energy = None
+
+    if tr is None or energy is None:
+        wav = pdir / "audio16k.wav"
+        try:
+            stage("Extracting audio", 0.16)
+            media.extract_audio(path, wav, duration=info.duration,
+                                on_progress=lambda f: stage("Extracting audio", 0.16 + 0.04 * f))
+            if energy is None:
+                try:
+                    energy = audio_analysis.energy_curve_wav(wav, ENERGY_STEP)
+                except (ValueError, EOFError, OSError):  # not the WAV we expected: let ffmpeg decode it
+                    energy = audio_analysis.energy_curve(media.load_pcm(wav, sr=16000), 16000, ENERGY_STEP)
+                _still_current(pid, created)
+                tmp = epath.with_name(f"energy.npy.{os.getpid()}-{threading.get_ident()}.tmp")
+                try:
+                    with open(tmp, "wb") as fh:
+                        np.save(fh, energy)
+                    os.replace(tmp, epath)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            if tr is None:
+                stage("Transcribing speech (Whisper)", 0.2)
+
+                minutes = int(-(-info.duration // 60))
+
+                def tr_progress(f: float):
+                    where = f", minute {min(minutes, int(f * info.duration / 60) + 1)} of {minutes}" if minutes > 2 else ""
+                    stage(f"Transcribing speech{where}", 0.2 + 0.4 * f)
+
+                tr = transcribe.transcribe(wav, language, tr_progress, info.duration)
+                tr["backend"], tr["requested_language"] = backend, language
+                _still_current(pid, created)
+                _write_json(tpath, tr)
+        finally:
+            wav.unlink(missing_ok=True)  # ~115 MB per hour of video, and nothing reads it again
+    return energy, tr.get("words", [])
 
 
 # =====================================================================  render
@@ -181,29 +384,115 @@ def _hook_time(words: list[dict], dur: float) -> float:
     return min(1.5, dur / 4)
 
 
+def _face_cache_name(start: float, end: float) -> str:
+    return f"{start:.3f}-{end:.3f}.json"
+
+
+def same_clip(payload: dict, clips: dict[int, str]) -> bool:
+    """Is this render job for one of `clips` (id -> creation stamp)? Jobs queued by older
+    versions carry no stamp and are matched by id."""
+    cid = payload.get("clip_id")
+    return cid in clips and payload.get("created", clips[cid]) == clips[cid]
+
+
+def _face_track(pdir: Path, source: Path, start: float, end: float,
+                still_current: Callable[[], None] = lambda: None) -> reframe.FaceTrack:
+    """Face positions for one clip. Cached, so a new caption style or hook title does not redo the detection.
+    `still_current` raises if the clip was deleted or replaced meanwhile (the cache then stays untouched)."""
+    cache = pdir / "faces" / _face_cache_name(start, end)
+    data = _load_json(cache) if _fresh(cache, source) else None
+    if isinstance(data, dict) and data.get("times"):  # an unreadable or empty file is a miss, not "no faces"
+        try:
+            return reframe.FaceTrack.from_dict(data)
+        except (ValueError, TypeError, IndexError, KeyError, AttributeError):
+            pass
+    track = reframe.analyze_faces(source, start, end)
+    still_current()  # the folder may belong to a newer project with the same id by now
+    if track.times:
+        try:
+            cache.parent.mkdir(exist_ok=True)
+            _write_json(cache, track.to_dict())
+        except OSError:
+            log.debug("could not save face track", exc_info=True)
+    return track
+
+
+# Clips being rendered right now: clip id -> (project id, fraction done). Kept in memory
+# (not a column) so the progress bar can move during a render without a schema change.
+_inflight: dict[int, tuple[int, float]] = {}
+_inflight_lock = threading.Lock()
+_last_progress_write: dict[int, float] = {}
+FACE_SHARE = 0.12  # rough share of a clip's time spent finding faces before ffmpeg starts
+
+
+def _set_inflight(cid: int, pid: int, fraction: float) -> None:
+    with _inflight_lock:
+        _inflight[cid] = (pid, max(0.0, min(1.0, fraction)))
+    refresh_project_progress(pid, throttle=True)
+
+
 def render_clip(payload: dict) -> None:
+    try:
+        _render(payload)
+    except ProjectGone:
+        log.info("clip %s was deleted or replaced while it rendered; result dropped", payload.get("clip_id"))
+
+
+def _clip_current(cid: int, created: str) -> None:
+    with session_scope() as s:
+        clip = s.get(Clip, cid)
+        if not clip or stamp(clip.created_at) != created:
+            raise ProjectGone(cid)
+
+
+def _render(payload: dict) -> None:
     cid = int(payload["clip_id"])
     s_cfg = get_settings()
     with session_scope() as s:
         clip = s.get(Clip, cid)
         if not clip:
             return
-        proj = s.get(Project, clip.project_id)
-        clip.status = "rendering"
-        clip.error = None
-        s.add(clip)
-        s.commit()
-        pid, start, end, hook_text = proj.id, clip.start, clip.end, clip.hook or clip.title
-        settings, source = dict(proj.settings), Path(proj.source_path)
-        src_w, src_h = proj.width or 1920, proj.height or 1080
-        music = s.get(MusicTrack, clip.music_track_id) if clip.music_track_id else None
-        music_info = (Path(music.path), music.drop_time) if music else None
+        created = stamp(clip.created_at)
+        if payload.get("created", created) != created:
+            return  # a job for an earlier clip whose id now belongs to a new one
+        pid = clip.project_id
+    # One render per clip at a time: two jobs for the same clip (an automatic retry and a
+    # "Try again", say) would write the same files at once and could leave a broken video.
+    with _inflight_lock:
+        busy = cid in _inflight
+        if not busy:
+            _inflight[cid] = (pid, 0.0)
+    if busy:
+        enqueue("render_clip", {"clip_id": cid, "created": created}, priority=8, delay_seconds=5)
+        return
 
+    work: Optional[Path] = None
+    retired: Optional[Path] = None
     try:
+        with session_scope() as s:
+            clip = s.get(Clip, cid)
+            if not clip or stamp(clip.created_at) != created:
+                raise ProjectGone(cid)
+            proj = s.get(Project, clip.project_id)
+            clip.status = "rendering"
+            clip.error = None
+            s.add(clip)
+            s.commit()
+            start, end, hook_text = clip.start, clip.end, clip.hook or clip.title
+            settings, source = dict(proj.settings), Path(proj.source_path)
+            music = s.get(MusicTrack, clip.music_track_id) if clip.music_track_id else None
+            music_info = (Path(music.path), music.drop_time) if music else None
+        refresh_project_progress(pid, throttle=True)
+
         pdir = project_dir(pid)
-        work = pdir / "clips" / f"{cid}"
-        if work.exists():
-            shutil.rmtree(work)
+        # Nobody else renders this clip now, so half-built or retired folders of it are
+        # leftovers of a crash or a redeploy: each can hold a 15-25 MB video.
+        for pattern in (f"{cid}.part-*", f"{cid}.old-*"):
+            for d in (pdir / "clips").glob(pattern):
+                shutil.rmtree(d, ignore_errors=True)
+        # Build everything in a folder of its own and move it into place at the end, so the
+        # clip that is on screen right now stays playable until the new one is complete.
+        work = pdir / "clips" / f"{cid}.part-{uuid.uuid4().hex[:8]}"
         work.mkdir(parents=True)
         out_w, out_h = ASPECT_RATIOS.get(settings.get("aspect_ratio", "9:16"), (s_cfg.output_width, s_cfg.output_height))
         style = get_editing_style(settings.get("editing_style", "face_track_zoom"))
@@ -218,13 +507,16 @@ def render_clip(payload: dict) -> None:
 
         # reframe
         layout = style.get("layout", "face_track")
-        track = reframe.FaceTrack() if layout in ("center", "blur_fill") else reframe.analyze_faces(source, start, end)
+        track = reframe.FaceTrack() if layout in ("center", "blur_fill") else _face_track(
+            pdir, source, start, end, lambda: _clip_current(cid, created))
+        _set_inflight(cid, pid, FACE_SHARE)
         zooms = _emphasis_windows(words, energy, start) if style.get("zoom_on_emphasis") else []
         lay = reframe.build_layout(layout, src_w=info.width, src_h=info.height, out_w=out_w, out_h=out_h,
                                    track=track, style=style, zoom_windows=zooms)
 
         spec = render.RenderSpec(source=source, start=start, end=end, out_path=work / "clip.mp4", work_dir=work,
-                                 video_filter=lay.filter, out_w=out_w, out_h=out_h, has_audio=info.has_audio)
+                                 video_filter=lay.filter, out_w=out_w, out_h=out_h, has_audio=info.has_audio,
+                                 fps=info.fps)
 
         # captions
         caption_y = settings.get("caption_position") or style.get("caption_y", 0.62)
@@ -257,11 +549,35 @@ def render_clip(payload: dict) -> None:
             spec.music = render.MusicSpec(path=mpath, offset=offset, volume=float(settings.get("music_volume", 0.18)),
                                           ducking=bool(settings.get("ducking", True)))
 
-        render.render(spec)
-        thumb = media.make_thumbnail(spec.out_path, work / "thumb.jpg", at=min(1.5, dur / 2))
+        last_check = [time.monotonic()]
+
+        def on_progress(f: float) -> None:
+            _set_inflight(cid, pid, FACE_SHARE + (1 - FACE_SHARE) * f)
+            if time.monotonic() - last_check[0] >= 5:  # deleted or replaced meanwhile? stop the encode
+                last_check[0] = time.monotonic()
+                _clip_current(cid, created)
+
+        render.render(spec, on_progress)
+        media.make_thumbnail(spec.out_path, work / "thumb.jpg", at=min(1.5, dur / 2))
+
+        final = pdir / "clips" / str(cid)
         with session_scope() as s:
             clip = s.get(Clip, cid)
-            clip.status, clip.video_path, clip.thumb_path = "ready", str(spec.out_path), str(thumb)
+            if not clip or stamp(clip.created_at) != created:
+                raise ProjectGone(cid)
+            if final.exists():
+                retired = final.with_name(f"{cid}.old-{uuid.uuid4().hex[:8]}")
+                os.replace(final, retired)
+            try:
+                os.replace(work, final)
+            except OSError:
+                if retired is not None:  # put the clip that was there back
+                    os.replace(retired, final)
+                    retired = None
+                raise
+            work = None
+            clip.status, clip.video_path, clip.thumb_path = "ready", str(final / "clip.mp4"), str(final / "thumb.jpg")
+            clip.error = None
             clip.score_breakdown = {**clip.score_breakdown, "layout": lay.layout_used}
             clip.updated_at = utcnow()
             s.add(clip)
@@ -269,16 +585,33 @@ def render_clip(payload: dict) -> None:
     except Exception as e:
         with session_scope() as s:
             clip = s.get(Clip, cid)
-            if clip:
+            if clip and stamp(clip.created_at) == created:
                 clip.status, clip.error = "failed", str(e)[-800:]
                 s.add(clip)
                 s.commit()
         raise
     finally:
+        if work is not None:  # never went live
+            shutil.rmtree(work, ignore_errors=True)
+        elif retired is not None:  # the new clip is in place: the one it replaced goes
+            shutil.rmtree(retired, ignore_errors=True)
+        with _inflight_lock:
+            _inflight.pop(cid, None)
         refresh_project_progress(pid)
 
 
-def refresh_project_progress(pid: int, final: bool = False) -> None:
+def refresh_project_progress(pid: int, final: bool = False, throttle: bool = False) -> None:
+    """Recompute the project's progress and stage from its clips.
+
+    `throttle=True` is for the once-a-second ticks during a render: it skips the write if
+    this project was updated less than a second ago.
+    """
+    with _inflight_lock:
+        now = time.monotonic()
+        if throttle and now - _last_progress_write.get(pid, 0.0) < 1.0:
+            return
+        _last_progress_write[pid] = now
+        running = [f for (p_id, f) in _inflight.values() if p_id == pid]
     with session_scope() as s:
         p = s.get(Project, pid)
         clips = s.exec(select(Clip).where(Clip.project_id == pid)).all()
@@ -286,23 +619,54 @@ def refresh_project_progress(pid: int, final: bool = False) -> None:
             return
         done = [c for c in clips if c.status in ("ready", "failed")]
         ready = [c for c in clips if c.status == "ready"]
-        p.progress = round(0.7 + 0.3 * len(done) / len(clips), 3)
-        if len(done) == len(clips):
+        n = len(clips)
+        if len(done) == n:
             p.status = "done" if ready else "failed"
-            p.stage = f"{len(ready)} of {len(clips)} clips ready"
+            p.stage = f"{len(ready)} of {n} clips ready"
             if not ready:
                 p.error = "All clip renders failed: " + (clips[0].error or "")[:300]
             p.progress = 1.0
         else:
-            p.stage = f"Rendered {len(done)} of {len(clips)} clips"
+            running = running[: n - len(done)]
+            p.progress = round(0.7 + 0.3 * (len(done) + sum(running)) / n, 3)
+            # no percentage in the text: the app shows the overall one right next to it
+            if len(running) == 1:
+                p.stage = f"Rendering clip {len(done) + 1} of {n}"
+            elif running:
+                p.stage = f"Rendering clips {len(done) + 1} to {len(done) + len(running)} of {n}"
+            else:
+                p.stage = f"Rendered {len(done)} of {n} clips"
         p.updated_at = utcnow()
         s.add(p)
         s.commit()
 
 
+def fail_clip(payload: dict, error: str) -> None:
+    """A render job that was interrupted on its last attempt: stop its clip showing 'rendering' forever."""
+    if not payload.get("clip_id"):
+        return
+    pid = None
+    with session_scope() as s:
+        clip = s.get(Clip, int(payload["clip_id"]))
+        if clip and payload.get("created", stamp(clip.created_at)) != stamp(clip.created_at):
+            clip = None  # the job was for an earlier clip with the same id
+        if clip and clip.status != "ready":
+            clip.status, clip.error = "failed", error[-800:]
+            s.add(clip)
+            s.commit()
+            pid = clip.project_id
+    if pid:
+        refresh_project_progress(pid)
+
+
 def fail_project(payload: dict, error: str) -> None:
-    if payload.get("project_id"):
-        _update_project(int(payload["project_id"]), status="failed", error=error[-800:], stage="Failed")
+    if not payload.get("project_id"):
+        return
+    try:
+        _update_project(int(payload["project_id"]), created=payload.get("created"), status="failed",
+                        error=error[-800:], stage="Failed")
+    except ProjectGone:
+        pass  # the project was deleted, or its id now belongs to a new one
 
 
 # =====================================================================  music

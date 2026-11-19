@@ -7,7 +7,7 @@ function Tabs({ className, ...props }: React.ComponentProps<typeof TabsPrimitive
   return <TabsPrimitive.Root className={cn("flex flex-col gap-3", className)} {...props} />;
 }
 function TabsList({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.List>) {
-  return <TabsPrimitive.List className={cn("inline-flex h-9 w-fit items-center justify-center rounded-lg bg-muted p-[3px] text-muted-foreground", className)} {...props} />;
+  return <TabsPrimitive.List className={cn("inline-flex h-9 w-fit items-center pointer-coarse:h-11 justify-center rounded-lg bg-muted p-[3px] text-muted-foreground", className)} {...props} />;
 }
 function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
   return (

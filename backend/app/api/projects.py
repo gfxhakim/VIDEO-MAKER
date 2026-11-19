@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
@@ -14,10 +15,11 @@ from sqlmodel import Session, col, select
 from ..db import get_session
 from ..models import Clip, Job, Project, utcnow
 from ..config import get_settings
+from ..pipeline.ingest import VIDEO_EXTS
 from ..pipeline.publish_kit import PLATFORMS, build_kit, build_zip
-from ..pipeline.tasks import project_dir
+from ..pipeline.tasks import project_dir, same_clip, stamp
 from ..presets import caption_styles, editing_styles
-from ..queue import enqueue
+from ..queue import cancel_queued, enqueue
 from ..schemas import ClipOut, ClipUpdate, GenerationSettings, PostedUpdate, ProjectCreateURL, ProjectOut
 from .deps import current_user, media_url
 
@@ -53,8 +55,20 @@ def clip_out(c: Clip) -> ClipOut:
 def _start(session: Session, p: Project) -> None:
     p.status, p.stage, p.progress, p.error, p.updated_at = "queued", "Waiting for worker", 0.0, None, utcnow()
     session.add(p)
+    # same commit as the status: a crash in between can never leave "queued" with no job
+    enqueue("analyze_project", {"project_id": p.id, "created": stamp(p.created_at)}, priority=10, session=session)
     session.commit()
-    enqueue("analyze_project", {"project_id": p.id}, priority=10)
+
+
+def needs_start(session: Session, p: Project) -> bool:
+    """A draft, or a project that says 'queued' while no analysis job exists for it (left so by
+    a crash in older versions): starting it again is safe."""
+    if p.status == "draft":
+        return True
+    if p.status != "queued":
+        return False
+    live = session.exec(select(Job).where(Job.kind == "analyze_project", col(Job.status).in_(("queued", "running")))).all()
+    return not any(j.payload.get("project_id") == p.id for j in live)
 
 
 # ------------------------------------------------------------------ projects
@@ -90,15 +104,23 @@ def create_from_upload(file: UploadFile = File(...), settings: Optional[str] = F
         gs = _validate(GenerationSettings(**json.loads(settings)) if settings else GenerationSettings())
     except (ValueError, TypeError) as e:
         raise HTTPException(400, f"Invalid settings: {e}") from e
-    p = Project(name=name or (file.filename or "Upload").rsplit(".", 1)[0][:120], source_type="upload",
-                source=file.filename or "upload.mp4", settings=gs.model_dump())
+    fname = re.split(r"[\\/]", file.filename or "upload.mp4")[-1] or "upload.mp4"
+    ext = Path(fname).suffix.lower()
+    if ext not in VIDEO_EXTS:  # checked before a project row exists
+        raise HTTPException(400, f"Unsupported file type '{ext or fname}'. Use MP4, MOV, MKV or WEBM.")
+    p = Project(name=name or Path(fname).stem[:120], source_type="upload", source=fname, settings=gs.model_dump())
     session.add(p)
     session.commit()
     session.refresh(p)
-    ext = "." + (file.filename or "x.mp4").rsplit(".", 1)[-1].lower()[:5]
     dest = project_dir(p.id) / f"source{ext}"
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(file.file, out, length=8 * 1024 * 1024)
+    try:
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(file.file, out, length=8 * 1024 * 1024)
+    except OSError:  # e.g. volume full: do not leave an empty project behind
+        shutil.rmtree(project_dir(p.id), ignore_errors=True)
+        session.delete(p)
+        session.commit()
+        raise HTTPException(507, "The server ran out of storage. Delete old projects or make the volume bigger.") from None
     p.source_path = str(dest)
     session.add(p)
     session.commit()
@@ -121,7 +143,7 @@ def generate(pid: int, settings: Optional[GenerationSettings] = None, session: S
     p = session.get(Project, pid)
     if not p:
         raise HTTPException(404, "Project not found")
-    if p.status in ("queued", "processing"):
+    if p.status == "processing" or (p.status == "queued" and not needs_start(session, p)):
         raise HTTPException(409, "Project is already processing")
     if settings:
         p.settings = _validate(settings).model_dump()
@@ -134,10 +156,18 @@ def delete_project(pid: int, session: Session = Depends(get_session)):
     p = session.get(Project, pid)
     if not p:
         raise HTTPException(404, "Project not found")
+    clips: dict[int, str] = {}
     for c in session.exec(select(Clip).where(Clip.project_id == pid)).all():
+        clips[c.id] = stamp(c.created_at)
         session.delete(c)
+    created = stamp(p.created_at)
     session.delete(p)
     session.commit()
+    # Work that has not started is dropped here; a job that is already running notices
+    # the project is gone at its next step and stops without writing anything. Matched on
+    # id and creation time: a new project may already have taken over these ids.
+    cancel_queued("analyze_project", lambda pl: pl.get("project_id") == pid and pl.get("created", created) == created)
+    cancel_queued("render_clip", lambda pl: same_clip(pl, clips))
     shutil.rmtree(project_dir(pid), ignore_errors=True)
     return {"ok": True}
 
@@ -189,7 +219,8 @@ def rerender_clip(cid: int, session: Session = Depends(get_session)):
         p.status, p.stage = "processing", "Re-rendering clip"
         session.add(p)
     session.commit()
-    enqueue("render_clip", {"clip_id": c.id}, priority=8)
+    cancel_queued("render_clip", lambda pl: pl.get("clip_id") == cid)  # e.g. an automatic retry still waiting
+    enqueue("render_clip", {"clip_id": c.id, "created": stamp(c.created_at)}, priority=8)
     return clip_out(c)
 
 

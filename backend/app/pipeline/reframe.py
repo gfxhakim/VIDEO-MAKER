@@ -15,6 +15,7 @@ Layouts: face_track | face_static | center | split_faces | gameplay_facecam | bl
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,21 +36,43 @@ class FaceTrack:
     def hit_rate(self) -> float:
         return sum(1 for f in self.faces if f) / max(1, len(self.faces))
 
+    def to_dict(self) -> dict:
+        """Plain JSON-safe form (lossless: floats survive json.dumps / json.loads exactly)."""
+        return {
+            "times": [float(t) for t in self.times],
+            "faces": [[[float(v) for v in f] for f in faces] for faces in self.faces],
+        }
 
-_cascades = None
+    @classmethod
+    def from_dict(cls, d: dict) -> "FaceTrack":
+        times = [float(t) for t in (d.get("times") or [])]
+        faces = [[(float(f[0]), float(f[1]), float(f[2]), float(f[3])) for f in (fs or [])]
+                 for fs in (d.get("faces") or [])]
+        if len(times) != len(faces):
+            raise ValueError("face track is corrupt: times and faces differ in length")
+        return cls(times=times, faces=faces)
+
+
+# One pair of classifiers per thread: detectMultiScale on a shared CascadeClassifier
+# is not guaranteed thread-safe, and several clips can be analysed at once.
+_tls = threading.local()
 
 
 def _get_cascades():
-    global _cascades
-    if _cascades is None:
+    pair = getattr(_tls, "cascades", None)
+    if pair is None:
         import cv2
 
+        from ..config import effective_cpus
+
+        cv2.setNumThreads(min(effective_cpus(), 4))  # more threads only add memory here
         base = Path(cv2.data.haarcascades)
-        _cascades = (
+        pair = (
             cv2.CascadeClassifier(str(base / "haarcascade_frontalface_default.xml")),
             cv2.CascadeClassifier(str(base / "haarcascade_profileface.xml")),
         )
-    return _cascades
+        _tls.cascades = pair
+    return pair
 
 
 def analyze_faces(src: str | Path, start: float, end: float, sample_fps: float = 4.0, det_width: int = 480) -> FaceTrack:
@@ -190,6 +213,11 @@ def _even(v: float) -> int:
     return max(2, int(round(v / 2)) * 2)
 
 
+def _fit(v: float, limit: int) -> int:
+    """Nearest even size that still fits inside `limit` (sources can have odd sizes, like 853x479)."""
+    return max(2, min(_even(v), limit - limit % 2))
+
+
 def _zoom_expr(zoom_windows: list[tuple[float, float]], amount: float) -> str:
     if not zoom_windows or amount <= 1.0:
         return "1"
@@ -225,9 +253,16 @@ def build_layout(layout: str, *, src_w: int, src_h: int, out_w: int, out_h: int,
     def post_zoom(label_in: str, w: int, h: int, fy: float = 0.4) -> str:
         if zoom == "1":
             return f"[{label_in}]scale={w}:{h}:{lanczos},setsar=1[vbase]"
-        # punch-in: upscale by z, then crop back to the output size (stays sharp, no stretch)
-        return (f"[{label_in}]scale=w='trunc({w}*{zoom}/2)*2':h='trunc({h}*{zoom}/2)*2':eval=frame:{lanczos},"
-                f"crop={w}:{h}:'(iw-{w})/2':'(ih-{h})*{fy:.2f}',setsar=1[vbase]")
+        # Punch-in: one normal branch and one pre-zoomed branch, switched on during the
+        # emphasis windows. Both scalers have a fixed size. The earlier single scale with
+        # eval=frame rebuilt its Lanczos kernels for every frame (about 15% of render time).
+        amount = float(style.get("zoom_amount", 1.15))
+        zw, zh = min(cw, _even(cw / amount)), min(ch, _even(ch / amount))
+        cond = "gt(" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in zoom_windows[:40]) + ",0)"
+        return (f"[{label_in}]split=2[zn][zz];"
+                f"[zn]scale={w}:{h}:{lanczos}[zbase];"
+                f"[zz]crop={zw}:{zh}:(iw-{zw})/2:(ih-{zh})*{fy:.2f},scale={w}:{h}:{lanczos}[zin];"
+                f"[zbase][zin]overlay=0:0:enable='{cond}',setsar=1[vbase]")
 
     if layout == "split_faces":
         res = _split_faces(src_w, src_h, out_w, out_h, track, lanczos)
@@ -292,8 +327,8 @@ def _split_faces(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResult | N
         return None
     half_h = out_h // 2
     ar = out_w / half_h
-    cw = _even(min(src_w / 2, src_h * ar))
-    ch = _even(cw / ar)
+    cw = _fit(min(src_w / 2, src_h * ar), src_w)
+    ch = _fit(cw / ar, src_h)
     ys = [f[1] for faces in track.faces for f in faces]
     cy = float(np.median(ys)) if ys else 0.4
     y = int(np.clip(cy * src_h - ch * 0.42, 0, src_h - ch))
@@ -318,14 +353,14 @@ def _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResul
     bot_h = out_h - top_h
     # gameplay: centre crop with the top panel's aspect
     g_ar = out_w / top_h
-    gw = _even(min(src_w, src_h * g_ar))
-    gh = _even(gw / g_ar)
+    gw = _fit(min(src_w, src_h * g_ar), src_w)
+    gh = _fit(gw / g_ar, src_h)
     gx, gy = (src_w - gw) // 2, (src_h - gh) // 2
     # facecam: box ~3.5x the face width around the face
     b_ar = out_w / bot_h
-    cw = _even(min(src_w, max(fw * src_w * 3.5, 160)))
-    ch = _even(min(src_h, cw / b_ar))
-    cw = _even(ch * b_ar)
+    cw = _fit(min(src_w, max(fw * src_w * 3.5, 160)), src_w)
+    ch = _fit(min(src_h, cw / b_ar), src_h)
+    cw = _fit(ch * b_ar, src_w)
     cx = int(np.clip(fx * src_w - cw / 2, 0, src_w - cw))
     cy = int(np.clip(fy * src_h - ch * 0.45, 0, src_h - ch))
     return LayoutResult(
