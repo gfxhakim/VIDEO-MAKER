@@ -4,7 +4,8 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
+  // On touch screens an invisible pad (the ::after box) grows the tappable area to ~44px without moving the layout.
+  "relative inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
   {
     variants: {
       variant: {
@@ -16,10 +17,10 @@ const buttonVariants = cva(
         link: "text-primary underline-offset-4 hover:underline",
       },
       size: {
-        default: "h-9 px-4 py-2",
-        sm: "h-8 rounded-md gap-1.5 px-3",
+        default: "h-9 px-4 py-2 pointer-coarse:after:absolute pointer-coarse:after:content-[''] pointer-coarse:after:inset-x-0 pointer-coarse:after:-inset-y-1",
+        sm: "h-8 rounded-md gap-1.5 px-3 pointer-coarse:after:absolute pointer-coarse:after:content-[''] pointer-coarse:after:inset-x-0 pointer-coarse:after:-inset-y-1.5",
         lg: "h-11 rounded-md px-6 text-base",
-        icon: "size-9",
+        icon: "size-9 pointer-coarse:after:absolute pointer-coarse:after:content-[''] pointer-coarse:after:-inset-1",
       },
     },
     defaultVariants: { variant: "default", size: "default" },
