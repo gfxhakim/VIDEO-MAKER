@@ -10,7 +10,7 @@ import { mutate } from "swr";
 import { toast } from "sonner";
 import { ChevronDown, ChevronUp, FileVideo, Lightbulb, Link2, Pause, Play, RotateCw, X } from "lucide-react";
 import { useAuth } from "@/components/auth-provider";
-import { SIGNED_OUT_EVENT, type GenerationSettings } from "@/lib/api";
+import { api, SIGNED_OUT_EVENT, type GenerationSettings } from "@/lib/api";
 import { discardUpload, isVideoFileName, listUnfinishedUploads, ResumableUpload, type ServerUpload, type UploadState } from "@/lib/uploader";
 import { cn, fmtBytes, fmtEta, fmtPercent, fmtSpeed, pctOf, splitFileName } from "@/lib/utils";
 
@@ -85,8 +85,13 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     pathRef.current = path;
   }, [path]);
 
+  const listSeq = useRef(0);
+  const lastAuthRetry = useRef(0);
   const loadUnfinished = useCallback(() => {
-    listUnfinishedUploads().then(setUnfinished).catch(() => {});
+    const seq = ++listSeq.current; // an older answer that arrives late must not bring back a finished upload
+    listUnfinishedUploads()
+      .then((list) => seq === listSeq.current && setUnfinished(list))
+      .catch(() => {});
   }, []);
 
   const userId = user?.id;
@@ -233,8 +238,21 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     if (phase === "waiting") setAnnounce(s.message ?? "Connection problem.");
     if (phase === "error") {
       setAnnounce(s.message ?? "Upload stopped.");
-      if (s.errorCode === "signed-out") void refreshAuth(); // the auth guard sends them to the sign-in page
-      else if (!onStudio) toast.error("Upload stopped", { description: s.message ?? undefined });
+      if (s.errorCode === "signed-out") {
+        // The auth guard sends them to the sign-in page. If they already signed in again (a chunk's 401
+        // can arrive after that), carry on by itself, at most once every 30 s so it can never loop.
+        const now = Date.now();
+        const mayRetry = now - lastAuthRetry.current > 30_000;
+        void api.authStatus().then(
+          (st) => {
+            if (st.user && mayRetry) {
+              lastAuthRetry.current = now;
+              current.current?.retry();
+            } else void refreshAuth();
+          },
+          () => void refreshAuth(),
+        );
+      } else if (!onStudio) toast.error("Upload stopped", { description: s.message ?? undefined });
       loadUnfinished();
     }
     if (phase === "done" && s.project) {
