@@ -213,6 +213,11 @@ def _even(v: float) -> int:
     return max(2, int(round(v / 2)) * 2)
 
 
+def _fit(v: float, limit: int) -> int:
+    """Nearest even size that still fits inside `limit` (sources can have odd sizes, like 853x479)."""
+    return max(2, min(_even(v), limit - limit % 2))
+
+
 def _zoom_expr(zoom_windows: list[tuple[float, float]], amount: float) -> str:
     if not zoom_windows or amount <= 1.0:
         return "1"
@@ -322,8 +327,8 @@ def _split_faces(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResult | N
         return None
     half_h = out_h // 2
     ar = out_w / half_h
-    cw = _even(min(src_w / 2, src_h * ar))
-    ch = _even(cw / ar)
+    cw = _fit(min(src_w / 2, src_h * ar), src_w)
+    ch = _fit(cw / ar, src_h)
     ys = [f[1] for faces in track.faces for f in faces]
     cy = float(np.median(ys)) if ys else 0.4
     y = int(np.clip(cy * src_h - ch * 0.42, 0, src_h - ch))
@@ -348,14 +353,14 @@ def _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResul
     bot_h = out_h - top_h
     # gameplay: centre crop with the top panel's aspect
     g_ar = out_w / top_h
-    gw = _even(min(src_w, src_h * g_ar))
-    gh = _even(gw / g_ar)
+    gw = _fit(min(src_w, src_h * g_ar), src_w)
+    gh = _fit(gw / g_ar, src_h)
     gx, gy = (src_w - gw) // 2, (src_h - gh) // 2
     # facecam: box ~3.5x the face width around the face
     b_ar = out_w / bot_h
-    cw = _even(min(src_w, max(fw * src_w * 3.5, 160)))
-    ch = _even(min(src_h, cw / b_ar))
-    cw = _even(ch * b_ar)
+    cw = _fit(min(src_w, max(fw * src_w * 3.5, 160)), src_w)
+    ch = _fit(min(src_h, cw / b_ar), src_h)
+    cw = _fit(ch * b_ar, src_w)
     cx = int(np.clip(fx * src_w - cw / 2, 0, src_w - cw))
     cy = int(np.clip(fy * src_h - ch * 0.45, 0, src_h - ch))
     return LayoutResult(

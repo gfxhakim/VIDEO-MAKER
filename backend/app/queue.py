@@ -48,6 +48,29 @@ def enqueue(kind: str, payload: dict[str, Any], *, priority: int = 0, delay_seco
         return job.id
 
 
+def cancel_queued(kind: str, match: Callable[[dict], bool]) -> int:
+    """Cancel jobs of `kind` that have not started yet and whose payload matches.
+    Running jobs are left alone (they check for themselves whether their work still matters)."""
+    with session_scope() as s:
+        ids = []
+        for j in s.exec(select(Job).where(Job.kind == kind, Job.status == "queued")).all():
+            try:
+                if match(dict(j.payload or {})):
+                    ids.append(j.id)
+            except Exception:  # noqa: BLE001
+                pass
+    if not ids:
+        return 0
+    now = utcnow().replace(tzinfo=None).isoformat(sep=" ")
+    with engine.begin() as conn:  # only jobs still queued: one a worker claimed meanwhile keeps running
+        res = conn.execute(
+            text("UPDATE job SET status='cancelled', finished_at=:now, error='No longer needed' "
+                 "WHERE status='queued' AND id IN (" + ",".join(str(int(i)) for i in ids) + ")"),
+            {"now": now},
+        )
+    return res.rowcount or 0
+
+
 def _claim(worker_id: str) -> Job | None:
     """Atomically claim the next runnable job (single UPDATE ... RETURNING)."""
     now = utcnow().replace(tzinfo=None).isoformat(sep=" ")  # SQLite stores UTC without offset

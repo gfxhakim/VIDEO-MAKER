@@ -106,10 +106,17 @@ def _received_bytes(u: Upload, received: list[int]) -> int:
     return sum(_chunk_len(u, i) for i in received)
 
 
+def _pwrite(fd: int, data, offset: int) -> int:
+    if hasattr(os, "pwrite"):
+        return os.pwrite(fd, data, offset)
+    os.lseek(fd, offset, os.SEEK_SET)  # Windows has no pwrite; every request opens its own descriptor
+    return os.write(fd, data)
+
+
 def _mark(upload_id: str, index: int) -> None:
-    fd = os.open(_map(upload_id), os.O_WRONLY)
+    fd = os.open(_map(upload_id), os.O_WRONLY | getattr(os, "O_BINARY", 0))
     try:
-        os.pwrite(fd, b"\x01", index)
+        _pwrite(fd, b"\x01", index)
     finally:
         os.close(fd)
 
@@ -117,7 +124,7 @@ def _mark(upload_id: str, index: int) -> None:
 def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
     view = memoryview(data)
     while view:
-        n = os.pwrite(fd, view, offset)
+        n = _pwrite(fd, view, offset)
         view, offset = view[n:], offset + n
 
 
@@ -136,7 +143,10 @@ def _clean_name(name: str) -> str:
     """Display name only (paths are built from the server-made id and a whitelisted extension)."""
     name = re.split(r"[\\/]", name)[-1]
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
-    return name[:200] or "upload"
+    if len(name) > 200:  # shorten the name, never the extension
+        stem, dot, ext = name.rpartition(".")
+        name = f"{stem[:199 - len(ext)]}.{ext}" if dot and stem and len(ext) <= 10 else name[:200]
+    return name or "upload"
 
 
 def upload_out(u: Upload) -> UploadOut:
@@ -171,7 +181,7 @@ def purge_stale_uploads() -> int:
         rows = session.exec(select(Upload)).all()
         keep = set()
         for u in rows:
-            if _last_activity(u) < cutoff:
+            if u.status != "completing" and _last_activity(u) < cutoff:  # completing: recover_uploads decides
                 _discard(session, u)
                 removed += 1
             else:
@@ -185,11 +195,27 @@ def purge_stale_uploads() -> int:
 
 
 def recover_uploads() -> None:
-    """Startup: an upload caught mid-`complete` by a restart goes back to 'uploading'."""
+    """Startup: finish or roll back an upload that a restart caught in the middle of `complete`.
+
+    The file still in the upload folder: nothing moved yet, so it goes back to 'uploading'
+    (and the project row made for it, which has no video, is removed). The file already in
+    the project folder: the move happened, so the bookkeeping is finished; a repeated
+    `complete` from the browser then returns that project and starts it.
+    """
     with session_scope() as session:
         for u in session.exec(select(Upload).where(Upload.status == "completing")).all():
+            p = session.get(Project, u.project_id) if u.project_id else None
+            dest = project_dir(p.id) / f"source{u.ext}" if p else None
             if _data(u.id).exists():
-                u.status = "uploading"
+                if p is not None and not p.source_path:
+                    shutil.rmtree(get_settings().projects_dir / str(p.id), ignore_errors=True)
+                    session.delete(p)
+                u.status, u.project_id = "uploading", None
+                session.add(u)
+            elif p is not None and dest is not None and dest.exists():
+                p.source_path = str(dest)
+                u.status, u.updated_at = "completed", utcnow()
+                session.add(p)
                 session.add(u)
             else:
                 _discard(session, u)
@@ -209,28 +235,42 @@ def init_upload(body: UploadInit, user: User = Depends(current_user), session: S
     if body.size > s.max_upload_gb * 1024**3:
         raise HTTPException(413, f"File is too large ({body.size / 1024**3:.1f} GB). The limit is {s.max_upload_gb:g} GB.")
 
-    mine = session.exec(
-        select(Upload).where(Upload.user_id == user.id, Upload.status == "uploading").order_by(col(Upload.created_at))
-    ).all()
+    mine = sorted(session.exec(select(Upload).where(Upload.user_id == user.id, Upload.status == "uploading")).all(),
+                  key=_last_activity)
     # same file again (page refresh, new tab, another day): carry on where it stopped
     for u in mine:
         if body.fingerprint and u.fingerprint == body.fingerprint and u.size == body.size:
             if _data(u.id).exists() and _map(u.id).exists():
                 return upload_out(u)
             _discard(session, u)
+            session.commit()
             mine.remove(u)
             break
-    while len(mine) >= s.max_active_uploads:  # keep abandoned partial files from filling the volume
-        _discard(session, mine.pop(0))
-    session.commit()
+    # keep abandoned partial files from filling the volume: the least recently active go first
+    evict = mine[: max(0, len(mine) - s.max_active_uploads + 1)]
 
-    others = session.exec(select(Upload).where(Upload.status != "completed")).all()
-    promised = sum(o.size - _received_bytes(o, _received(o)) for o in others)  # sparse files: not on disk yet
+    # Space check before anything is deleted, so a refused upload costs nothing. Unfinished
+    # uploads reserve what they still need (their files are sparse), except the ones about
+    # to be evicted and ones that never received a byte and have sat idle for 2 minutes
+    # (the app does not list those, so they could block the volume for a whole day).
+    idle = time.time() - 120
+    dropping = {e.id for e in evict}
+    promised = 0
+    for o in session.exec(select(Upload).where(Upload.status != "completed")).all():
+        if o.id in dropping:
+            continue
+        got = _received_bytes(o, _received(o))
+        if got == 0 and o.status == "uploading" and _last_activity(o) < idle:
+            continue
+        promised += o.size - got
     free = shutil.disk_usage(s.data_dir).free - promised
     if free < body.size + s.upload_min_free_mb * 1024**2:
         raise HTTPException(
             507, f"Not enough storage on the server: {max(free, 0) / 1024**3:.1f} GB free, this video needs "
                  f"{body.size / 1024**3:.1f} GB. Delete old projects or make the volume bigger.")
+    for e in evict:
+        _discard(session, e)
+    session.commit()
 
     chunk = max(1, s.upload_chunk_mb) * MB
     u = Upload(id=uuid.uuid4().hex, user_id=user.id, filename=name, ext=ext, size=body.size, chunk_size=chunk,
@@ -283,8 +323,9 @@ async def put_chunk(request: Request, index: int, upload_id: str = UPLOAD_ID):
         raise HTTPException(400, f"Chunk {index} must be exactly {expected} bytes, not {declared}")
 
     try:
-        fd = os.open(_data(u.id), os.O_WRONLY)
+        fd = os.open(_data(u.id), os.O_WRONLY | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
+        await run_in_threadpool(_gone_or_finished, upload_id, user_id)
         raise HTTPException(404, "Upload not found (it may have expired). Start again.") from None
     offset, got, buf = index * u.chunk_size, 0, bytearray()
     try:
@@ -312,8 +353,20 @@ async def put_chunk(request: Request, index: int, upload_id: str = UPLOAD_ID):
     try:
         _mark(u.id, index)  # only now does the chunk count
     except FileNotFoundError:
+        await run_in_threadpool(_gone_or_finished, upload_id, user_id)
         raise HTTPException(404, "Upload not found (it was cancelled).") from None
     return {"index": index, "bytes": got}
+
+
+def _gone_or_finished(upload_id: str, user_id: int) -> None:
+    """The bytes vanished under a chunk. If that is because the upload was just finished (from
+    another tab, say), answer 409 like any chunk for a finished upload, not 'start again'."""
+    try:
+        u = _load(upload_id, user_id)
+    except HTTPException:
+        return
+    if u.status != "uploading":
+        raise HTTPException(409, "This upload is already finished")
 
 
 @router.post("/{upload_id}/complete", response_model=ProjectOut)
@@ -324,6 +377,8 @@ def complete_upload(body: UploadComplete, upload_id: str = UPLOAD_ID, user: User
         p = session.get(Project, u.project_id) if u.project_id else None
         if not p:
             raise HTTPException(404, "Upload not found (it may have expired). Start again.")
+        if body.start and p.status == "draft" and p.source_path:  # finished by recover_uploads after a restart
+            _start(session, p)
         return project_out(session, p)
     gs = _validate(body.settings or GenerationSettings())
     missing = u.total_chunks - len(_received(u))
@@ -344,12 +399,15 @@ def complete_upload(body: UploadComplete, upload_id: str = UPLOAD_ID, user: User
         p = Project(name=(body.name or FsPath(u.filename).stem or "Upload")[:120], source_type="upload", source=u.filename,
                     settings=gs.model_dump())
         session.add(p)
+        session.flush()
+        u.project_id = p.id  # written with the project, so a restart after the move can finish the job
+        session.add(u)
         session.commit()
         session.refresh(p)
         dest = project_dir(p.id) / f"source{u.ext}"
         os.replace(src, dest)  # same volume: a rename, not a second copy of a multi-GB file
         p.source_path = str(dest)
-        u.status, u.project_id, u.updated_at = "completed", p.id, utcnow()
+        u.status, u.updated_at = "completed", utcnow()
         session.add(p)
         session.add(u)
         session.commit()
@@ -359,9 +417,10 @@ def complete_upload(body: UploadComplete, upload_id: str = UPLOAD_ID, user: User
             if p is not None and p.id:
                 shutil.rmtree(get_settings().projects_dir / str(p.id), ignore_errors=True)
                 session.delete(p)
-            u.status = "uploading"
+            u.status, u.project_id = "uploading", None
             session.add(u)
             session.commit()
+        # otherwise the file is already in the project folder: recover_uploads finishes it
         raise
     shutil.rmtree(_dir(upload_id), ignore_errors=True)
     if body.start:
@@ -372,7 +431,7 @@ def complete_upload(body: UploadComplete, upload_id: str = UPLOAD_ID, user: User
 @router.delete("/{upload_id}")
 def abort_upload(upload_id: str = UPLOAD_ID, user: User = Depends(current_user), session: Session = Depends(get_session)):
     u = session.get(Upload, upload_id)
-    if u and u.user_id == user.id:
+    if u and u.user_id == user.id and u.status != "completing":  # being turned into a project right now: leave it
         _discard(session, u)  # a completed upload only loses its bookkeeping row; the project stays
         session.commit()
     return {"ok": True}

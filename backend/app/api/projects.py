@@ -17,9 +17,9 @@ from ..models import Clip, Job, Project, utcnow
 from ..config import get_settings
 from ..pipeline.ingest import VIDEO_EXTS
 from ..pipeline.publish_kit import PLATFORMS, build_kit, build_zip
-from ..pipeline.tasks import project_dir
+from ..pipeline.tasks import project_dir, stamp
 from ..presets import caption_styles, editing_styles
-from ..queue import enqueue
+from ..queue import cancel_queued, enqueue
 from ..schemas import ClipOut, ClipUpdate, GenerationSettings, PostedUpdate, ProjectCreateURL, ProjectOut
 from .deps import current_user, media_url
 
@@ -56,7 +56,7 @@ def _start(session: Session, p: Project) -> None:
     p.status, p.stage, p.progress, p.error, p.updated_at = "queued", "Waiting for worker", 0.0, None, utcnow()
     session.add(p)
     session.commit()
-    enqueue("analyze_project", {"project_id": p.id}, priority=10)
+    enqueue("analyze_project", {"project_id": p.id, "created": stamp(p.created_at)}, priority=10)
 
 
 # ------------------------------------------------------------------ projects
@@ -144,10 +144,16 @@ def delete_project(pid: int, session: Session = Depends(get_session)):
     p = session.get(Project, pid)
     if not p:
         raise HTTPException(404, "Project not found")
+    clip_ids = set()
     for c in session.exec(select(Clip).where(Clip.project_id == pid)).all():
+        clip_ids.add(c.id)
         session.delete(c)
     session.delete(p)
     session.commit()
+    # Work that has not started is dropped here; a job that is already running notices
+    # the project is gone at its next step and stops without writing anything.
+    cancel_queued("analyze_project", lambda pl: pl.get("project_id") == pid)
+    cancel_queued("render_clip", lambda pl: pl.get("clip_id") in clip_ids)
     shutil.rmtree(project_dir(pid), ignore_errors=True)
     return {"ok": True}
 
@@ -199,7 +205,8 @@ def rerender_clip(cid: int, session: Session = Depends(get_session)):
         p.status, p.stage = "processing", "Re-rendering clip"
         session.add(p)
     session.commit()
-    enqueue("render_clip", {"clip_id": c.id}, priority=8)
+    cancel_queued("render_clip", lambda pl: pl.get("clip_id") == cid)  # e.g. an automatic retry still waiting
+    enqueue("render_clip", {"clip_id": c.id, "created": stamp(c.created_at)}, priority=8)
     return clip_out(c)
 
 
