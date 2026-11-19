@@ -3,31 +3,61 @@
 import { useState } from "react";
 import Link from "next/link";
 import useSWR from "swr";
-import { CaptionsOff, Check, ExternalLink, Music2, Plus, RotateCw } from "lucide-react";
+import { CaptionsOff, Check, ExternalLink, Film, Music2, Plus, RotateCw, SlidersHorizontal, Sparkles } from "lucide-react";
 import { CaptionPreview } from "@/components/caption-preview";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { fetcher, type CaptionStyle, type GenerationSettings, type MusicTrack, type Presets } from "@/lib/api";
+import {
+  fetcher,
+  type BrollClip,
+  type CaptionStyle,
+  type GenerationSettings,
+  type HookCardStyle,
+  type MusicTrack,
+  type Presets,
+  type WatermarkPosition,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-const MODE_NAME: Record<CaptionStyle["mode"], string> = { chunk: "Phrase + highlight", stack: "Lead + keyword", word: "Word by word" };
+const MODE_NAME: Record<CaptionStyle["mode"], string> = {
+  chunk: "Phrase + highlight",
+  stack: "Lead + keyword",
+  word: "Word by word",
+  boxed: "Boxed backdrop",
+};
 const RATIO_NAME: Record<string, string> = { "9:16": "Tall", "4:5": "Portrait", "1:1": "Square", "16:9": "Wide" };
+const LANGUAGES = [
+  { code: "", label: "Auto-detect" },
+  { code: "en", label: "English" },
+  { code: "ar", label: "Arabic" },
+  { code: "es", label: "Spanish" },
+  { code: "fr", label: "French" },
+  { code: "de", label: "German" },
+  { code: "pt", label: "Portuguese" },
+  { code: "it", label: "Italian" },
+  { code: "hi", label: "Hindi" },
+  { code: "ja", label: "Japanese" },
+  { code: "ko", label: "Korean" },
+  { code: "tr", label: "Turkish" },
+];
+const WM_POSITIONS: { key: WatermarkPosition; label: string }[] = [
+  { key: "top_left", label: "Top left" },
+  { key: "top_right", label: "Top right" },
+  { key: "bottom_left", label: "Bottom left" },
+  { key: "bottom_right", label: "Bottom right" },
+];
 
-/*
- * Layout note: everything here is sized by the WIDTH OF THE SELECTOR (container queries: @md, @lg, @2xl),
- * not by the screen, because the same component sits in a full-screen sheet on phones and in dialogs of
- * different widths on desktop.
- */
 const card =
   "relative min-w-0 rounded-lg border transition-[color,background-color,border-color,scale] outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-[.98]";
 const cardOn = "border-primary bg-primary/10 ring-1 ring-primary";
 const toggle = "min-h-9 py-1 leading-snug font-normal pointer-coarse:min-h-11";
-// the padding is part of the slider, so the whole 40px (44px on touch) strip can be grabbed, not just the thin track
 const slider = "py-[1.0625rem] pointer-coarse:py-[1.1875rem]";
+const SELECT =
+  "h-9 rounded-lg border border-white/15 bg-zinc-900 px-3 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring pointer-coarse:h-11 pointer-coarse:text-sm";
 
-/** Check mark on the corner of the picked card (it sits on the border, so it never covers the content). */
 function Picked() {
   return (
     <span aria-hidden className="absolute -top-1.5 -right-1.5 z-10 grid size-[1.125rem] place-items-center rounded-full bg-primary text-primary-foreground shadow-md">
@@ -45,7 +75,6 @@ function Heading({ children, hint, className }: { children: React.ReactNode; hin
   );
 }
 
-/** Small 9:16 diagram of how each layout arranges the frame. Drawn in percentages, so it works at any size. */
 function LayoutDiagram({ layout, className }: { layout: string; className?: string }) {
   const pane = "absolute inset-x-[9%] rounded-[2px]";
   const face = "absolute left-1/2 aspect-square -translate-x-1/2 rounded-full";
@@ -66,6 +95,14 @@ function LayoutDiagram({ layout, className }: { layout: string; className?: stri
           <span className="absolute top-[42%] right-[20%] h-[7%] w-[14%] rounded-[1px] bg-sky-200/80" />
           <span className={cn(pane, "bottom-[5%] h-[35%] bg-primary/45")} />
           <span className={cn(face, "bottom-[13%] w-[30%] bg-primary")} />
+        </>
+      )}
+      {layout === "broll_split" && (
+        <>
+          <span className={cn(pane, "top-[5%] h-[48%] bg-primary/45")} />
+          <span className={cn(face, "top-[17%] w-[30%] bg-primary")} />
+          <span className={cn(pane, "bottom-[5%] h-[39%] bg-emerald-400/45")} />
+          <span className="absolute right-[18%] bottom-[16%] left-[18%] h-[12%] rounded-[2px] bg-emerald-200/70" />
         </>
       )}
       {layout === "blur_fill" && (
@@ -89,7 +126,7 @@ function LayoutDiagram({ layout, className }: { layout: string; className?: stri
           <span className="absolute inset-x-[20%] top-[52%] bottom-[5%] rounded-t-full bg-primary/60" />
         </>
       )}
-      {!["split_faces", "gameplay_facecam", "blur_fill", "face_track", "face_static"].includes(layout) && (
+      {!["split_faces", "gameplay_facecam", "broll_split", "blur_fill", "face_track", "face_static"].includes(layout) && (
         <>
           <span className={cn(pane, "inset-y-[5%] bg-primary/30")} />
           <span className="absolute inset-x-[30%] top-1/2 h-px -translate-y-1/2 bg-white/80" />
@@ -100,15 +137,14 @@ function LayoutDiagram({ layout, className }: { layout: string; className?: stri
   );
 }
 
-/** Same shape as the loaded selector, so the dialog does not jump when the styles arrive. */
 function SelectorSkeleton() {
   return (
     <div className="@container" aria-busy="true" aria-label="Loading styles">
       <div className="flex flex-col gap-6">
         <div>
           <div className="skeleton mb-2.5 h-5 w-40 rounded" />
-          <div className="grid grid-cols-3 gap-2 @2xl:grid-cols-6">
-            {Array.from({ length: 6 }, (_, k) => (
+          <div className="grid grid-cols-3 gap-2 @2xl:grid-cols-7">
+            {Array.from({ length: 7 }, (_, k) => (
               <div key={k} className="skeleton h-[6.75rem] rounded-lg" />
             ))}
           </div>
@@ -128,12 +164,12 @@ function SelectorSkeleton() {
 }
 
 export function StyleSelector({ value, onChange }: { value: GenerationSettings; onChange: (v: GenerationSettings) => void }) {
-  // presets never change while the app is open
   const { data: presets, error, mutate: retry, isValidating } = useSWR<Presets>("/api/presets", fetcher, { revalidateOnFocus: false, revalidateIfStale: false });
-  // songs do: they are refetched when the user comes back from the Music page in another tab
   const { data: music } = useSWR<MusicTrack[]>("/api/music", fetcher);
-  const [peek, setPeek] = useState<string | null>(null); // editing style under the mouse or keyboard focus
-  const [hover, setHover] = useState<string | null>(null); // caption style under the mouse
+  const { data: broll } = useSWR<BrollClip[]>("/api/broll", fetcher);
+  const [peek, setPeek] = useState<string | null>(null);
+  const [hover, setHover] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const set = <K extends keyof GenerationSettings>(k: K, v: GenerationSettings[K]) => onChange({ ...value, [k]: v });
 
   if (!presets) {
@@ -149,6 +185,10 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
   }
 
   const shown = presets.editing_styles.find((s) => s.key === peek) ?? presets.editing_styles.find((s) => s.key === value.editing_style);
+  const activeStyle = presets.editing_styles.find((s) => s.key === value.editing_style);
+  const hookOn = !!(value.hook_title || activeStyle?.hook_card);
+  const isBroll = activeStyle?.layout === "broll_split";
+  const capPct = Math.round((value.caption_position ?? 0.65) * 100);
   const mouse = (e: React.PointerEvent) => e.pointerType === "mouse";
 
   return (
@@ -156,8 +196,8 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
       <div className="flex flex-col gap-6">
         {/* 1. Editing style */}
         <section>
-          <Heading hint="How the wide video is fitted into a tall one.">1. Editing style</Heading>
-          <div className="grid grid-cols-3 gap-2 @2xl:grid-cols-6">
+          <Heading hint="How the wide video is fitted into your frame.">1. Editing style</Heading>
+          <div className="grid grid-cols-3 gap-2 @lg:grid-cols-4 @2xl:grid-cols-7">
             {presets.editing_styles.map((s) => {
               const on = value.editing_style === s.key;
               return (
@@ -180,8 +220,6 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
               );
             })}
           </div>
-          {/* What the picked (or pointed at) style does. Every description is stacked in the same cell,
-              so the tallest one decides the height and picking another style never moves what is below. */}
           <div aria-hidden className="mt-2 grid rounded-md bg-white/[.04] px-2.5 py-1.5 text-xs leading-snug text-muted-foreground">
             {presets.editing_styles.map((s) => (
               <p key={s.key} className={cn("col-start-1 row-start-1", s.key !== shown?.key && "invisible")}>
@@ -189,10 +227,42 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
               </p>
             ))}
           </div>
+
+          {isBroll && (
+            <div className="mt-3 rounded-xl border border-white/10 bg-white/[.03] p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-medium">Choose B-roll background clip (bottom half)</span>
+                <Link href="/music?tab=broll" target="_blank" rel="noopener" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+                  <Plus className="size-3" /> Upload B-roll <ExternalLink className="size-3" />
+                </Link>
+              </div>
+              {broll?.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {broll.map((b) => {
+                    const on = value.broll_id === b.id;
+                    return (
+                      <button
+                        key={b.id}
+                        type="button"
+                        onClick={() => set("broll_id", on ? null : b.id)}
+                        className={cn(
+                          "flex min-h-9 items-center gap-1.5 rounded-full border px-3 text-xs transition-colors",
+                          on ? "border-primary bg-primary/15 text-foreground" : "border-white/15 text-muted-foreground hover:bg-white/5",
+                        )}
+                      >
+                        <Film className="size-3.5" /> {b.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">No B-roll clips uploaded yet. Without one, this falls back to dynamic face tracking.</p>
+              )}
+            </div>
+          )}
         </section>
 
         {/* 2. Caption style */}
-        {/* wide: the two switches sit at the right end of the heading row; narrow: under the tiles */}
         <section className="@2xl:grid @2xl:grid-cols-[minmax(0,1fr)_auto] @2xl:items-center @2xl:gap-x-6">
           <Heading hint="Pick one to watch it play." className="@2xl:mb-0">2. Caption style</Heading>
           <div className="grid grid-cols-2 gap-2 @lg:grid-cols-4 @2xl:col-span-2 @2xl:row-start-2 @2xl:mt-1.5">
@@ -212,7 +282,7 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
                     data-caption-tile={c.key}
                     className="@container-[size] block aspect-[5/2] w-full overflow-hidden rounded-t-[calc(var(--radius)-1px)] bg-gradient-to-br from-zinc-700 via-zinc-800 to-zinc-900"
                   >
-                    <CaptionPreview style={c} animate={on || hover === c.key} />
+                    <CaptionPreview style={c} animate={on || hover === c.key} showEmoji={value.auto_emoji} />
                   </span>
                   <span className="block px-2 py-1.5">
                     <span className="line-clamp-2 text-xs leading-tight font-medium wrap-anywhere">{c.name}</span>
@@ -240,13 +310,79 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
           </div>
           <div className="mt-2.5 flex flex-wrap gap-x-6 gap-y-0.5 @2xl:col-start-2 @2xl:row-start-1 @2xl:mt-0">
             <Label className={toggle}>
-              <Switch checked={value.auto_emoji} onCheckedChange={(v) => set("auto_emoji", v)} /> Add emojis
+              <Switch checked={value.auto_emoji} onCheckedChange={(v) => set("auto_emoji", v)} /> Add iOS emojis
             </Label>
             <Label className={toggle}>
               <Switch checked={value.hook_title} onCheckedChange={(v) => set("hook_title", v)} /> Hook title on every clip
             </Label>
           </div>
         </section>
+
+        {/* Hook card style + Caption height */}
+        {(value.caption_style !== "none" || hookOn) && (
+          <section className="grid gap-x-8 gap-y-4 rounded-2xl border border-white/10 bg-white/[.02] p-3.5 @2xl:grid-cols-2">
+            {value.caption_style !== "none" && (
+              <div>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium">Caption vertical position</span>
+                  <span className="text-muted-foreground tabular-nums">
+                    {value.caption_position == null ? "Style default" : `${capPct}% from top`}
+                    {value.caption_position != null && (
+                      <button type="button" onClick={() => set("caption_position", null)} className="ml-2 text-primary hover:underline">
+                        Reset
+                      </button>
+                    )}
+                  </span>
+                </div>
+                <Slider
+                  className={slider}
+                  min={15}
+                  max={82}
+                  step={1}
+                  value={[capPct]}
+                  onValueChange={([v]) => set("caption_position", v / 100)}
+                />
+                <p className="text-[11px] text-muted-foreground">Keep between 55%–72% to stay above TikTok/Reels bottom UI.</p>
+              </div>
+            )}
+            {hookOn && (
+              <div className="flex flex-wrap items-center gap-3">
+                <div>
+                  <span className="mb-1 block text-xs font-medium">Hook card theme</span>
+                  <select
+                    aria-label="Hook card theme"
+                    value={value.hook_card_style ?? "light"}
+                    onChange={(e) => set("hook_card_style", e.target.value as HookCardStyle)}
+                    className={SELECT}
+                  >
+                    {(presets.hook_card_styles ?? [
+                      { key: "light", name: "Light pill" },
+                      { key: "dark", name: "Dark pill" },
+                      { key: "accent", name: "Brand gradient" },
+                      { key: "glass", name: "Frosted glass" },
+                    ]).map((h) => (
+                      <option key={h.key} value={h.key}>{h.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <span className="mb-1 block text-xs font-medium">Show hook for</span>
+                  <select
+                    aria-label="Hook card duration"
+                    value={String(value.hook_card_duration ?? 0)}
+                    onChange={(e) => set("hook_card_duration", Number(e.target.value))}
+                    className={SELECT}
+                  >
+                    <option value="0">Entire clip</option>
+                    <option value="3">First 3 seconds</option>
+                    <option value="5">First 5 seconds</option>
+                    <option value="8">First 8 seconds</option>
+                  </select>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
 
         {/* 3. Shape + 4. Length */}
         <div className="grid gap-x-8 gap-y-6 @2xl:grid-cols-2">
@@ -272,7 +408,7 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
             </div>
           </section>
           <section>
-            <Heading hint="Best between 15 and 60 seconds.">
+            <Heading hint="Between 5 and 180 seconds.">
               4. Clip length{" "}
               <span className="ml-1 font-normal text-muted-foreground tabular-nums">
                 {value.min_duration}s to {value.max_duration}s
@@ -281,11 +417,11 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
             <Slider
               className={slider}
               min={5}
-              max={120}
+              max={180}
               step={5}
               minStepsBetweenThumbs={1}
               value={[value.min_duration, value.max_duration]}
-              onValueChange={([a, b]) => onChange({ ...value, min_duration: Math.min(a, 115), max_duration: Math.min(120, Math.max(b, a + 5)) })}
+              onValueChange={([a, b]) => onChange({ ...value, min_duration: Math.min(a, 175), max_duration: Math.min(180, Math.max(b, a + 5)) })}
             />
           </section>
         </div>
@@ -314,7 +450,6 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
                 </button>
               );
             })}
-            {/* a new tab, so the video and the choices made here are not lost */}
             <Link
               href="/music"
               target="_blank"
@@ -342,6 +477,90 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
                 <Label className={toggle}>
                   <Switch checked={value.match_drop_to_hook} onCheckedChange={(v) => set("match_drop_to_hook", v)} /> Land the beat drop on the hook
                 </Label>
+                <Label className={toggle}>
+                  <Switch checked={!!value.beat_sync_zoom} onCheckedChange={(v) => set("beat_sync_zoom", v)} /> Snap punch-in zooms to music beats
+                </Label>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* 6. Audio polish, Language & Brand Kit */}
+        <section className="rounded-2xl border border-white/10 bg-white/[.02]">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced((v) => !v)}
+            aria-expanded={showAdvanced}
+            className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left text-sm font-medium outline-none hover:bg-white/[.02] focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <span className="flex items-center gap-2">
+              <SlidersHorizontal className="size-4 text-primary" /> Audio polish, language & branding
+            </span>
+            <span className="text-xs text-muted-foreground">{showAdvanced ? "Hide" : "Customize"}</span>
+          </button>
+          {showAdvanced && (
+            <div className="grid gap-5 border-t border-white/10 p-4 @2xl:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label className={toggle}>
+                  <Switch checked={value.normalize_audio ?? true} onCheckedChange={(v) => set("normalize_audio", v)} /> Normalize speech loudness (-14 LUFS)
+                </Label>
+                <Label className={toggle}>
+                  <Switch checked={!!value.denoise_audio} onCheckedChange={(v) => set("denoise_audio", v)} /> Reduce background room noise
+                </Label>
+                <Label className={toggle}>
+                  <Switch checked={!!value.remove_silences} onCheckedChange={(v) => set("remove_silences", v)} /> Auto jump-cut awkward silences
+                </Label>
+                <Label className={toggle}>
+                  <Switch checked={!!value.progress_bar} onCheckedChange={(v) => set("progress_bar", v)} /> Add retention progress bar
+                </Label>
+                {presets.llm_configured && (
+                  <Label className={toggle}>
+                    <Switch checked={!!value.use_ai} onCheckedChange={(v) => set("use_ai", v)} />
+                    <span className="flex items-center gap-1"><Sparkles className="size-3.5 text-primary" /> Enhance hooks & scores with AI</span>
+                  </Label>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label htmlFor="speech-lang" className="mb-1 block text-xs font-medium">Spoken language</label>
+                  <select
+                    id="speech-lang"
+                    value={value.language ?? ""}
+                    onChange={(e) => set("language", e.target.value || null)}
+                    className={cn(SELECT, "w-full")}
+                  >
+                    {LANGUAGES.map((l) => (
+                      <option key={l.code} value={l.code}>{l.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                  <div>
+                    <label htmlFor="wm-text" className="mb-1 block text-xs font-medium">Watermark handle (optional)</label>
+                    <Input
+                      id="wm-text"
+                      value={value.watermark_text ?? ""}
+                      onChange={(e) => set("watermark_text", e.target.value)}
+                      placeholder="@yourhandle"
+                      maxLength={60}
+                      className="h-9 text-xs pointer-coarse:h-11 pointer-coarse:text-base"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="wm-pos" className="mb-1 block text-xs font-medium">Corner</label>
+                    <select
+                      id="wm-pos"
+                      value={value.watermark_position ?? "bottom_right"}
+                      onChange={(e) => set("watermark_position", e.target.value as WatermarkPosition)}
+                      className={SELECT}
+                    >
+                      {WM_POSITIONS.map((p) => (
+                        <option key={p.key} value={p.key}>{p.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
               </div>
             </div>
           )}

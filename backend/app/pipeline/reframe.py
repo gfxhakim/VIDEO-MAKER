@@ -1,30 +1,33 @@
-"""16:9 -> 9:16 smart reframing.
+"""16:9 -> vertical / square smart reframing.
 
-Step 1  analyze_faces(): sample frames (4 fps) with OpenCV's bundled Haar cascades, at a
-        small resolution so it is cheap on a laptop CPU.
-Step 2  camera_path():   choose the face to follow, fill gaps, median-filter, then a
-        "virtual camera" with a dead-zone and easing, so it pans only when the subject
-        really moves (no jitter).
+Step 1  analyze_faces(): sample frames (4 fps) using OpenCV YuNet ONNX (accurate across
+        tilted heads, mics, and dim lighting) with automatic fallback to Haar cascades.
+Step 2  camera_path():   split at hard scene cuts so the camera snaps cleanly on cuts,
+        fill gaps, median-filter, then smooth with a virtual camera dead-zone.
 Step 3  build_layout():  turn the analysis into an FFmpeg filtergraph for the chosen layout.
 
-All crops come straight from the full-resolution source and are scaled once with
-Lanczos to the output size, so quality is preserved (no double scaling, no stretching).
-
-Layouts: face_track | face_static | center | split_faces | gameplay_facecam | blur_fill
+Layouts: face_track | face_static | center | split_faces | gameplay_facecam | broll_split | blur_fill
 """
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
+from ..config import effective_cpus, get_settings
+
 log = logging.getLogger(__name__)
 
 # (cx, cy, w, h) normalised 0..1
 Face = tuple[float, float, float, float]
+
+YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
 
 @dataclass
@@ -37,7 +40,6 @@ class FaceTrack:
         return sum(1 for f in self.faces if f) / max(1, len(self.faces))
 
     def to_dict(self) -> dict:
-        """Plain JSON-safe form (lossless: floats survive json.dumps / json.loads exactly)."""
         return {
             "times": [float(t) for t in self.times],
             "faces": [[[float(v) for v in f] for f in faces] for faces in self.faces],
@@ -53,9 +55,53 @@ class FaceTrack:
         return cls(times=times, faces=faces)
 
 
-# One pair of classifiers per thread: detectMultiScale on a shared CascadeClassifier
-# is not guaranteed thread-safe, and several clips can be analysed at once.
 _tls = threading.local()
+_yunet_lock = threading.Lock()
+
+
+def _yunet_model_path() -> Path | None:
+    s = get_settings()
+    for p in (s.models_dir / YUNET_FILENAME, s.assets_dir / "models" / YUNET_FILENAME):
+        if p.is_file() and p.stat().st_size > 100_000:
+            return p
+    if not s.auto_download_yunet or os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    with _yunet_lock:
+        dest = s.models_dir / YUNET_FILENAME
+        if dest.is_file() and dest.stat().st_size > 100_000:
+            return dest
+        tmp = dest.with_suffix(".tmp")
+        try:
+            log.info("downloading YuNet face detector (~228 KB) into %s", dest)
+            urllib.request.urlretrieve(YUNET_URL, tmp)
+            if tmp.stat().st_size > 100_000:
+                os.replace(tmp, dest)
+                return dest
+        except Exception as e:  # noqa: BLE001
+            log.info("YuNet download skipped (%s); using Haar cascades", e)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return None
+
+
+def _get_yunet(sw: int, sh: int):
+    import cv2
+
+    if not hasattr(cv2, "FaceDetectorYN"):
+        return None
+    det = getattr(_tls, "yunet", None)
+    if det is None:
+        model_path = _yunet_model_path()
+        if not model_path:
+            return None
+        try:
+            det = cv2.FaceDetectorYN.create(str(model_path), "", (sw, sh), 0.65, 0.3, 5)
+            _tls.yunet = det
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not load YuNet (%s); falling back to Haar", e)
+            return None
+    det.setInputSize((sw, sh))
+    return det
 
 
 def _get_cascades():
@@ -63,9 +109,7 @@ def _get_cascades():
     if pair is None:
         import cv2
 
-        from ..config import effective_cpus
-
-        cv2.setNumThreads(min(effective_cpus(), 4))  # more threads only add memory here
+        cv2.setNumThreads(min(effective_cpus(), 4))
         base = Path(cv2.data.haarcascades)
         pair = (
             cv2.CascadeClassifier(str(base / "haarcascade_frontalface_default.xml")),
@@ -102,17 +146,28 @@ def analyze_faces(src: str | Path, start: float, end: float, sample_fps: float =
             break
         h, w = frame.shape[:2]
         scale = det_width / w
-        small = cv2.resize(frame, (det_width, int(h * scale)))
-        gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
-        sh, sw = gray.shape
-        min_side = max(24, int(sh * 0.07))
-        dets = frontal.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=6, minSize=(min_side, min_side))
-        if len(dets) == 0:
-            dets = profile.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=6, minSize=(min_side, min_side))
-            if len(dets) == 0:  # profile facing the other way
-                flipped = profile.detectMultiScale(cv2.flip(gray, 1), scaleFactor=1.15, minNeighbors=6, minSize=(min_side, min_side))
-                dets = [(sw - x - fw, y, fw, fh) for (x, y, fw, fh) in flipped]
-        faces = [((x + fw / 2) / sw, (y + fh / 2) / sh, fw / sw, fh / sh) for (x, y, fw, fh) in dets]
+        sh = max(24, int(h * scale))
+        small = cv2.resize(frame, (det_width, sh))
+        faces: list[Face] = []
+        yunet = _get_yunet(det_width, sh)
+        if yunet is not None:
+            _, raw = yunet.detect(small)
+            if raw is not None:
+                for row in raw:
+                    x, y, fw, fh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                    if fw > 8 and fh > 8:
+                        faces.append(((x + fw / 2) / det_width, (y + fh / 2) / sh, fw / det_width, fh / sh))
+        if not faces and yunet is None:
+            gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
+            g_h, g_w = gray.shape
+            min_side = max(24, int(g_h * 0.07))
+            dets = frontal.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=6, minSize=(min_side, min_side))
+            if len(dets) == 0:
+                dets = profile.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=6, minSize=(min_side, min_side))
+                if len(dets) == 0:
+                    flipped = profile.detectMultiScale(cv2.flip(gray, 1), scaleFactor=1.15, minNeighbors=6, minSize=(min_side, min_side))
+                    dets = [(g_w - x - fw, y, fw, fh) for (x, y, fw, fh) in flipped]
+            faces = [((x + fw / 2) / g_w, (y + fh / 2) / g_h, fw / g_w, fh / g_h) for (x, y, fw, fh) in dets]
         track.times.append(frame_idx / fps)
         track.faces.append(faces)
         frame_idx += 1
@@ -128,34 +183,31 @@ def _median_filter(x: np.ndarray, k: int = 5) -> np.ndarray:
     return np.array([np.median(xp[i:i + k]) for i in range(len(x))])
 
 
-def camera_path(track: FaceTrack, smoothing: float = 0.82, dead_zone: float = 0.06) -> tuple[list[float], np.ndarray, np.ndarray]:
-    """Return (times, cx[], cy[]) normalised, for the subject the camera follows."""
-    if not track.times:
-        return [], np.array([]), np.array([])
+def _smooth_segment(times: list[float], faces_slice: list[list[Face]], smoothing: float, dead_zone: float,
+                    fallback_x: float = 0.5, fallback_y: float = 0.4) -> tuple[np.ndarray, np.ndarray]:
     cx, cy = [], []
     prev = None
-    for faces in track.faces:
+    for faces in faces_slice:
         if not faces:
             cx.append(np.nan)
             cy.append(np.nan)
             continue
         if prev is None:
             f = max(faces, key=lambda f: f[2] * f[3])
-        else:  # prefer big faces near where the camera already is (continuity)
+        else:
             f = max(faces, key=lambda f: f[2] * f[3] * 4 - abs(f[0] - prev[0]))
         prev = f
         cx.append(f[0])
         cy.append(f[1])
     cx_a, cy_a = np.array(cx, dtype=float), np.array(cy, dtype=float)
-    for arr in (cx_a, cy_a):
+    for arr, fb in ((cx_a, fallback_x), (cy_a, fallback_y)):
         valid = ~np.isnan(arr)
         if not valid.any():
-            arr[:] = 0.5 if arr is cx_a else 0.4
+            arr[:] = fb
             continue
         idx = np.arange(len(arr))
-        arr[:] = np.interp(idx, idx[valid], arr[valid])  # fill gaps (holds edges)
+        arr[:] = np.interp(idx, idx[valid], arr[valid])
     cx_a, cy_a = _median_filter(cx_a), _median_filter(cy_a)
-    # virtual camera: ignore small moves, ease towards big ones
     cam_x, cam_y = np.empty_like(cx_a), np.empty_like(cy_a)
     x, y = cx_a[0], cy_a[0]
     alpha = 1 - smoothing
@@ -165,11 +217,42 @@ def camera_path(track: FaceTrack, smoothing: float = 0.82, dead_zone: float = 0.
         if abs(cy_a[i] - y) > dead_zone:
             y += (cy_a[i] - y) * alpha
         cam_x[i], cam_y[i] = x, y
-    return track.times, cam_x, cam_y
+    return cam_x, cam_y
+
+
+def camera_path(
+    track: FaceTrack,
+    smoothing: float = 0.82,
+    dead_zone: float = 0.06,
+    scene_cuts: list[float] | None = None,
+) -> tuple[list[float], np.ndarray, np.ndarray]:
+    """Return (times, cx[], cy[]) normalised, snapping cleanly across hard scene cuts."""
+    if not track.times:
+        return [], np.array([]), np.array([])
+    if not scene_cuts:
+        cam_x, cam_y = _smooth_segment(track.times, track.faces, smoothing, dead_zone)
+        return track.times, cam_x, cam_y
+
+    cuts = sorted(c for c in scene_cuts if track.times[0] < c < track.times[-1])
+    if not cuts:
+        cam_x, cam_y = _smooth_segment(track.times, track.faces, smoothing, dead_zone)
+        return track.times, cam_x, cam_y
+
+    out_x, out_y = [], []
+    seg_start = 0
+    for cut in [*cuts, track.times[-1] + 1.0]:
+        seg_end = seg_start
+        while seg_end < len(track.times) and track.times[seg_end] < cut:
+            seg_end += 1
+        if seg_end > seg_start:
+            sx, sy = _smooth_segment(track.times[seg_start:seg_end], track.faces[seg_start:seg_end], smoothing, dead_zone)
+            out_x.append(sx)
+            out_y.append(sy)
+        seg_start = seg_end
+    return track.times, np.concatenate(out_x), np.concatenate(out_y)
 
 
 def _rdp(points: list[tuple[float, float]], eps: float) -> list[tuple[float, float]]:
-    """Ramer-Douglas-Peucker simplification (keeps the FFmpeg expression short)."""
     if len(points) < 3:
         return points
     (x0, y0), (x1, y1) = points[0], points[-1]
@@ -188,7 +271,6 @@ def _rdp(points: list[tuple[float, float]], eps: float) -> list[tuple[float, flo
 
 
 def piecewise_expr(times: list[float], values: list[float], max_points: int = 48) -> str:
-    """Linear interpolation of keyframes as an FFmpeg expression of t (evaluated per frame)."""
     pts = list(zip(times, values))
     if not pts:
         return "0"
@@ -214,7 +296,6 @@ def _even(v: float) -> int:
 
 
 def _fit(v: float, limit: int) -> int:
-    """Nearest even size that still fits inside `limit` (sources can have odd sizes, like 853x479)."""
     return max(2, min(_even(v), limit - limit % 2))
 
 
@@ -232,13 +313,23 @@ class LayoutResult:
     notes: str = ""
 
 
-def build_layout(layout: str, *, src_w: int, src_h: int, out_w: int, out_h: int, track: FaceTrack,
-                 style: dict, zoom_windows: list[tuple[float, float]] | None = None) -> LayoutResult:
+def build_layout(
+    layout: str,
+    *,
+    src_w: int,
+    src_h: int,
+    out_w: int,
+    out_h: int,
+    track: FaceTrack,
+    style: dict,
+    zoom_windows: list[tuple[float, float]] | None = None,
+    scene_cuts: list[float] | None = None,
+    has_broll: bool = False,
+) -> LayoutResult:
     """Return the video filtergraph for one clip. Input label [0:v], output label [vbase]."""
     zoom_windows = zoom_windows or []
     lanczos = "flags=lanczos"
     target_ar = out_w / out_h
-    # largest crop of the source with the target aspect
     if src_w / src_h > target_ar:
         cw, ch = _even(src_h * target_ar), _even(src_h)
     else:
@@ -250,19 +341,24 @@ def build_layout(layout: str, *, src_w: int, src_h: int, out_w: int, out_h: int,
 
     zoom = _zoom_expr(zoom_windows, float(style.get("zoom_amount", 1.15))) if style.get("zoom_on_emphasis") else "1"
 
-    def post_zoom(label_in: str, w: int, h: int, fy: float = 0.4) -> str:
+    def post_zoom(label_in: str, w: int, h: int, fy: float = 0.4, base_w: int | None = None, base_h: int | None = None) -> str:
         if zoom == "1":
             return f"[{label_in}]scale={w}:{h}:{lanczos},setsar=1[vbase]"
-        # Punch-in: one normal branch and one pre-zoomed branch, switched on during the
-        # emphasis windows. Both scalers have a fixed size. The earlier single scale with
-        # eval=frame rebuilt its Lanczos kernels for every frame (about 15% of render time).
         amount = float(style.get("zoom_amount", 1.15))
-        zw, zh = min(cw, _even(cw / amount)), min(ch, _even(ch / amount))
+        bw, bh = base_w or cw, base_h or ch
+        zw, zh = min(bw, _even(bw / amount)), min(bh, _even(bh / amount))
         cond = "gt(" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in zoom_windows[:40]) + ",0)"
         return (f"[{label_in}]split=2[zn][zz];"
                 f"[zn]scale={w}:{h}:{lanczos}[zbase];"
                 f"[zz]crop={zw}:{zh}:(iw-{zw})/2:(ih-{zh})*{fy:.2f},scale={w}:{h}:{lanczos}[zin];"
                 f"[zbase][zin]overlay=0:0:enable='{cond}',setsar=1[vbase]")
+
+    if layout == "broll_split":
+        if has_broll:
+            res = _broll_split(src_w, src_h, out_w, out_h, track, lanczos, scene_cuts=scene_cuts, style=style)
+            if res:
+                return res
+        layout = "face_track"
 
     if layout == "split_faces":
         res = _split_faces(src_w, src_h, out_w, out_h, track, lanczos)
@@ -271,7 +367,8 @@ def build_layout(layout: str, *, src_w: int, src_h: int, out_w: int, out_h: int,
         layout = "face_track"
 
     if layout == "gameplay_facecam":
-        res = _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos)
+        res = _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos,
+                                post_zoom=post_zoom if zoom != "1" else None)
         if res:
             return res
         layout = "blur_fill"
@@ -292,9 +389,14 @@ def build_layout(layout: str, *, src_w: int, src_h: int, out_w: int, out_h: int,
         y = (src_h - ch) // 2
         return LayoutResult(f"[0:v]crop={cw}:{ch}:{x}:{y}[c0];" + post_zoom("c0", out_w, out_h), "center")
 
-    times, camx, camy = camera_path(track, float(style.get("smoothing", 0.82)), float(style.get("dead_zone", 0.06)))
+    times, camx, camy = camera_path(
+        track,
+        float(style.get("smoothing", 0.82)),
+        float(style.get("dead_zone", 0.06)),
+        scene_cuts=scene_cuts,
+    )
     px = np.clip(camx * src_w - cw / 2, 0, src_w - cw)
-    py = np.clip(camy * src_h - ch * 0.38, 0, src_h - ch)  # keep eyes in the upper third
+    py = np.clip(camy * src_h - ch * 0.38, 0, src_h - ch)
     if layout == "face_static":
         x, y = int(np.median(px)), int(np.median(py))
         return LayoutResult(f"[0:v]crop={cw}:{ch}:{x}:{y}[c0];" + post_zoom("c0", out_w, out_h), "face_static")
@@ -310,7 +412,7 @@ def _cluster_x(track: FaceTrack) -> tuple[float, float] | None:
         return None
     xs_a = np.array(xs)
     c1, c2 = np.percentile(xs_a, 20), np.percentile(xs_a, 80)
-    for _ in range(10):  # 1-D k-means, k=2
+    for _ in range(10):
         a = xs_a[np.abs(xs_a - c1) <= np.abs(xs_a - c2)]
         b = xs_a[np.abs(xs_a - c1) > np.abs(xs_a - c2)]
         if len(a) == 0 or len(b) == 0:
@@ -342,7 +444,7 @@ def _split_faces(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResult | N
     )
 
 
-def _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResult | None:
+def _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos, post_zoom=None) -> LayoutResult | None:
     faces = [f for fs in track.faces for f in fs]
     if len(faces) < 4:
         return None
@@ -351,22 +453,49 @@ def _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos) -> LayoutResul
     fw = float(np.median([f[2] for f in faces]))
     top_h = int(out_h * 0.55) // 2 * 2
     bot_h = out_h - top_h
-    # gameplay: centre crop with the top panel's aspect
     g_ar = out_w / top_h
     gw = _fit(min(src_w, src_h * g_ar), src_w)
     gh = _fit(gw / g_ar, src_h)
     gx, gy = (src_w - gw) // 2, (src_h - gh) // 2
-    # facecam: box ~3.5x the face width around the face
     b_ar = out_w / bot_h
     cw = _fit(min(src_w, max(fw * src_w * 3.5, 160)), src_w)
     ch = _fit(min(src_h, cw / b_ar), src_h)
     cw = _fit(ch * b_ar, src_w)
     cx = int(np.clip(fx * src_w - cw / 2, 0, src_w - cw))
     cy = int(np.clip(fy * src_h - ch * 0.45, 0, src_h - ch))
-    return LayoutResult(
+    graph = (
         f"[0:v]split=2[g0][f0];"
         f"[g0]crop={gw}:{gh}:{gx}:{gy},scale={out_w}:{top_h}:{lanczos}[top];"
         f"[f0]crop={cw}:{ch}:{cx}:{cy},scale={out_w}:{bot_h}:{lanczos}[bot];"
+    )
+    if post_zoom is not None:
+        graph += "[top][bot]vstack=2,setsar=1[vpre];" + post_zoom("vpre", out_w, out_h, 0.3, out_w, out_h)
+    else:
+        graph += "[top][bot]vstack=2,setsar=1[vbase]"
+    return LayoutResult(graph, "gameplay_facecam")
+
+
+def _broll_split(src_w, src_h, out_w, out_h, track, lanczos, *, scene_cuts=None, style=None) -> LayoutResult | None:
+    """Speaker on top (55%), looping B-roll clip on bottom (45%). Uses [broll:v] placeholder."""
+    style = style or {}
+    top_h = int(out_h * 0.55) // 2 * 2
+    bot_h = out_h - top_h
+    ar = out_w / top_h
+    cw = _fit(min(src_w, src_h * ar), src_w)
+    ch = _fit(cw / ar, src_h)
+    if track.times and track.hit_rate >= 0.1:
+        times, camx, camy = camera_path(track, float(style.get("smoothing", 0.82)), float(style.get("dead_zone", 0.06)), scene_cuts=scene_cuts)
+        px = np.clip(camx * src_w - cw / 2, 0, src_w - cw)
+        py = np.clip(camy * src_h - ch * 0.4, 0, src_h - ch)
+        x_expr = piecewise_expr(times, list(px))
+        y_expr = piecewise_expr(times, list(py)) if ch < src_h else "0"
+        top_crop = f"crop={cw}:{ch}:'{x_expr}':'{y_expr}'"
+    else:
+        tx, ty = (src_w - cw) // 2, (src_h - ch) // 2
+        top_crop = f"crop={cw}:{ch}:{tx}:{ty}"
+    return LayoutResult(
+        f"[0:v]{top_crop},scale={out_w}:{top_h}:{lanczos}[top];"
+        f"[broll:v]scale={out_w}:{bot_h}:force_original_aspect_ratio=increase,crop={out_w}:{bot_h},fps=30[bot];"
         f"[top][bot]vstack=2,setsar=1[vbase]",
-        "gameplay_facecam",
+        "broll_split",
     )

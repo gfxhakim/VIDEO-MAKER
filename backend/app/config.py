@@ -1,10 +1,12 @@
 """Central settings, loaded from environment variables / backend/.env."""
 from __future__ import annotations
 
+import json
 import math
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -51,9 +53,15 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "int8"
     whisper_threads: int = 0  # 0 = auto (leaves a core for the scene scan that runs alongside)
 
+    # face detection (YuNet ONNX downloaded once into models_dir; falls back to OpenCV Haar cascades)
+    auto_download_yunet: bool = True
+
+    # optional OpenAI-compatible / Ollama endpoint for semantic scoring & copywriting (disabled by default)
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = "gpt-4o-mini"
+
     # uploads (chunked + resumable, see api/uploads.py)
-    # One chunk = one short request. Railway's proxy requires a request body to finish
-    # uploading within 5 minutes, so chunks must stay small enough for slow home uplinks.
     upload_chunk_mb: int = 4
     max_upload_gb: float = 10
     upload_ttl_hours: int = 24  # unfinished uploads are deleted after this long without a new chunk
@@ -62,7 +70,10 @@ class Settings(BaseSettings):
 
     # downloads
     ytdlp_format: str = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"
+    ytdlp_max_filesize_gb: float = 4.0
+    ytdlp_timeout_seconds: int = 1800
     allow_local_paths: bool = True
+    allow_private_urls: bool = False
 
     # paths derived from data_dir
     @property
@@ -82,8 +93,16 @@ class Settings(BaseSettings):
         return self.data_dir / "music"
 
     @property
+    def broll_dir(self) -> Path:
+        return self.data_dir / "broll"
+
+    @property
     def models_dir(self) -> Path:
         return self.data_dir / "models"
+
+    @property
+    def app_settings_path(self) -> Path:
+        return self.data_dir / "app_settings.json"
 
     @property
     def fonts_dir(self) -> Path:
@@ -94,18 +113,48 @@ class Settings(BaseSettings):
         return BACKEND_DIR / "assets"
 
     def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.projects_dir, self.uploads_dir, self.music_dir, self.models_dir):
+        for d in (self.data_dir, self.projects_dir, self.uploads_dir, self.music_dir, self.broll_dir, self.models_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+
+def load_runtime_config() -> dict[str, Any]:
+    """User-editable runtime preferences saved in DATA_DIR/app_settings.json (brand defaults + optional LLM)."""
+    s = get_settings()
+    defaults: dict[str, Any] = {
+        "default_watermark_text": "",
+        "default_watermark_position": "bottom_right",
+        "llm_base_url": s.llm_base_url,
+        "llm_api_key": s.llm_api_key,
+        "llm_model": s.llm_model,
+    }
+    p = s.app_settings_path
+    if p.exists():
+        try:
+            saved = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                for k in defaults:
+                    if k in saved and saved[k] is not None:
+                        defaults[k] = saved[k]
+        except (OSError, ValueError):
+            pass
+    return defaults
+
+
+def save_runtime_config(patch: dict[str, Any]) -> dict[str, Any]:
+    cur = load_runtime_config()
+    for k, v in patch.items():
+        if k in cur and v is not None:
+            cur[k] = v
+    p = get_settings().app_settings_path
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+    return cur
 
 
 @lru_cache
 def effective_cpus() -> int:
-    """CPU cores this process may really use. Never below 1.
-
-    Containers often see every core of the host while a cgroup quota allows far
-    fewer, so thread counts based on os.cpu_count() waste memory and get slower.
-    Order: CPU_LIMIT env override, then scheduler affinity capped by the cgroup quota.
-    """
+    """CPU cores this process may really use. Never below 1."""
     override = os.environ.get("CPU_LIMIT", "").strip()
     if override:
         try:
@@ -117,14 +166,14 @@ def effective_cpus() -> int:
     except (AttributeError, OSError):
         n = os.cpu_count() or 1
     quota = None
-    try:  # cgroup v2: "max 100000" or "200000 100000"
+    try:
         raw = Path("/sys/fs/cgroup/cpu.max").read_text().split()
         if len(raw) == 2 and raw[0] != "max":
             quota = float(raw[0]) / float(raw[1])
     except (OSError, ValueError, ZeroDivisionError):
         pass
     if quota is None:
-        try:  # cgroup v1
+        try:
             q = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
             per = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
             if q > 0 and per > 0:
@@ -157,7 +206,7 @@ def memory_limit_bytes() -> int:
     for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:
             raw = Path(f).read_text().strip()
-            if raw.isdigit() and 0 < int(raw) < 1 << 60:  # cgroup v1 reports a huge number for "no limit"
+            if raw.isdigit() and 0 < int(raw) < 1 << 60:
                 return int(raw)
         except OSError:
             pass
@@ -171,12 +220,6 @@ def memory_limit_bytes() -> int:
 
 
 def auto_worker_concurrency() -> int:
-    """How many jobs to run at once when WORKER_CONCURRENCY is 0.
-
-    One render already uses about three cores, so a second worker only pays off from
-    4 cores up. Each 1080x1920 render needs roughly 0.5 GB and the speech model plus a
-    long video's audio can take 1.5 GB, so memory caps it too.
-    """
     by_cpu = min(3, effective_cpus() // 2)
     mem = memory_limit_bytes()
     by_mem = 3 if not mem else int(mem // (2 * 1024**3))
@@ -188,13 +231,11 @@ def worker_count() -> int:
 
 
 def ffmpeg_thread_count() -> int:
-    """Threads for one ffmpeg process: FFMPEG_THREADS if set, else the usable cores (max 8)."""
     return get_settings().ffmpeg_threads or min(effective_cpus(), 8)
 
 
 @lru_cache
 def nice_prefix() -> tuple[str, ...]:
-    """Command prefix that runs heavy ffmpeg work at low priority, so the API stays responsive."""
     import shutil
 
     return ("nice", "-n", "10") if os.name == "posix" and shutil.which("nice") else ()

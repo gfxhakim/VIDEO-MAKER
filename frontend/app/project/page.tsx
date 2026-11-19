@@ -6,36 +6,31 @@ import { useSearchParams } from "next/navigation";
 import useSWR, { type SWRConfiguration } from "swr";
 import { motion } from "motion/react";
 import { toast } from "sonner";
-import { ArrowLeft, Check, Clock, Download, Loader2, Palette, RotateCcw, Sparkles, TriangleAlert, WifiOff } from "lucide-react";
+import {
+  ArrowLeft, Check, CheckSquare, Clock, Download, HardDrive, Loader2, Palette, Plus, RotateCcw, Search, Sparkles, ThumbsDown, ThumbsUp, Trash2, TriangleAlert, WifiOff,
+} from "lucide-react";
 import { PageHeader } from "@/components/app-shell";
-import { CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
+import { aspectClass, CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
 import { ClipStudio, useClipStudio } from "@/components/clip-studio";
 import { StatusBadge } from "@/components/status-badge";
 import { StyleSelector } from "@/components/style-selector";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { ApiError, api, fetcher, type Clip, type GenerationSettings, type Project } from "@/lib/api";
-import { cn, fmtDuration } from "@/lib/utils";
-
-/* ------------------------------------------------------------------ polling */
+import { ApiError, api, fetcher, type Clip, type GenerationSettings, type Project, type TranscriptResponse } from "@/lib/api";
+import { cn, fmtBytes, fmtDuration } from "@/lib/utils";
 
 const isLive = (p?: Project) => p?.status === "queued" || p?.status === "processing";
 const isBusy = (c: Clip) => c.status === "pending" || c.status === "rendering";
 const PROJECT_EVERY = 1500;
 const CLIPS_EVERY = 6000;
 
-/**
- * One dropped request must not freeze the page: SWR stops polling while a key is in error and its
- * own retry backs off for longer and longer. Retry soon instead, and keep doing it.
- */
 const retrySoon: NonNullable<SWRConfiguration["onErrorRetry"]> = (err, _key, _config, revalidate, { retryCount }) => {
-  if (err instanceof ApiError && (err.status === 404 || err.status === 401)) return; // nothing to wait for
-  if (typeof document !== "undefined" && document.visibilityState === "hidden") return; // SWR checks again when the tab is back
+  if (err instanceof ApiError && (err.status === 404 || err.status === 401)) return;
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
   setTimeout(() => revalidate({ retryCount }), Math.min(1500 * retryCount, 6000));
 };
-
-/* ------------------------------------------------------------------ elapsed time */
 
 const runKey = (id: number) => `autoclip:run:${id}`;
 type Run = { start: number; p: number };
@@ -52,21 +47,13 @@ function writeRun(id: number, run: Run | null) {
   try {
     if (run) localStorage.setItem(runKey(id), JSON.stringify(run));
     else localStorage.removeItem(runKey(id));
-  } catch {
-    /* private mode: the clock just restarts on reload */
-  }
+  } catch {}
 }
-/** The API sends UTC, sometimes without a zone and with microseconds. */
 function parseTime(iso: string) {
   const s = iso.replace(/(\.\d{3})\d+/, "$1");
   return Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(s) ? s : s + "Z");
 }
 
-/**
- * When the current run started, for the "so far" clock.
- * The API does not say (see `started_at` below, used the day it does), so this browser remembers when it
- * first saw the run and keeps that across reloads. Progress going backwards means a new run began.
- */
 function useRunStart(project: Project | undefined) {
   const [start, setStart] = useState<number | null>(null);
   const id = project?.id;
@@ -90,8 +77,6 @@ function useRunStart(project: Project | undefined) {
     let run = readRun(id);
     if (run && (progress + 0.05 < run.p || run.start > now || now - run.start > 48 * 3600e3)) run = null;
     if (!run) {
-      // First sight of this run. If it is already under way, the project's creation time is the best guess,
-      // unless this is a re-run of an older project (it still has its clips from before).
       const created = createdAt ? parseTime(createdAt) : NaN;
       const underWay = progress >= 0.02 && !(hadClips && progress < 0.68);
       const usable = !Number.isNaN(created) && created <= now && now - created < 12 * 3600e3;
@@ -114,7 +99,6 @@ function fmtClock(totalSeconds: number) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
-/** Ticks on its own, so the rest of the page does not re-render every second. */
 function ElapsedClock({ since }: { since: number }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -124,9 +108,6 @@ function ElapsedClock({ since }: { since: number }) {
   return <span className="tabular-nums">{fmtClock((now - since) / 1000)}</span>;
 }
 
-/* ------------------------------------------------------------------ progress card */
-
-// The pipeline moves the bar through these marks; the text beside the bar comes from the server as is.
 const STEPS = [
   { from: 0, label: "Get video" },
   { from: 0.16, label: "Transcribe" },
@@ -144,7 +125,6 @@ function LiveCard({ project, since, offline }: { project: Project; since: number
     <motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} aria-label="Progress" className="glass mb-6 rounded-3xl border p-4 sm:mb-8 sm:p-6">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <StatusBadge status={project.status} />
-        {/* whatever the server says, however long: two lines at most on a phone, one line beside the badge from there up */}
         <p className="order-last line-clamp-2 min-w-0 basis-full text-sm wrap-anywhere sm:order-none sm:line-clamp-1 sm:flex-1 sm:basis-0" title={stage}>{stage}</p>
         <span className="text-gradient ml-auto shrink-0 text-2xl leading-none font-semibold tabular-nums">{pct}%</span>
       </div>
@@ -199,14 +179,13 @@ function FailedCard({ project, retrying, onRetry }: { project: Project; retrying
   );
 }
 
-/** Quiet placeholders while the first clips are being made. No shimmer: this can stay on screen for many minutes. */
-function WaitingWall({ count }: { count: number }) {
+function WaitingWall({ count, ratio }: { count: number; ratio?: string }) {
   return (
     <div>
       <p className="mb-3 text-sm text-muted-foreground">Your clips will appear here as each one is made.</p>
       <div aria-hidden className={cn(CLIP_GRID, "max-sm:[&>*:nth-child(n+5)]:hidden max-xl:[&>*:nth-child(n+9)]:hidden")}>
         {Array.from({ length: count }).map((_, i) => (
-          <div key={i} className="grid aspect-[9/16] place-items-center rounded-2xl border border-dashed border-white/10 bg-white/[.02] text-sm text-muted-foreground/50">
+          <div key={i} className={cn("grid place-items-center rounded-2xl border border-dashed border-white/10 bg-white/[.02] text-sm text-muted-foreground/50", aspectClass(ratio))}>
             #{i + 1}
           </div>
         ))}
@@ -236,8 +215,6 @@ function Notice({ title, text, children }: { title: string; text: string; childr
   );
 }
 
-/* ------------------------------------------------------------------ page */
-
 const FILTERS = [
   { key: "all", label: "All" },
   { key: "pending", label: "To review" },
@@ -245,17 +222,14 @@ const FILTERS = [
   { key: "rejected", label: "Rejected" },
 ] as const;
 type Filter = (typeof FILTERS)[number]["key"];
+type SortKey = "rank" | "score" | "duration";
 
 function ProjectView() {
   const id = useSearchParams().get("id");
-  // How often to poll, as plain numbers kept in state. SWR (2.5) only looks at `refreshInterval` when its
-  // identity changes: an inline function restarts the timer on every render, and a stable function that
-  // answers 0 before the first data arrives never starts it at all. A number that changes only when the
-  // project goes live (or stops) does exactly what is wanted.
   const [every, setEvery] = useState({ project: 0, clips: 0 });
   const { data: project, error: projectError, mutate: mutateProject } = useSWR<Project>(id ? `/api/projects/${id}` : null, fetcher, {
     refreshInterval: every.project,
-    dedupingInterval: 1000, // SWR's default (2 s) would swallow every other 1.5 s poll
+    dedupingInterval: 1000,
     onErrorRetry: retrySoon,
   });
   const { data: clips, error: clipsError, mutate: mutateClips } = useSWR<Clip[]>(id ? `/api/projects/${id}/clips` : null, fetcher, {
@@ -263,8 +237,6 @@ function ProjectView() {
     onErrorRetry: retrySoon,
   });
   const live = isLive(project);
-  // Clip rows only exist once rendering starts, and the list (with every transcript) is the heavy request:
-  // it is fetched when the small project poll says something changed, plus a slow safety poll.
   const rendering = live && (project?.progress ?? 0) >= 0.68;
   const busy = !!clips?.some(isBusy);
   const wantProject = live ? PROJECT_EVERY : 0;
@@ -281,15 +253,29 @@ function ProjectView() {
     lastSignal.current = signal;
   }, [signal, mutateClips]);
 
-  // a clip is being made again (Try again on a card, Save & re-render) but the project still reads as finished
   useEffect(() => {
     if (busy && !live) void mutateProject();
   }, [busy, live, mutateProject]);
 
   const since = useRunStart(project);
   const [filter, setFilter] = useState<Filter>("all");
+  const [sort, setSort] = useState<SortKey>("rank");
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+
   const [restyle, setRestyle] = useState<GenerationSettings | null>(null);
+  const [restyleMode, setRestyleMode] = useState<"restyle" | "rescore">("restyle");
   const [starting, setStarting] = useState(false);
+
+  // Manual clip modal
+  const [manualOpen, setManualOpen] = useState(false);
+  const [trData, setTrData] = useState<TranscriptResponse | null>(null);
+  const [trQuery, setTrQuery] = useState("");
+  const [mStart, setMStart] = useState(0);
+  const [mEnd, setMEnd] = useState(20);
+  const [mTitle, setMTitle] = useState("");
+  const [mBusy, setMBusy] = useState(false);
 
   const counts = useMemo(() => {
     const n: Record<Filter, number> = { all: 0, pending: 0, approved: 0, rejected: 0 };
@@ -299,13 +285,92 @@ function ProjectView() {
     }
     return n;
   }, [clips]);
-  const shown = useMemo(() => (clips ?? []).filter((c) => filter === "all" || c.review_status === filter), [clips, filter]);
+
+  const shown = useMemo(() => {
+    const base = (clips ?? []).filter((c) => filter === "all" || c.review_status === filter);
+    if (sort === "score") return [...base].sort((a, b) => b.score - a.score);
+    if (sort === "duration") return [...base].sort((a, b) => b.duration - a.duration);
+    return base;
+  }, [clips, filter, sort]);
+
   const studio = useClipStudio(clips, shown);
   const updateClip = useCallback((c: Clip) => {
-    // a clip sent back to be made again: that is a new, short run, so its clock starts now
     if (isBusy(c) && !readRun(c.project_id)) writeRun(c.project_id, { start: Date.now(), p: 0 });
     void mutateClips((list) => list?.map((x) => (x.id === c.id ? c : x)), { revalidate: false });
   }, [mutateClips]);
+
+  const deleteClipFromList = useCallback((cid: number) => {
+    void mutateClips((list) => list?.filter((x) => x.id !== cid), { revalidate: false });
+  }, [mutateClips]);
+
+  const toggleSelect = useCallback((cid: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(cid)) next.delete(cid);
+      else next.add(cid);
+      return next;
+    });
+  }, []);
+
+  async function runBulk(action: "approve" | "reject" | "delete" | "rerender") {
+    const ids = Array.from(selected);
+    if (!ids.length) return;
+    if (action === "delete" && !window.confirm(`Delete ${ids.length} selected clip(s)?`)) return;
+    setBulkBusy(true);
+    try {
+      await api.bulkClips(ids, action);
+      setSelected(new Set());
+      setSelectMode(false);
+      await mutateClips();
+      await mutateProject();
+      toast.success(`Updated ${ids.length} clip(s)`);
+    } catch (e) {
+      toast.error("Bulk action failed", { description: (e as Error).message });
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
+  async function openManualDialog() {
+    setManualOpen(true);
+    if (!trData && project) {
+      try {
+        setTrData(await api.transcript(project.id));
+      } catch {
+        setTrData({ language: "", sentences: [], words: [] });
+      }
+    }
+  }
+
+  async function submitManualClip(e: React.FormEvent) {
+    e.preventDefault();
+    if (!project) return;
+    setMBusy(true);
+    try {
+      const c = await api.createManualClip(project.id, { start: mStart, end: mEnd, title: mTitle || undefined });
+      await mutateClips((list) => (list ? [...list, c] : [c]), { revalidate: true });
+      await mutateProject();
+      setManualOpen(false);
+      setMTitle("");
+      toast.success("Manual clip queued for rendering");
+    } catch (e) {
+      toast.error("Could not create clip", { description: (e as Error).message });
+    } finally {
+      setMBusy(false);
+    }
+  }
+
+  async function pruneSource() {
+    if (!project) return;
+    if (!window.confirm("Delete the raw source video file from disk? Rendered clips stay safe, but you won't be able to re-trim or re-style them.")) return;
+    try {
+      const res = await api.pruneSource(project.id);
+      await mutateProject();
+      toast.success(`Freed ${fmtBytes(res.freed_bytes)} from storage`);
+    } catch (e) {
+      toast.error("Could not remove source video", { description: (e as Error).message });
+    }
+  }
 
   if (!id) {
     return (
@@ -335,23 +400,31 @@ function ProjectView() {
     project.duration != null && `${fmtDuration(project.duration)} source`,
     styleName(project.settings.editing_style),
     project.settings.caption_style && `${styleName(project.settings.caption_style)} captions`,
+    project.settings.aspect_ratio,
   ].filter(Boolean).join(" · ");
 
-  async function start(settings?: GenerationSettings) {
+  async function start(settings?: GenerationSettings, mode: "rescore" | "restyle" = "rescore") {
     setStarting(true);
     try {
-      const p = await api.regenerate(project!.id, settings);
+      const p = await api.regenerate(project!.id, settings, mode);
       writeRun(p.id, { start: Date.now(), p: 0 });
-      await mutateProject(p, { revalidate: false }); // show the progress card now, not after the next poll
+      await mutateProject(p, { revalidate: false });
+      if (mode === "restyle") await mutateClips();
       setRestyle(null);
       setFilter("all");
-      toast.success("Making your clips again", { description: "The transcript is reused, so this is faster than the first time." });
+      toast.success(mode === "restyle" ? "Re-rendering clips with new look" : "Making your clips again", {
+        description: mode === "restyle" ? "Your edits, approvals, and posted marks are kept." : "The transcript is reused, so this is faster than the first time.",
+      });
     } catch (e) {
       toast.error("Could not start", { description: (e as Error).message });
     } finally {
       setStarting(false);
     }
   }
+
+  const filteredSentences = (trData?.sentences ?? []).filter(
+    (s) => !trQuery.trim() || s.text.toLowerCase().includes(trQuery.trim().toLowerCase()),
+  );
 
   return (
     <>
@@ -363,51 +436,118 @@ function ProjectView() {
         description={<span className="capitalize">{about}</span>}
         actions={
           <>
-            <Button variant="outline" className="pointer-coarse:h-11 max-sm:flex-1" disabled={live} onClick={() => setRestyle(project.settings)}><Palette /> Re-style</Button>
+            {!project.source_deleted && project.status === "done" && (
+              <Button variant="outline" className="pointer-coarse:h-11" onClick={openManualDialog}><Plus /> Add clip</Button>
+            )}
+            <Button variant="outline" className="pointer-coarse:h-11" disabled={live || project.source_deleted} onClick={() => {
+              setRestyleMode(counts.all > 0 ? "restyle" : "rescore");
+              setRestyle(project.settings);
+            }}>
+              <Palette /> Re-style
+            </Button>
             {readyCount > 0 ? (
-              <Button variant="outline" className="pointer-coarse:h-11 max-sm:flex-1" asChild>
+              <Button variant="outline" className="pointer-coarse:h-11" asChild>
                 <a
                   download
                   href={api.exportZipUrl(project.id, approvedCount ? "approved" : "all")}
-                  onClick={() => toast("Packing your clips into one ZIP file", { description: "The download starts by itself in a moment." })}
+                  onClick={() => toast("Packing your clips into one ZIP file", { description: "Includes MP4s, platform captions, and .SRT subtitles." })}
                 >
                   <Download /> {approvedCount ? `Download ${approvedCount} approved` : "Download all"}
                 </a>
               </Button>
             ) : (
-              // a link cannot be disabled, so with nothing to download this is a real (disabled) button
-              <Button variant="outline" className="pointer-coarse:h-11 max-sm:flex-1" disabled title="There are no finished clips yet"><Download /> Download all</Button>
+              <Button variant="outline" className="pointer-coarse:h-11" disabled title="There are no finished clips yet"><Download /> Download all</Button>
             )}
           </>
         }
       />
 
       {live && <LiveCard project={project} since={since} offline={!!projectError} />}
-      {project.status === "failed" && <FailedCard project={project} retrying={starting} onRetry={() => start()} />}
+      {project.status === "failed" && <FailedCard project={project} retrying={starting} onRetry={() => start(undefined, "rescore")} />}
+
+      {!live && project.status === "done" && !project.source_deleted && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-white/[.02] px-4 py-2.5 text-xs text-muted-foreground">
+          <span className="flex items-center gap-2"><HardDrive className="size-3.5 text-primary" /> Raw source video is kept on disk so you can re-trim or re-style clips.</span>
+          <button type="button" onClick={pruneSource} className="font-medium text-foreground hover:text-destructive hover:underline">
+            Delete raw source to free space
+          </button>
+        </div>
+      )}
 
       {counts.all > 0 && (
-        <div role="group" aria-label="Show" className="mb-4 flex gap-1 sm:mb-5 sm:gap-2">
-          {FILTERS.map((f) => (
-            <button
-              key={f.key}
-              type="button"
-              aria-pressed={filter === f.key}
-              onClick={() => setFilter(f.key)}
-              className={cn(
-                "relative min-w-0 rounded-full px-1.5 py-1.5 text-[0.8125rem] whitespace-nowrap transition outline-none focus-visible:ring-2 focus-visible:ring-ring/60 active:scale-[.97] max-sm:flex-auto sm:px-4 sm:text-sm pointer-coarse:min-h-10 pointer-coarse:min-w-10",
-                filter === f.key ? "text-foreground" : "text-muted-foreground hover:text-foreground",
-              )}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 sm:mb-5">
+          <div role="group" aria-label="Show" className="flex flex-wrap gap-1 sm:gap-2">
+            {FILTERS.map((f) => (
+              <button
+                key={f.key}
+                type="button"
+                aria-pressed={filter === f.key}
+                onClick={() => setFilter(f.key)}
+                className={cn(
+                  "relative min-w-0 rounded-full px-2.5 py-1.5 text-[0.8125rem] whitespace-nowrap transition outline-none focus-visible:ring-2 focus-visible:ring-ring/60 active:scale-[.97] sm:px-4 sm:text-sm pointer-coarse:min-h-10",
+                  filter === f.key ? "text-foreground" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {filter === f.key && <motion.span layoutId="clip-filter" className="absolute inset-0 rounded-full bg-white/10 ring-1 ring-white/15" transition={{ duration: 0.2 }} />}
+                <span className="relative">{f.label} <span className="text-muted-foreground tabular-nums">{counts[f.key]}</span></span>
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <select
+              aria-label="Sort clips"
+              value={sort}
+              onChange={(e) => setSort(e.target.value as SortKey)}
+              className="h-9 rounded-lg border border-white/10 bg-zinc-900 px-2.5 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              {filter === f.key && <motion.span layoutId="clip-filter" className="absolute inset-0 rounded-full bg-white/10 ring-1 ring-white/15" transition={{ duration: 0.2 }} />}
-              <span className="relative">{f.label} <span className="text-muted-foreground tabular-nums">{counts[f.key]}</span></span>
-            </button>
-          ))}
+              <option value="rank">Sort: Rank</option>
+              <option value="score">Sort: Highest score</option>
+              <option value="duration">Sort: Longest</option>
+            </select>
+            <Button
+              variant={selectMode ? "default" : "outline"}
+              size="sm"
+              onClick={() => {
+                setSelectMode((v) => !v);
+                setSelected(new Set());
+              }}
+              className="h-9 text-xs"
+            >
+              <CheckSquare className="size-3.5" /> {selectMode ? "Done" : "Select"}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {selectMode && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-primary/30 bg-primary/10 px-4 py-2.5 text-xs">
+          <span className="font-medium">{selected.size} selected</span>
+          <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setSelected(new Set(shown.map((c) => c.id)))}>Select all ({shown.length})</Button>
+          <div className="ml-auto flex flex-wrap gap-1.5">
+            <Button size="sm" variant="secondary" disabled={!selected.size || bulkBusy} onClick={() => runBulk("approve")}><ThumbsUp className="size-3.5" /> Approve</Button>
+            <Button size="sm" variant="secondary" disabled={!selected.size || bulkBusy} onClick={() => runBulk("reject")}><ThumbsDown className="size-3.5" /> Reject</Button>
+            <Button size="sm" variant="secondary" disabled={!selected.size || bulkBusy || project.source_deleted} onClick={() => runBulk("rerender")}><RotateCcw className="size-3.5" /> Re-render</Button>
+            <Button size="sm" variant="destructive" disabled={!selected.size || bulkBusy} onClick={() => runBulk("delete")}><Trash2 className="size-3.5" /> Delete</Button>
+          </div>
         </div>
       )}
 
       {shown.length > 0 ? (
         <div className={CLIP_GRID}>
-          {shown.map((c, i) => <ClipCard key={c.id} clip={c} index={i} onChange={updateClip} onOpen={studio.open} />)}
+          {shown.map((c, i) => (
+            <ClipCard
+              key={c.id}
+              clip={c}
+              index={i}
+              ratio={project.settings.aspect_ratio}
+              selectable={selectMode}
+              selected={selected.has(c.id)}
+              onToggleSelect={toggleSelect}
+              onChange={updateClip}
+              onOpen={studio.open}
+            />
+          ))}
         </div>
       ) : counts.all > 0 ? (
         <div className="glass rounded-3xl border border-dashed p-8 text-center text-sm text-muted-foreground sm:p-12">
@@ -415,14 +555,14 @@ function ProjectView() {
           <div className="mt-3"><Button variant="outline" size="sm" className="pointer-coarse:h-10" onClick={() => setFilter("all")}>Show all {counts.all}</Button></div>
         </div>
       ) : live ? (
-        <WaitingWall count={Math.max(4, Math.min(Number(project.settings.clip_count) || 10, 12))} />
+        <WaitingWall count={Math.max(4, Math.min(Number(project.settings.clip_count) || 10, 12))} ratio={project.settings.aspect_ratio} />
       ) : !clips ? (
         clipsError ? (
           <Notice title="Could not load the clips" text="Check your connection and try again.">
             <Button variant="outline" onClick={() => mutateClips()}><RotateCcw /> Try again</Button>
           </Notice>
         ) : (
-          <ClipGridSkeleton count={10} />
+          <ClipGridSkeleton count={10} ratio={project.settings.aspect_ratio} />
         )
       ) : project.status !== "failed" ? (
         <div className="glass rounded-3xl border border-dashed p-8 text-center text-sm text-muted-foreground sm:p-12">
@@ -431,20 +571,125 @@ function ProjectView() {
         </div>
       ) : null}
 
-      <ClipStudio clips={studio.clips} index={studio.index} onOpen={studio.open} onClose={studio.close} onChange={updateClip} />
+      <ClipStudio
+        clips={studio.clips}
+        index={studio.index}
+        projectAspect={project.settings.aspect_ratio}
+        onOpen={studio.open}
+        onClose={studio.close}
+        onChange={updateClip}
+        onDelete={deleteClipFromList}
+      />
 
+      {/* Re-style dialog */}
       <Dialog open={!!restyle} onOpenChange={(o) => !o && !starting && setRestyle(null)}>
         <DialogContent className="sm:max-w-4xl">
           <DialogHeader>
             <DialogTitle>Re-style this project</DialogTitle>
-            <DialogDescription>Pick a new look, then make the clips again. The clips you have now are replaced.</DialogDescription>
+            <DialogDescription>Pick a new look and decide whether to keep your existing clips or re-pick moments.</DialogDescription>
           </DialogHeader>
-          <DialogBody>{restyle && <StyleSelector value={restyle} onChange={setRestyle} />}</DialogBody>
+          <DialogBody>
+            {counts.all > 0 && (
+              <div className="mb-5 grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => setRestyleMode("restyle")}
+                  className={cn(
+                    "rounded-xl border p-3 text-left text-xs transition",
+                    restyleMode === "restyle" ? "border-primary bg-primary/10 ring-1 ring-primary" : "border-white/10 hover:bg-white/5",
+                  )}
+                >
+                  <div className="font-semibold text-foreground">Keep existing clips &amp; edits</div>
+                  <p className="mt-0.5 text-muted-foreground">Re-renders all {counts.all} clips with the new captions, layout, music &amp; polish while keeping titles, approvals, and posted badges.</p>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRestyleMode("rescore")}
+                  className={cn(
+                    "rounded-xl border p-3 text-left text-xs transition",
+                    restyleMode === "rescore" ? "border-primary bg-primary/10 ring-1 ring-primary" : "border-white/10 hover:bg-white/5",
+                  )}
+                >
+                  <div className="font-semibold text-foreground">Re-pick moments from scratch</div>
+                  <p className="mt-0.5 text-muted-foreground">Re-runs highlight selection ({restyle?.clip_count ?? 20} clips, {restyle?.min_duration}–{restyle?.max_duration}s). Replaces current clips.</p>
+                </button>
+              </div>
+            )}
+            {restyle && <StyleSelector value={restyle} onChange={setRestyle} />}
+          </DialogBody>
           <DialogFooter>
             <Button variant="ghost" className="pointer-coarse:h-11" disabled={starting} onClick={() => setRestyle(null)}>Cancel</Button>
-            <Button className="bg-brand text-white pointer-coarse:h-11" disabled={starting || !restyle} onClick={() => restyle && start(restyle)}>
+            <Button className="bg-brand text-white pointer-coarse:h-11" disabled={starting || !restyle} onClick={() => restyle && start(restyle, restyleMode)}>
               {starting ? <Loader2 className="animate-spin" /> : <Sparkles />}
-              {starting ? "Starting…" : `Re-generate ${restyle?.clip_count ?? ""} clips`}
+              {starting ? "Starting…" : restyleMode === "restyle" ? `Re-render ${counts.all} clips` : `Re-generate ${restyle?.clip_count ?? ""} clips`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Manual Clip Creator dialog */}
+      <Dialog open={manualOpen} onOpenChange={(o) => !o && !mBusy && setManualOpen(false)}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Create manual clip</DialogTitle>
+            <DialogDescription>Pick any timestamp range or click a sentence from the transcript below.</DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <form id="manual-clip-form" onSubmit={submitManualClip} className="flex flex-col gap-4">
+              <div className="grid grid-cols-2 gap-3">
+                <label className="text-xs text-muted-foreground">Start (seconds)
+                  <Input type="number" step="0.5" min={0} max={project.duration ?? undefined} value={mStart} onChange={(e) => setMStart(Number(e.target.value))} className="mt-1" required />
+                </label>
+                <label className="text-xs text-muted-foreground">End (seconds)
+                  <Input type="number" step="0.5" min={1} max={project.duration ?? undefined} value={mEnd} onChange={(e) => setMEnd(Number(e.target.value))} className="mt-1" required />
+                </label>
+              </div>
+              <label className="text-xs text-muted-foreground">Title / Hook (optional)
+                <Input value={mTitle} onChange={(e) => setMTitle(e.target.value)} placeholder="Leave empty to auto-fill from speech" className="mt-1" />
+              </label>
+              <div>
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium">Search transcript to set range</span>
+                  <div className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[.03] px-2.5">
+                    <Search className="size-3.5 text-muted-foreground" />
+                    <input
+                      value={trQuery}
+                      onChange={(e) => setTrQuery(e.target.value)}
+                      placeholder="Filter spoken words…"
+                      className="h-8 bg-transparent text-xs outline-none"
+                    />
+                  </div>
+                </div>
+                <div className="max-h-56 space-y-1 overflow-y-auto rounded-xl border border-white/10 bg-black/20 p-2">
+                  {!trData ? (
+                    <p className="p-3 text-xs text-muted-foreground">Loading transcript…</p>
+                  ) : filteredSentences.length === 0 ? (
+                    <p className="p-3 text-xs text-muted-foreground">No transcript sentences found.</p>
+                  ) : (
+                    filteredSentences.slice(0, 120).map((s, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => {
+                          setMStart(Math.max(0, Number((s.start - 0.2).toFixed(1))));
+                          setMEnd(Math.min(project.duration || s.end + 25, Number((s.start + 25).toFixed(1))));
+                          if (!mTitle) setMTitle(s.text.slice(0, 75));
+                        }}
+                        className="flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition hover:bg-white/10"
+                      >
+                        <span className="shrink-0 font-mono text-[11px] text-primary tabular-nums">{fmtDuration(s.start)}</span>
+                        <span className="text-foreground/90">{s.text}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+            </form>
+          </DialogBody>
+          <DialogFooter>
+            <Button variant="ghost" disabled={mBusy} onClick={() => setManualOpen(false)}>Cancel</Button>
+            <Button type="submit" form="manual-clip-form" className="bg-brand text-white" disabled={mBusy || mEnd <= mStart + 1}>
+              {mBusy ? <Loader2 className="animate-spin" /> : <Plus />} Render clip ({Math.max(0, mEnd - mStart).toFixed(1)}s)
             </Button>
           </DialogFooter>
         </DialogContent>

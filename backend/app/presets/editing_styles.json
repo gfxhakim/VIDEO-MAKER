@@ -35,9 +35,17 @@
     "caption_y": 0.5,
     "hook_card": false
   },
+  "broll_split": {
+    "name": "Speaker + B-Roll Split",
+    "description": "Speaker framed on top, looping background B-roll clip on the bottom for retention.",
+    "layout": "broll_split",
+    "zoom_on_emphasis": false,
+    "caption_y": 0.52,
+    "hook_card": false
+  },
   "blur_fill_reaction": {
     "name": "Blurred Fill + Hook Title",
-    "description": "Full 16:9 frame over a blurred backdrop with a white hook-title card on top (stream-clip / reaction look).",
+    "description": "Full 16:9 frame over a blurred backdrop with a hook-title card on top (stream-clip / reaction look).",
     "layout": "blur_fill",
     "foreground_y": 0.5,
     "caption_y": 0.74,
@@ -45,7 +53,7 @@
   },
   "center_crop": {
     "name": "Simple Center Crop",
-    "description": "Fastest render. Plain 9:16 center crop, no analysis.",
+    "description": "Fastest render. Plain center crop, no face tracking.",
     "layout": "center",
     "caption_y": 0.66,
     "hook_card": false

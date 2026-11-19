@@ -24,8 +24,9 @@ WORKDIR /app/backend
 COPY backend/requirements.txt ./
 RUN pip install -r requirements.txt
 COPY backend/ ./
-# caption fonts (open-source); the app falls back to DejaVu if this ever fails
+# caption fonts (open-source) and YuNet face detector (~228 KB); falls back cleanly if skipped
 RUN python scripts/download_fonts.py || echo "font download skipped"
+RUN python scripts/download_models.py || echo "model download skipped"
 COPY --from=web /web/out /app/frontend/out
 RUN mkdir -p /data
 EXPOSE 8000

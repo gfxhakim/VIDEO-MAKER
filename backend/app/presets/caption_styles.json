@@ -1,5 +1,5 @@
 {
-  "_doc": "Caption presets rendered as ASS subtitles by app/pipeline/captions.py. Colors are #RRGGBB. 'mode': word (one word at a time), chunk (a short phrase with the active word highlighted), stack (small lead-in line + big keyword). Fonts live in backend/fonts.",
+  "_doc": "Caption presets rendered as ASS subtitles by app/pipeline/captions.py. Colors are #RRGGBB. 'mode': word (one word at a time), chunk (a short phrase with the active word highlighted), stack (small lead-in line + big keyword), boxed (bold pill backdrop). Fonts live in backend/fonts.",
   "hormozi": {
     "name": "Hormozi Bold Yellow/White",
     "description": "Heavy uppercase, thick black stroke, active word in yellow, keyword pop.",
@@ -22,7 +22,7 @@
   },
   "single_word_pop": {
     "name": "Single Word Pop",
-    "description": "One condensed word at a time, center screen, random accent colors on numbers and keywords.",
+    "description": "One condensed word at a time, center screen, vibrant accent colors on numbers and keywords.",
     "mode": "word",
     "font": "Anton",
     "weight": 400,
@@ -37,7 +37,7 @@
     "shadow": 0,
     "glow": 0,
     "bounce": 1.12,
-    "emoji": false
+    "emoji": true
   },
   "netflix_kinetic": {
     "name": "Netflix Kinetic",
@@ -46,7 +46,7 @@
     "words_per_chunk": 2,
     "font": "Bebas Neue",
     "weight": 400,
-    "size": 128,
+    "size": 124,
     "uppercase": true,
     "primary": "#FFFFFF",
     "highlight": "#E50914",
@@ -55,8 +55,8 @@
     "outline": 3,
     "shadow": 6,
     "glow": 0,
-    "bounce": 1.3,
-    "emoji": false
+    "bounce": 1.25,
+    "emoji": true
   },
   "neon_glow": {
     "name": "Neon Glow",
@@ -64,7 +64,7 @@
     "mode": "word",
     "font": "DM Serif Display",
     "weight": 400,
-    "size": 124,
+    "size": 120,
     "uppercase": false,
     "primary": "#FFFFFF",
     "highlight": "#FFFFFF",
@@ -75,7 +75,7 @@
     "shadow": 0,
     "glow": 18,
     "bounce": 1.06,
-    "emoji": false
+    "emoji": true
   },
   "minimal_clean": {
     "name": "Minimalist Clean",
@@ -94,7 +94,7 @@
     "shadow": 3,
     "glow": 0,
     "bounce": 1.0,
-    "emoji": false
+    "emoji": true
   },
   "gaming_stack": {
     "name": "Gaming Stack",
@@ -104,8 +104,8 @@
     "font": "Montserrat",
     "weight": 900,
     "italic": true,
-    "size": 110,
-    "lead_size": 56,
+    "size": 106,
+    "lead_size": 54,
     "uppercase": true,
     "primary": "#FFFFFF",
     "highlight": "#FFE53B",
@@ -116,7 +116,7 @@
     "shadow": 2,
     "glow": 0,
     "bounce": 1.15,
-    "emoji": false
+    "emoji": true
   },
   "cinematic_cyan": {
     "name": "Cinematic Single Word",
@@ -135,6 +135,26 @@
     "shadow": 2,
     "glow": 0,
     "bounce": 1.0,
-    "emoji": false
+    "emoji": true
+  },
+  "bold_boxed": {
+    "name": "Boxed High-Contrast",
+    "description": "Crisp white phrase over a dark semi-opaque backdrop pill for busy backgrounds.",
+    "mode": "boxed",
+    "words_per_chunk": 3,
+    "font": "Poppins",
+    "weight": 800,
+    "size": 76,
+    "uppercase": false,
+    "primary": "#FFFFFF",
+    "highlight": "#FFE500",
+    "accent": "#38BDF8",
+    "outline_color": "#09090B",
+    "box_color": "#111116",
+    "outline": 16,
+    "shadow": 0,
+    "glow": 0,
+    "bounce": 1.06,
+    "emoji": true
   }
 }

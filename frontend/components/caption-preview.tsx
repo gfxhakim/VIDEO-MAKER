@@ -14,19 +14,19 @@ const FONT_VARS: Record<string, string> = {
 const SAMPLE = ["this", "changed", "my", "life", "$10,000", "in", "30", "days"];
 const KEYWORDS = new Set(["changed", "$10,000", "30"]);
 
-/** `n` preset pixels as an em length of the caption font, so strokes, shadows and gaps scale with the text. */
 const em = (n: number, size: number) => `${(n / size).toFixed(4)}em`;
 
-/**
- * CSS approximation of an ASS caption preset, animated word by word.
- *
- * It fills its parent, and the parent must be a size container with a real width and height
- * (`@container-[size]` plus an aspect ratio or a height). The text is sized in container units,
- * so it grows and shrinks with the box: `frame` is how many pixels of the 1080px wide video the
- * box width stands for (smaller = more zoomed in). After layout, anything that still does not
- * fit (an unknown preset, a late font) is scaled down, so the text can never leave the box.
- */
-export function CaptionPreview({ style, frame = 830, animate = true }: { style: CaptionStyle; frame?: number; animate?: boolean }) {
+export function CaptionPreview({
+  style,
+  frame = 830,
+  animate = true,
+  showEmoji = false,
+}: {
+  style: CaptionStyle;
+  frame?: number;
+  animate?: boolean;
+  showEmoji?: boolean;
+}) {
   const [i, setI] = useState(1);
   const box = useRef<HTMLSpanElement>(null);
   const text = useRef<HTMLSpanElement>(null);
@@ -37,11 +37,10 @@ export function CaptionPreview({ style, frame = 830, animate = true }: { style: 
     return () => clearInterval(t);
   }, [animate]);
 
-  // Safety net: shrink the text when it is wider or taller than the box.
   const fit = useCallback(() => {
     const b = box.current;
     const t = text.current;
-    const words = t?.firstElementChild as HTMLElement | null | undefined; // its layout size ignores the scale below
+    const words = t?.firstElementChild as HTMLElement | null | undefined;
     if (!b || !t || !words) return;
     const cs = getComputedStyle(b);
     const w = b.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
@@ -50,12 +49,12 @@ export function CaptionPreview({ style, frame = 830, animate = true }: { style: 
     const k = Math.min(1, w / words.offsetWidth, h / words.offsetHeight);
     t.style.transform = k < 0.995 ? `scale(${k.toFixed(3)})` : "";
   }, []);
-  useLayoutEffect(fit, [fit, i, style, frame]); // every new word
+  useLayoutEffect(fit, [fit, i, style, frame]);
   useEffect(() => {
     if (!box.current) return;
-    const ro = new ResizeObserver(fit); // the box changed size
+    const ro = new ResizeObserver(fit);
     ro.observe(box.current);
-    const fonts = document.fonts; // the caption font arrived
+    const fonts = document.fonts;
     fonts?.addEventListener?.("loadingdone", fit);
     return () => {
       ro.disconnect();
@@ -66,6 +65,7 @@ export function CaptionPreview({ style, frame = 830, animate = true }: { style: 
   const size = style.size > 0 ? style.size : 90;
   const fmt = (w: string) => (style.uppercase ? w.toUpperCase() : w);
   const cycle = style.accent_cycle?.length ? style.accent_cycle : [style.accent];
+  const isBoxed = style.mode === "boxed";
   const shadow = [
     style.shadow ? `${em(style.shadow, size)} ${em(style.shadow, size)} 0 rgba(0,0,0,.65)` : "",
     style.glow ? `0 0 ${em(style.glow * 1.2, size)} currentColor, 0 0 ${em(style.glow * 2.4, size)} currentColor` : "",
@@ -79,16 +79,16 @@ export function CaptionPreview({ style, frame = 830, animate = true }: { style: 
     fontSize: `${((size / frame) * 100).toFixed(2)}cqw`,
     lineHeight: 1.1,
     letterSpacing: style.spacing ? em(style.spacing, size) : undefined,
-    WebkitTextStroke: style.outline ? `${em(style.outline, size)} ${style.outline_color}` : undefined,
+    WebkitTextStroke: !isBoxed && style.outline ? `${em(style.outline, size)} ${style.outline_color}` : undefined,
     paintOrder: "stroke fill",
     textShadow: shadow || undefined,
   };
 
-  // the presets say how many words share the screen; older ones do not, so fall back to three
   const extra = style as CaptionStyle & { words_per_chunk?: number; lead_size?: number };
   const per = Math.min(4, Math.max(2, Math.round(extra.words_per_chunk ?? 3)));
   const start = Math.floor(i / per) * per;
   const chunk = SAMPLE.slice(start, start + per);
+  const hasKeywordInChunk = chunk.some((w) => KEYWORDS.has(w));
 
   let body: React.ReactNode;
   if (style.mode === "word") {
@@ -113,7 +113,13 @@ export function CaptionPreview({ style, frame = 830, animate = true }: { style: 
     );
   } else {
     body = (
-      <span className="flex flex-wrap justify-center" style={{ columnGap: "0.25em" }}>
+      <span
+        className="flex flex-wrap justify-center rounded-md"
+        style={{
+          columnGap: "0.25em",
+          ...(isBoxed ? { backgroundColor: style.box_color || "rgba(17,17,22,0.88)", padding: "0.14em 0.34em" } : {}),
+        }}
+      >
         {chunk.map((w, k) => {
           const active = start + k === i;
           const color = active ? style.highlight : KEYWORDS.has(w) ? style.accent : style.primary;
@@ -128,9 +134,10 @@ export function CaptionPreview({ style, frame = 830, animate = true }: { style: 
   }
 
   return (
-    <span ref={box} aria-hidden className="block size-full overflow-hidden px-[5cqw] py-[3cqw] select-none">
-      {/* Exactly as big as the room inside the box. The words sit in its middle; when they are too big they
-          stick out evenly on every side, so scaling this element down around its centre brings them back in. */}
+    <span ref={box} aria-hidden className="relative block size-full overflow-hidden px-[5cqw] py-[3cqw] select-none">
+      {showEmoji && (hasKeywordInChunk || KEYWORDS.has(SAMPLE[i])) && (
+        <span className="absolute top-[6%] left-1/2 -translate-x-1/2 text-[14cqw] leading-none drop-shadow">💸</span>
+      )}
       <span ref={text} data-caption-text className="flex size-full items-center justify-center text-center" style={base}>
         {body}
       </span>

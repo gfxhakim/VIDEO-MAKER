@@ -486,7 +486,7 @@ def _complete(session: Session, u: Upload, upload_id: str, gs: GenerationSetting
             raise HTTPException(409, "Uploaded file has the wrong size. Start again.")
         with open(src, "rb") as f:
             os.fsync(f.fileno())
-        p = Project(name=(body.name or FsPath(u.filename).stem or "Upload")[:120], source_type="upload", source=u.filename,
+        p = Project(user_id=u.user_id, name=(body.name or FsPath(u.filename).stem or "Upload")[:120], source_type="upload", source=u.filename,
                     settings=gs.model_dump())
         session.add(p)
         session.flush()

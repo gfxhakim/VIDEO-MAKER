@@ -7,7 +7,7 @@ import useSWR, { mutate as globalMutate, preload } from "swr";
 import { motion } from "motion/react";
 import { toast } from "sonner";
 import {
-  ArrowRight, Check, CheckCircle2, Clapperboard, ClipboardPaste, Film, FileVideo, FolderOpen, Link2, Loader2, Minus, Plus, RotateCw, Sparkles, Trash2,
+  ArrowRight, Check, CheckCircle2, Clapperboard, ClipboardPaste, Film, FileVideo, FolderOpen, Link2, Loader2, Minus, Plus, RotateCw, SearchCheck, Sparkles, Trash2,
   UploadCloud, Wand2, X,
 } from "lucide-react";
 import { PageHeader } from "@/components/app-shell";
@@ -17,9 +17,10 @@ import { StyleSelector } from "@/components/style-selector";
 import { FileName, QueuedNote, SlowUploadHint, UploadControls, UploadProgress, useUpload } from "@/components/upload-provider";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
-import { api, DEFAULT_SETTINGS, fetcher, isLive, quietFetcher, type Clip, type GenerationSettings, type Project } from "@/lib/api";
+import { api, DEFAULT_SETTINGS, fetcher, isLive, quietFetcher, type Clip, type GenerationSettings, type Project, type URLProbeResult } from "@/lib/api";
 import { VIDEO_EXTENSIONS, type ServerUpload } from "@/lib/uploader";
 import { cn, fmtBytes, fmtDate, fmtDuration, pctOf } from "@/lib/utils";
 
@@ -31,23 +32,20 @@ const SOURCES = [
 type Source = (typeof SOURCES)[number]["key"];
 
 const ACCEPT = `video/*,${VIDEO_EXTENSIONS.join(",")}`;
-const COUNT = { min: 10, max: 50, presets: [10, 20, 30, 50] };
+const COUNT = { min: 1, max: 50, presets: [5, 10, 20, 30, 50] };
 
-// Stable identities: an inline function would make SWR restart its polling timer on every render.
 const projectsEvery = (list?: Project[]) => (list?.some(isLive) ? 2000 : 20000);
 const SWR_PROJECTS = { refreshInterval: projectsEvery, errorRetryInterval: 2000 };
-const SWR_CLIPS = { revalidateOnFocus: false, dedupingInterval: 10000 }; // every clip with its transcript: do not refetch it on each tab switch
+const SWR_CLIPS = { revalidateOnFocus: false, dedupingInterval: 10000 };
 
-// Ask for the lists while the session check is still on its way: one round trip less before the page fills in.
 const early = new Map<string, { at: number; data: Promise<unknown> }>();
 if (typeof window !== "undefined" && window.location.pathname === "/") {
   for (const key of ["/api/projects", "/api/clips"]) {
     const data = quietFetcher(key);
-    data.catch(() => {}); // signed out or offline at that moment: the page asks again when it shows
+    data.catch(() => {});
     early.set(key, { at: Date.now(), data });
   }
 }
-/** The first read of a list uses the early request above, every later read is a normal one. */
 function firstFetcher<T>(key: string): Promise<T> {
   const hit = early.get(key);
   early.delete(key);
@@ -60,7 +58,6 @@ function greeting() {
   return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
 }
 
-/** "youtube.com/watch?v=1" -> "https://youtube.com/watch?v=1"; null when it is not a web link. */
 function toLink(raw: string): string | null {
   let s = raw.trim();
   if (!s || /\s/.test(s)) return null;
@@ -76,6 +73,17 @@ function toLink(raw: string): string | null {
   }
 }
 
+function parseClockToSec(raw: string): number | null {
+  const s = raw.trim();
+  if (!s) return null;
+  if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+  const parts = s.split(":").map(Number);
+  if (parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
 const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes("Files");
 
 const FIELD =
@@ -85,24 +93,22 @@ const FIELD_BTN =
   "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none pointer-coarse:h-10";
 const SMALL_BTN =
   "inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-white/15 px-3 text-xs font-medium transition-colors hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none active:bg-white/15 pointer-coarse:h-10";
-const PANEL_MIN = "@[38rem]:min-h-36 tall:@[38rem]:min-h-44"; // the composer keeps one height while you switch tabs
+const PANEL_MIN = "@[38rem]:min-h-36 tall:@[38rem]:min-h-44";
 
-/** "New project" in the sidebar and the phone "+" link to /?new=1, also while this page is already open. */
 function NewProjectWatcher({ onNew }: { onNew: () => void }) {
   const wantsNew = useSearchParams().get("new");
   const router = useRouter();
   useEffect(() => {
     if (!wantsNew) return;
     onNew();
-    router.replace("/", { scroll: false }); // so the next click fires again
+    router.replace("/", { scroll: false });
   }, [wantsNew, onNew, router]);
   return null;
 }
 
-// ------------------------------------------------------------------ composer: upload tab
 function UploadPanel({ drag, openPicker, onUseLink }: { drag: boolean; openPicker: (resume?: ServerUpload) => void; onUseLink: () => void }) {
   const { upload: u, unfinished, discard, retry } = useUpload();
-  const leftover = unfinished.find((x) => x.received_bytes > 0 && x.status === "uploading"); // from an earlier visit
+  const leftover = unfinished.find((x) => x.received_bytes > 0 && x.status === "uploading");
 
   if (u) {
     const needsFile = u.errorCode === "file-gone" || u.errorCode === "different-file";
@@ -195,12 +201,11 @@ function UploadPanel({ drag, openPicker, onUseLink }: { drag: boolean; openPicke
   );
 }
 
-// ------------------------------------------------------------------ composer: link and path tabs
 function TextSource({
-  id, label, icon: Icon, value, onChange, onEnter, placeholder, help, warn, mono, type,
+  id, label, icon: Icon, value, onChange, onEnter, placeholder, help, warn, mono, type, extraBtn,
 }: {
   id: string; label: string; icon: React.ElementType; value: string; onChange: (v: string) => void; onEnter: () => void;
-  placeholder: string; help: React.ReactNode; warn?: string | null; mono?: boolean; type: "url" | "text";
+  placeholder: string; help: React.ReactNode; warn?: string | null; mono?: boolean; type: "url" | "text"; extraBtn?: React.ReactNode;
 }) {
   const input = useRef<HTMLInputElement>(null);
   const [canPaste, setCanPaste] = useState(false);
@@ -212,7 +217,7 @@ function TextSource({
       if (text) onChange(text);
       else toast("Nothing to paste yet", { description: "Copy the link first." });
     } catch {
-      input.current?.focus(); // the browser said no: the field is ready for a normal paste
+      input.current?.focus();
     }
   }
 
@@ -240,6 +245,7 @@ function TextSource({
           aria-invalid={!!warn}
           className={cn(FIELD_INPUT, mono && "font-mono")}
         />
+        {extraBtn}
         {value ? (
           <button type="button" onClick={() => { onChange(""); input.current?.focus(); }} className={cn(FIELD_BTN, "w-9 justify-center px-0 pointer-coarse:w-10")} aria-label={`Clear the ${label.toLowerCase()}`}>
             <X className="size-4" />
@@ -253,7 +259,6 @@ function TextSource({
   );
 }
 
-// ------------------------------------------------------------------ stats
 function Stats({ projects, clips }: { projects?: Project[]; clips?: Clip[] }) {
   const items = [
     { label: "Projects", value: projects?.length, icon: Clapperboard },
@@ -278,7 +283,6 @@ function Stats({ projects, clips }: { projects?: Project[]; clips?: Clip[] }) {
   );
 }
 
-// ------------------------------------------------------------------ projects
 const GRID = "grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] sm:gap-4";
 const CARD = "glass relative flex min-w-0 overflow-hidden rounded-2xl border sm:flex-col";
 
@@ -323,7 +327,6 @@ const ProjectCard = memo(function ProjectCard({ p, onDelete }: { p: Project; onD
             <div className="mt-0.5 truncate text-xs text-white/70">{state}</div>
           </div>
         </div>
-        {/* phones: a compact row, text next to the thumbnail */}
         <div className="flex min-w-0 flex-1 flex-col justify-center gap-1 py-2 pr-1 pl-3 sm:hidden">
           <div className="truncate text-sm font-medium">{p.name}</div>
           <div className={cn("truncate text-xs text-muted-foreground", p.status === "failed" && "text-destructive", p.status === "done" && "text-success")}>{state}</div>
@@ -348,18 +351,20 @@ const ProjectCard = memo(function ProjectCard({ p, onDelete }: { p: Project; onD
   );
 });
 
-// ------------------------------------------------------------------ page
 export default function Studio() {
   const router = useRouter();
   const { user } = useAuth();
   const { data: projects, error: projectsError, mutate } = useSWR<Project[]>("/api/projects", firstFetcher, SWR_PROJECTS);
   const { data: clips, mutate: mutateClips } = useSWR<Clip[]>("/api/clips", firstFetcher, SWR_CLIPS);
-  const up = useUpload(); // lives above the pages: the upload keeps going while you pick a style or browse
+  const up = useUpload();
   const { upload: u, start: startUpload, generate: queueGenerate, undoGenerate, cancel: cancelUpload, queuedSettings } = up;
   const [source, setSource] = useState<Source>("upload");
   const [url, setUrl] = useState("");
   const [path, setPath] = useState("");
-  // a queued Generate keeps its settings in the upload: coming back to this page shows that choice again
+  const [probe, setProbe] = useState<URLProbeResult | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [trimStart, setTrimStart] = useState("");
+  const [trimEnd, setTrimEnd] = useState("");
   const [settings, setSettings] = useState<GenerationSettings>(() => queuedSettings() ?? DEFAULT_SETTINGS);
   const firstSettings = useRef(settings);
   const [styleOpen, setStyleOpen] = useState(false);
@@ -371,9 +376,8 @@ export default function Studio() {
   const resumeFor = useRef<ServerUpload | null>(null);
   const composer = useRef<HTMLElement>(null);
 
-  useEffect(() => setHello(greeting()), []); // the visitor's clock, not the build machine's
+  useEffect(() => setHello(greeting()), []);
 
-  // the stats count clips: refresh them when a project stops being worked on
   const liveCount = projects?.filter(isLive).length ?? 0;
   const lastLive = useRef(0);
   useEffect(() => {
@@ -382,9 +386,9 @@ export default function Studio() {
   }, [liveCount, mutateClips]);
 
   const warmStyles = useCallback(() => {
-    // the style dialog opens with its data already there
     preload("/api/presets", fetcher);
     preload("/api/music", fetcher);
+    preload("/api/broll", fetcher);
   }, []);
 
   const focusComposer = useCallback(() => {
@@ -393,7 +397,6 @@ export default function Studio() {
     const calm = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     el.scrollIntoView({ behavior: calm ? "auto" : "smooth", block: "center" });
     el.querySelector<HTMLElement>("[data-autofocus]")?.focus({ preventScroll: true });
-    // a visible answer even when the composer was already on screen
     el.animate?.([{ boxShadow: "0 0 0 0 rgb(217 70 239 / .65)" }, { boxShadow: "0 0 0 14px rgb(217 70 239 / 0)" }], { duration: calm ? 1 : 900, easing: "ease-out" });
   }, []);
 
@@ -416,14 +419,29 @@ export default function Studio() {
     requestAnimationFrame(() => document.getElementById("src-url")?.focus());
   }, []);
 
-  // what you see selected is what a queued upload will use. Only a change made on this page is sent:
-  // what the page opened with is already what the upload holds.
   const queued = !!u?.autoStart;
   useEffect(() => {
     if (queued && settings !== firstSettings.current) queueGenerate(settings);
   }, [queued, settings, queueGenerate]);
 
   const link = toLink(url);
+  useEffect(() => {
+    setProbe(null);
+  }, [url]);
+
+  async function checkLink() {
+    if (!link) return;
+    setProbing(true);
+    try {
+      const info = await api.probeUrl(link);
+      setProbe(info);
+    } catch (e) {
+      toast.error("Could not inspect link", { description: (e as Error).message });
+    } finally {
+      setProbing(false);
+    }
+  }
+
   const uploadReady = !!u && !["error", "canceled", "finishing", "done"].includes(u.phase);
   const ready = source === "upload" ? uploadReady : source === "url" ? !!link : !!path.trim();
   const uploading = !!u && ["preparing", "uploading", "waiting", "paused"].includes(u.phase);
@@ -437,19 +455,25 @@ export default function Studio() {
     if (source === "upload") {
       if (!u || !uploadReady) return;
       const now = u.phase === "uploaded";
-      queueGenerate(settings); // starts now if every byte is in, otherwise the moment the upload finishes
+      queueGenerate(settings);
       setStyleOpen(false);
       if (!now && !u.autoStart)
         toast.success(`${settings.clip_count} clips start when the upload finishes`, {
           description: "Keep this tab open. You can use the rest of the app meanwhile.",
           action: { label: "Undo", onClick: undoGenerate },
         });
-      return; // the upload provider opens the project when it exists
+      return;
     }
+    const sStart = parseClockToSec(trimStart);
+    const sEnd = parseClockToSec(trimEnd);
     setBusy(true);
     try {
-      const p = await api.createFromLink(source === "url" ? { url: link ?? url.trim(), settings } : { path: path.trim(), settings });
-      void globalMutate(`/api/projects/${p.id}`, p, { revalidate: false }); // the project page opens without a loading state
+      const payload =
+        source === "url"
+          ? { url: link ?? url.trim(), name: probe?.title, source_start: sStart, source_end: sEnd, settings }
+          : { path: path.trim(), source_start: sStart, source_end: sEnd, settings };
+      const p = await api.createFromLink(payload);
+      void globalMutate(`/api/projects/${p.id}`, p, { revalidate: false });
       void mutate();
       toast.success("Your clips are cooking", { description: `${settings.clip_count} clips on the way.` });
       if (uploading)
@@ -495,10 +519,9 @@ export default function Studio() {
       <PageHeader
         eyebrow={hello}
         title={<>Hey {user?.name ?? "there"}, let&apos;s make something <span className="text-gradient">go viral</span>.</>}
-        description={<span className="max-sm:hidden">Drop in a long video and get 10 to 50 vertical clips with captions, smart framing and music.</span>}
+        description={<span className="max-sm:hidden">Drop in a long video and get 1 to 50 vertical clips with captions, smart framing, iOS emojis and music.</span>}
       />
 
-      {/* composer */}
       <section
         ref={composer}
         aria-label="New project"
@@ -530,7 +553,6 @@ export default function Studio() {
         }}
         className="glass @container relative mb-4 rounded-3xl border p-4 sm:mb-6 sm:p-6"
       >
-        {/* the glow is clipped by its own box: the card itself never becomes a (focus-)scrollable area */}
         <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]" aria-hidden>
           <div className="absolute -top-24 -right-24 size-72 rounded-full bg-fuchsia-500/20 blur-3xl" />
         </div>
@@ -569,12 +591,33 @@ export default function Studio() {
               )}
               {source === "upload" && <UploadPanel drag={drag} openPicker={openPicker} onUseLink={useLinkInstead} />}
               {source === "url" && (
-                <TextSource
-                  id="src-url" label="Video link" icon={Link2} type="url" value={url} onChange={setUrl} onEnter={() => link && openStyle()}
-                  placeholder="Paste a video link"
-                  warn={url.trim() && !link ? "That does not look like a link. It should start with https://" : null}
-                  help={<>YouTube, Twitch, Vimeo, X or Google Drive. The server downloads it directly (up to 1080p), so nothing is sent from your connection. Only use videos you own or may use.</>}
-                />
+                <div className="flex flex-col gap-2.5">
+                  <TextSource
+                    id="src-url" label="Video link" icon={Link2} type="url" value={url} onChange={setUrl} onEnter={() => link && openStyle()}
+                    placeholder="Paste a video link"
+                    warn={url.trim() && !link ? "That does not look like a link. It should start with https://" : null}
+                    help={<>YouTube, Twitch, Vimeo, X or Google Drive. The server downloads it directly (up to 1080p).</>}
+                    extraBtn={link ? (
+                      <button type="button" onClick={checkLink} disabled={probing} className={FIELD_BTN}>
+                        {probing ? <Loader2 className="size-3.5 animate-spin" /> : <SearchCheck className="size-3.5" />} Check link
+                      </button>
+                    ) : null}
+                  />
+                  {probe && (
+                    <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/[.03] p-2.5 text-xs">
+                      {probe.thumbnail && (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={probe.thumbnail} alt="" className="h-12 w-20 shrink-0 rounded-lg object-cover" />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-medium text-foreground">{probe.title}</div>
+                        <div className="mt-0.5 text-muted-foreground">
+                          {[probe.uploader, probe.duration ? fmtDuration(probe.duration) : null].filter(Boolean).join(" · ")}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
               {source === "path" && (
                 <TextSource
@@ -582,6 +625,24 @@ export default function Studio() {
                   placeholder="/data/videos/stream.mp4"
                   help="For a file that is already on the server. Nothing is uploaded."
                 />
+              )}
+              {source !== "upload" && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span>Optional segment range:</span>
+                  <Input
+                    value={trimStart}
+                    onChange={(e) => setTrimStart(e.target.value)}
+                    placeholder="Start (e.g. 12:30)"
+                    className="h-8 w-32 text-xs"
+                  />
+                  <span>to</span>
+                  <Input
+                    value={trimEnd}
+                    onChange={(e) => setTrimEnd(e.target.value)}
+                    placeholder="End (e.g. 45:00)"
+                    className="h-8 w-32 text-xs"
+                  />
+                </div>
               )}
             </div>
             <input
@@ -591,7 +652,7 @@ export default function Studio() {
                 const resume = resumeFor.current;
                 resumeFor.current = null;
                 if (f) pick(f, resume);
-                e.target.value = ""; // the same file can be chosen again
+                e.target.value = "";
               }}
             />
           </div>
@@ -609,7 +670,7 @@ export default function Studio() {
                 </div>
               </div>
               <Slider min={COUNT.min} max={COUNT.max} step={1} value={[count]} onValueChange={([v]) => setCount(v)} className="py-3 pointer-coarse:py-[1.125rem]" />
-              <div className="grid grid-cols-4 gap-1.5">
+              <div className="grid grid-cols-5 gap-1.5">
                 {COUNT.presets.map((n) => (
                   <button
                     key={n} type="button" onClick={() => setCount(n)} aria-pressed={count === n} aria-label={`${n} clips`}
@@ -647,7 +708,7 @@ export default function Studio() {
         <DialogContent className="sm:max-w-4xl 2xl:max-w-5xl">
           <DialogHeader className="sm:flex-row sm:items-baseline sm:gap-3">
             <DialogTitle className="flex shrink-0 items-center gap-2"><Sparkles className="size-5 text-primary" aria-hidden /> Pick your style</DialogTitle>
-            <DialogDescription className="min-w-0 max-sm:sr-only sm:truncate">Used for every clip in this run. You can change it later.</DialogDescription>
+            <DialogDescription className="min-w-0 max-sm:sr-only sm:truncate">Used for every clip in this run. You can override individual clips later.</DialogDescription>
           </DialogHeader>
           <DialogBody><StyleSelector value={settings} onChange={setSettings} /></DialogBody>
           <DialogFooter className="flex-col gap-2.5 sm:gap-5">
@@ -663,7 +724,7 @@ export default function Studio() {
                 <Button size="lg" onClick={() => setStyleOpen(false)} className="bg-brand flex-1 text-white hover:brightness-110 sm:flex-none"><Check /> Done</Button>
               ) : (
                 <Button size="lg" onClick={generate} disabled={busy || !ready} className="bg-brand flex-1 text-white hover:brightness-110 sm:flex-none">
-                  {busy ? <Loader2 className="animate-spin" /> : <Sparkles />} Generate {count} clips
+                  {busy ? <Loader2 className="animate-spin" /> : <Sparkles />} Generate {count} {count === 1 ? "clip" : "clips"}
                 </Button>
               )}
             </div>
@@ -671,7 +732,6 @@ export default function Studio() {
         </DialogContent>
       </Dialog>
 
-      {/* projects */}
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 className="text-lg font-semibold">Your projects</h2>
         {!!clips?.length && (

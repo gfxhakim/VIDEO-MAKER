@@ -1,15 +1,8 @@
 """Job handlers that glue the pipeline together.
 
-analyze_project  ingest -> probe -> audio -> transcribe -> score -> create clips -> enqueue renders
-render_clip      faces -> layout -> captions/emoji/hook card -> music -> ffmpeg -> thumbnail
+analyze_project  ingest -> probe -> audio -> transcribe -> score -> (optional AI) -> create clips -> enqueue renders
+render_clip      faces -> layout (scene-cut aware) -> silence cuts -> captions/emoji/hook card -> music/audio polish -> ffmpeg -> thumbnail
 analyze_music    bpm / beats / drop for an uploaded song
-
-Each clip renders as its own job, so one bad clip never sinks the whole project and
-renders can run in parallel (WORKER_CONCURRENCY).
-
-Everything that only depends on the source video (transcript, loudness curve, scene cuts,
-face tracks) is cached in the project folder, so changing the style or re-rendering a clip
-does not pay for it again.
 """
 from __future__ import annotations
 
@@ -27,12 +20,12 @@ from typing import Any, Callable, Optional
 import numpy as np
 from sqlmodel import select
 
-from ..config import effective_cpus, ffmpeg_thread_count, get_settings
+from ..config import effective_cpus, ffmpeg_thread_count, get_settings, load_runtime_config
 from ..db import session_scope
-from ..models import Clip, MusicTrack, Project, utcnow
+from ..models import BrollClip, Clip, MusicTrack, Project, utcnow
 from ..presets import ASPECT_RATIOS, get_caption_style, get_editing_style
 from ..queue import cancel_queued, enqueue
-from . import audio_analysis, captions, highlights, hook_card, ingest, media, reframe, render, transcribe
+from . import audio_analysis, captions, highlights, hook_card, ingest, llm, media, reframe, render, transcribe
 
 log = logging.getLogger(__name__)
 ENERGY_STEP = 0.25
@@ -45,24 +38,14 @@ def project_dir(project_id: int) -> Path:
 
 
 class ProjectGone(BaseException):
-    """The project or clip this job was made for was deleted or replaced while it ran.
-
-    SQLite hands a deleted row's id to the next new row, so without this check a job for a
-    deleted project would write its transcript and clips into the next project, and an old
-    render would overwrite a new clip. A BaseException, so that no `except Exception` on
-    the way (progress callbacks, ffmpeg helpers) swallows it; the job handlers catch it and
-    end quietly.
-    """
+    """The project or clip this job was made for was deleted or replaced while it ran."""
 
 
 def stamp(dt) -> str:
-    """Identity of a row beyond its (reusable) id: its creation time, as stored."""
     return dt.isoformat() if dt else ""
 
 
 def _update_project(project_id: int, *, created: Optional[str] = None, **fields) -> None:
-    """Update the project row. With `created`, raise ProjectGone instead when the row is
-    gone or now belongs to another project."""
     with session_scope() as s:
         p = s.get(Project, project_id)
         if not p or (created is not None and stamp(p.created_at) != created):
@@ -81,17 +64,21 @@ def _stage(project_id: int, stage: str, progress: float, created: Optional[str] 
 
 
 def _still_current(project_id: int, created: str) -> None:
-    """Raise ProjectGone if the project was deleted (or its id reused) since the job began."""
     with session_scope() as s:
         p = s.get(Project, project_id)
         if not p or stamp(p.created_at) != created:
             raise ProjectGone(project_id)
 
 
-class _Background:
-    """Run one function in a daemon thread (a pool thread would hold up the process exit
-    until a long ffmpeg scan ends)."""
+def _is_gone(project_id: int, created: str) -> bool:
+    try:
+        _still_current(project_id, created)
+        return False
+    except ProjectGone:
+        return True
 
+
+class _Background:
     def __init__(self, fn: Callable[..., Any], *args, **kwargs):
         self._result: Any = None
         self._error: Optional[BaseException] = None
@@ -101,7 +88,7 @@ class _Background:
     def _run(self, fn, args, kwargs) -> None:
         try:
             self._result = fn(*args, **kwargs)
-        except BaseException as e:  # noqa: BLE001  handed to the caller in result()
+        except BaseException as e:  # noqa: BLE001
             self._error = e
 
     def result(self) -> Any:
@@ -115,7 +102,6 @@ class _Background:
 
 
 def _fresh(cache: Path, source: Path) -> bool:
-    """True when a cached analysis file exists, is not empty and is not older than the source video."""
     try:
         st = cache.stat()
         return st.st_size > 0 and st.st_mtime >= source.stat().st_mtime
@@ -124,7 +110,6 @@ def _fresh(cache: Path, source: Path) -> bool:
 
 
 def _write_json(path: Path, obj) -> None:
-    """Write through a temp file, so a crash can never leave half a cache file that looks valid."""
     tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
     try:
         tmp.write_text(json.dumps(obj))
@@ -140,6 +125,23 @@ def _load_json(path: Path):
         return None
 
 
+def words_for_clip(clip: Clip, pdir: Path) -> list[dict]:
+    """Effective clip-relative words for a clip (respects edited words_override if set)."""
+    if clip.words_override:
+        return [
+            {
+                "word": str(w.get("word", "")).strip(),
+                "start": float(w.get("start", 0.0)),
+                "end": float(w.get("end", 0.0)),
+            }
+            for w in clip.words_override
+            if str(w.get("word", "")).strip()
+        ]
+    tpath = pdir / "transcript.json"
+    all_words = _load_json(tpath).get("words", []) if tpath.exists() and isinstance(_load_json(tpath), dict) else []
+    return captions.clip_words(all_words, clip.start, clip.end)
+
+
 # =====================================================================  analyze
 def analyze_project(payload: dict) -> None:
     try:
@@ -150,31 +152,61 @@ def analyze_project(payload: dict) -> None:
 
 def _analyze(payload: dict) -> None:
     pid = int(payload["project_id"])
+    mode = payload.get("mode", "rescore")
     with session_scope() as s:
         p = s.get(Project, pid)
         if not p:
             return
         created = stamp(p.created_at)
         if payload.get("created", created) != created:
-            return  # queued for a deleted project whose id now belongs to a new one
-        source_type, source, source_path, settings = p.source_type, p.source, p.source_path, dict(p.settings)
+            return
+        source_type, source, source_path = p.source_type, p.source, p.source_path
+        source_start, source_end = p.source_start, p.source_end
+        settings = dict(p.settings)
+        existing_clips = s.exec(select(Clip).where(Clip.project_id == pid)).all()
     pdir = project_dir(pid)
 
     def stage(text: str, progress: float) -> None:
         _stage(pid, text, progress, created)
+
+    # Non-destructive restyle mode: keep existing clips, edits, approvals & posted history, just re-render
+    if mode == "restyle" and existing_clips and source_path and Path(source_path).exists():
+        music_ids = list(settings.get("music_track_ids") or [])
+        clip_ids: list[tuple[int, str]] = []
+        with session_scope() as s:
+            p = s.get(Project, pid)
+            if not p or stamp(p.created_at) != created:
+                raise ProjectGone(pid)
+            rows = s.exec(select(Clip).where(Clip.project_id == pid).order_by(Clip.rank)).all()
+            for rank, c in enumerate(rows, start=1):
+                c.status = "pending"
+                c.error = None
+                if music_ids and c.music_track_id is None:
+                    c.music_track_id = music_ids[(rank - 1) % len(music_ids)]
+                s.add(c)
+                clip_ids.append((c.id, stamp(c.created_at)))
+            s.commit()
+        old_map = {cid: cstamp for cid, cstamp in clip_ids}
+        cancel_queued("render_clip", lambda pl: same_clip(pl, old_map))
+        _update_project(pid, created=created, stage=f"Re-rendering {len(clip_ids)} clips", progress=0.7, status="processing")
+        for i, (cid, cstamp) in enumerate(clip_ids):
+            enqueue("render_clip", {"clip_id": cid, "created": cstamp}, priority=-i)
+        return
 
     # 1. ingest ----------------------------------------------------------------
     stage("Fetching video", 0.02)
     if source_type == "url":
         have = Path(source_path) if source_path else None
         if have and have.is_file() and have.stat().st_size > 0:
-            path = have  # already downloaded (new style or a retry): do not fetch it again
+            path = have
         else:
             def dl_progress(f: float):
-                # the app shows the overall percentage next to this text, so say what the number is
                 stage(f"Downloading video ({int(f * 100)}% of the file)", 0.02 + 0.13 * f)
 
-            path, title = ingest.download_url(source, pdir, dl_progress)
+            try:
+                path, title = ingest.download_url(source, pdir, dl_progress, should_stop=lambda: _is_gone(pid, created))
+            except ingest.DownloadCancelled:
+                raise ProjectGone(pid) from None
             with session_scope() as s:
                 p = s.get(Project, pid)
                 if not p or stamp(p.created_at) != created:
@@ -190,7 +222,7 @@ def _analyze(payload: dict) -> None:
     else:
         path = Path(source_path or "")
         if not path.exists():
-            raise media.MediaError("Uploaded file is missing")
+            raise media.MediaError("Uploaded file is missing (or raw source was deleted)")
 
     info = media.probe(path)
     _update_project(pid, created=created, duration=info.duration, width=info.width, height=info.height)
@@ -198,8 +230,6 @@ def _analyze(payload: dict) -> None:
         raise media.MediaError("Video is too short (need at least 8 seconds)")
 
     # 2. scene cuts start now, in the background ---------------------------------
-    # They only need the source file, so they run next to audio and transcription
-    # instead of holding the bar at 62% for minutes afterwards.
     scenes_path = pdir / "scenes.json"
     cuts = _load_json(scenes_path) if _fresh(scenes_path, path) else None
     stop_scan = threading.Event()
@@ -210,46 +240,64 @@ def _analyze(payload: dict) -> None:
         scan = _Background(media.scan_scene_changes, path, threads=min(spare, ffmpeg_thread_count()), stop=stop_scan)
 
     try:
-        # 3. audio + transcript -------------------------------------------------
         words: list[dict] = []
         energy = np.zeros(0, dtype=np.float32)
         if info.has_audio:
             energy, words = _analyze_audio(pid, created, stage, pdir, path, info, settings)
-            # an audio track can run a little longer than the picture: never clip past the end
             words = [w for w in words if w["start"] < info.duration]
 
-        # 4. visual activity ----------------------------------------------------
         if scan is not None:
             stage("Detecting scene changes", 0.62)
             try:
                 cuts = scan.result()
-            except media.MediaError as e:  # only costs the "action" part of the score
+            except media.MediaError as e:
                 log.warning("%s", e)
                 cuts = []
             else:
                 _still_current(pid, created)
                 _write_json(scenes_path, cuts)
     finally:
-        stop_scan.set()  # if anything above failed, end the background ffmpeg too
+        stop_scan.set()
         if scan is not None:
-            scan.wait(30)  # the watcher kills ffmpeg within half a second
+            scan.wait(30)
 
-    # 5. scoring --------------------------------------------------------------
+    # 5. scoring (respecting optional source_start / source_end range) ----------
     stage("Scoring viral moments", 0.68)
-    chosen = highlights.select_highlights(
-        duration=info.duration, words=words, energy_db=energy, energy_step=ENERGY_STEP, scene_cuts=cuts or [],
-        count=int(settings.get("clip_count", 20)), min_len=float(settings.get("min_duration", 15)),
-        max_len=float(settings.get("max_duration", 60)),
-    )
+    win_start = max(0.0, float(source_start or 0.0))
+    win_end = min(info.duration, float(source_end)) if source_end and source_end > win_start + 5 else info.duration
+    if win_start > 0 or win_end < info.duration:
+        sub_dur = win_end - win_start
+        sub_words = captions.clip_words(words, win_start, win_end)
+        i0 = int(win_start / ENERGY_STEP)
+        i1 = int(win_end / ENERGY_STEP) + 1
+        sub_energy = energy[i0:i1] if len(energy) else energy
+        sub_cuts = [c - win_start for c in (cuts or []) if win_start <= c <= win_end]
+        chosen = highlights.select_highlights(
+            duration=sub_dur, words=sub_words, energy_db=sub_energy, energy_step=ENERGY_STEP, scene_cuts=sub_cuts,
+            count=int(settings.get("clip_count", 20)), min_len=float(settings.get("min_duration", 15)),
+            max_len=float(settings.get("max_duration", 60)),
+        )
+        for c in chosen:
+            c.start += win_start
+            c.end += win_start
+    else:
+        chosen = highlights.select_highlights(
+            duration=info.duration, words=words, energy_db=energy, energy_step=ENERGY_STEP, scene_cuts=cuts or [],
+            count=int(settings.get("clip_count", 20)), min_len=float(settings.get("min_duration", 15)),
+            max_len=float(settings.get("max_duration", 60)),
+        )
     if not chosen:
         raise media.MediaError("Could not find any usable moments in this video")
+
+    if settings.get("use_ai") and llm.is_configured():
+        stage("Refining hooks & scores with AI", 0.69)
+        llm.enhance_candidates(chosen)
 
     music_ids = list(settings.get("music_track_ids") or [])
     with session_scope() as s:
         p = s.get(Project, pid)
         if not p or stamp(p.created_at) != created:
             raise ProjectGone(pid)
-        # re-runs replace earlier clips
         old_ids: dict[int, str] = {}
         for old in s.exec(select(Clip).where(Clip.project_id == pid)).all():
             old_ids[old.id] = stamp(old.created_at)
@@ -269,15 +317,11 @@ def _analyze(payload: dict) -> None:
             s.commit()
             s.refresh(clip)
             clip_ids.append((clip.id, stamp(clip.created_at)))
-    # Render retries still waiting for the replaced clips would otherwise run against the
-    # new clips (same ids) and race their real renders. Matched on id and creation time, so
-    # fresh jobs of another project's clips that took over one of these ids stay.
     cancel_queued("render_clip", lambda pl: same_clip(pl, old_ids))
-    # the files of replaced clips (15-25 MB each) and face tracks nobody uses any more
     for oid in old_ids:
         shutil.rmtree(pdir / "clips" / str(oid), ignore_errors=True)
     hour_ago = time.time() - 3600
-    for d in (pdir / "clips").glob("*.*-*"):  # half-built or retired folders left by a crash
+    for d in (pdir / "clips").glob("*.*-*"):
         try:
             if d.is_dir() and d.stat().st_mtime < hour_ago:
                 shutil.rmtree(d, ignore_errors=True)
@@ -295,18 +339,14 @@ def _analyze(payload: dict) -> None:
 
 def _analyze_audio(pid: int, created: str, stage: Callable[[str, float], None], pdir: Path, path: Path, info,
                    settings: dict) -> tuple[np.ndarray, list[dict]]:
-    """Loudness curve and word-level transcript for the source, reusing earlier results."""
     epath, tpath = pdir / "energy.npy", pdir / "transcript.json"
     backend = get_settings().transcribe_backend.lower()
     language = settings.get("language") or None
 
     tr = _load_json(tpath) if _fresh(tpath, path) else None
     if isinstance(tr, dict):
-        # made with another engine or for another language: do it again
         if tr.get("backend", backend) != backend or tr.get("requested_language", language) != language:
             tr = None
-        # an empty transcript from before this check existed (TRANSCRIBE_BACKEND=none, or the
-        # PyAV crash) is not a result worth keeping once speech recognition is on
         elif "backend" not in tr and not tr.get("words") and backend != "none":
             tr = None
     else:
@@ -327,7 +367,7 @@ def _analyze_audio(pid: int, created: str, stage: Callable[[str, float], None], 
             if energy is None:
                 try:
                     energy = audio_analysis.energy_curve_wav(wav, ENERGY_STEP)
-                except (ValueError, EOFError, OSError):  # not the WAV we expected: let ffmpeg decode it
+                except (ValueError, EOFError, OSError):
                     energy = audio_analysis.energy_curve(media.load_pcm(wav, sr=16000), 16000, ENERGY_STEP)
                 _still_current(pid, created)
                 tmp = epath.with_name(f"energy.npy.{os.getpid()}-{threading.get_ident()}.tmp")
@@ -339,7 +379,6 @@ def _analyze_audio(pid: int, created: str, stage: Callable[[str, float], None], 
                     tmp.unlink(missing_ok=True)
             if tr is None:
                 stage("Transcribing speech (Whisper)", 0.2)
-
                 minutes = int(-(-info.duration // 60))
 
                 def tr_progress(f: float):
@@ -351,17 +390,25 @@ def _analyze_audio(pid: int, created: str, stage: Callable[[str, float], None], 
                 _still_current(pid, created)
                 _write_json(tpath, tr)
         finally:
-            wav.unlink(missing_ok=True)  # ~115 MB per hour of video, and nothing reads it again
+            wav.unlink(missing_ok=True)
     return energy, tr.get("words", [])
 
 
 # =====================================================================  render
-def _emphasis_windows(words: list[dict], energy: np.ndarray, clip_start: float, gap: float = 3.0) -> list[tuple[float, float]]:
-    """Moments for punch-in zooms: keywords or loudness spikes, at most one every `gap` s."""
+def _emphasis_windows(words: list[dict], energy: np.ndarray, clip_start: float, gap: float = 3.0,
+                      beats: list[float] | None = None, music_offset: float = 0.0) -> list[tuple[float, float]]:
     out: list[tuple[float, float]] = []
     if len(energy):
         ref = energy[energy > -55]
         mu, sd = (float(ref.mean()), float(ref.std() + 1e-6)) if len(ref) else (0.0, 1.0)
+    clip_beats = [b - music_offset for b in (beats or []) if 0.2 <= (b - music_offset) <= 180.0]
+
+    def snap(t: float) -> float:
+        if not clip_beats:
+            return t
+        nearest = min(clip_beats, key=lambda b: abs(b - t))
+        return nearest if abs(nearest - t) <= 0.35 else t
+
     for w in words:
         loud = False
         if len(energy):
@@ -369,8 +416,13 @@ def _emphasis_windows(words: list[dict], energy: np.ndarray, clip_start: float, 
             if 0 <= i < len(energy):
                 loud = (energy[i] - mu) / sd > 1.3
         if captions.is_keyword(w["word"]) or loud or w["word"].endswith("!"):
-            if not out or w["start"] - out[-1][0] >= gap:
-                out.append((w["start"], min(w["start"] + 1.1, w["end"] + 0.6)))
+            t0 = max(0.0, snap(w["start"]))
+            if not out or t0 - out[-1][0] >= gap:
+                out.append((t0, min(t0 + 1.1, w["end"] + 0.6)))
+    if not out and clip_beats:
+        for b in clip_beats[::8][:12]:
+            if not out or b - out[-1][0] >= gap:
+                out.append((b, b + 0.9))
     return out
 
 
@@ -378,8 +430,8 @@ def _hook_time(words: list[dict], dur: float) -> float:
     for w in words:
         if 0.8 <= w["start"] <= min(6.0, dur / 3) and captions.is_keyword(w["word"]):
             return w["start"]
-    for w in words:  # end of the first sentence
-        if re.search(r"[.!?]$", w["word"]) and w["end"] < dur / 2:
+    for w in words:
+        if re.search(r"[.!?؟]$", w["word"]) and w["end"] < dur / 2:
             return w["end"]
     return min(1.5, dur / 4)
 
@@ -389,25 +441,21 @@ def _face_cache_name(start: float, end: float) -> str:
 
 
 def same_clip(payload: dict, clips: dict[int, str]) -> bool:
-    """Is this render job for one of `clips` (id -> creation stamp)? Jobs queued by older
-    versions carry no stamp and are matched by id."""
     cid = payload.get("clip_id")
     return cid in clips and payload.get("created", clips[cid]) == clips[cid]
 
 
 def _face_track(pdir: Path, source: Path, start: float, end: float,
                 still_current: Callable[[], None] = lambda: None) -> reframe.FaceTrack:
-    """Face positions for one clip. Cached, so a new caption style or hook title does not redo the detection.
-    `still_current` raises if the clip was deleted or replaced meanwhile (the cache then stays untouched)."""
     cache = pdir / "faces" / _face_cache_name(start, end)
     data = _load_json(cache) if _fresh(cache, source) else None
-    if isinstance(data, dict) and data.get("times"):  # an unreadable or empty file is a miss, not "no faces"
+    if isinstance(data, dict) and data.get("times"):
         try:
             return reframe.FaceTrack.from_dict(data)
         except (ValueError, TypeError, IndexError, KeyError, AttributeError):
             pass
     track = reframe.analyze_faces(source, start, end)
-    still_current()  # the folder may belong to a newer project with the same id by now
+    still_current()
     if track.times:
         try:
             cache.parent.mkdir(exist_ok=True)
@@ -417,12 +465,10 @@ def _face_track(pdir: Path, source: Path, start: float, end: float,
     return track
 
 
-# Clips being rendered right now: clip id -> (project id, fraction done). Kept in memory
-# (not a column) so the progress bar can move during a render without a schema change.
 _inflight: dict[int, tuple[int, float]] = {}
 _inflight_lock = threading.Lock()
 _last_progress_write: dict[int, float] = {}
-FACE_SHARE = 0.12  # rough share of a clip's time spent finding faces before ffmpeg starts
+FACE_SHARE = 0.12
 
 
 def _set_inflight(cid: int, pid: int, fraction: float) -> None:
@@ -454,10 +500,8 @@ def _render(payload: dict) -> None:
             return
         created = stamp(clip.created_at)
         if payload.get("created", created) != created:
-            return  # a job for an earlier clip whose id now belongs to a new one
+            return
         pid = clip.project_id
-    # One render per clip at a time: two jobs for the same clip (an automatic retry and a
-    # "Try again", say) would write the same files at once and could leave a broken video.
     with _inflight_lock:
         busy = cid in _inflight
         if not busy:
@@ -474,86 +518,146 @@ def _render(payload: dict) -> None:
             if not clip or stamp(clip.created_at) != created:
                 raise ProjectGone(cid)
             proj = s.get(Project, clip.project_id)
+            if not proj or not proj.source_path or not Path(proj.source_path).exists():
+                raise media.MediaError("Source video is no longer on disk (it may have been deleted to free space)")
             clip.status = "rendering"
             clip.error = None
             s.add(clip)
             s.commit()
             start, end, hook_text = clip.start, clip.end, clip.hook or clip.title
-            settings, source = dict(proj.settings), Path(proj.source_path)
+            settings = {**dict(proj.settings), **dict(clip.overrides or {})}
+            source = Path(proj.source_path)
             music = s.get(MusicTrack, clip.music_track_id) if clip.music_track_id else None
-            music_info = (Path(music.path), music.drop_time) if music else None
+            music_info = (Path(music.path), music.drop_time, list(music.beats or [])) if music else None
+            broll_id = settings.get("broll_id")
+            broll = s.get(BrollClip, int(broll_id)) if broll_id else None
+            broll_path = Path(broll.path) if broll and Path(broll.path).exists() else None
+            words_override = list(clip.words_override) if clip.words_override else None
         refresh_project_progress(pid, throttle=True)
 
         pdir = project_dir(pid)
-        # Nobody else renders this clip now, so half-built or retired folders of it are
-        # leftovers of a crash or a redeploy: each can hold a 15-25 MB video.
         for pattern in (f"{cid}.part-*", f"{cid}.old-*"):
             for d in (pdir / "clips").glob(pattern):
                 shutil.rmtree(d, ignore_errors=True)
-        # Build everything in a folder of its own and move it into place at the end, so the
-        # clip that is on screen right now stays playable until the new one is complete.
         work = pdir / "clips" / f"{cid}.part-{uuid.uuid4().hex[:8]}"
         work.mkdir(parents=True)
+
         out_w, out_h = ASPECT_RATIOS.get(settings.get("aspect_ratio", "9:16"), (s_cfg.output_width, s_cfg.output_height))
         style = get_editing_style(settings.get("editing_style", "face_track_zoom"))
         cap_style = get_caption_style(settings.get("caption_style", "hormozi"))
-        dur = end - start
+        src_dur = end - start
 
         tpath = pdir / "transcript.json"
-        all_words = json.loads(tpath.read_text()).get("words", []) if tpath.exists() else []
-        words = captions.clip_words(all_words, start, end)
+        if words_override:
+            words = [{"word": str(w["word"]).strip(), "start": float(w["start"]), "end": float(w["end"])}
+                     for w in words_override if str(w.get("word", "")).strip()]
+        else:
+            all_words = json.loads(tpath.read_text()).get("words", []) if tpath.exists() else []
+            words = captions.clip_words(all_words, start, end)
+
         energy = np.load(pdir / "energy.npy") if (pdir / "energy.npy").exists() else np.zeros(0)
+        scenes_all = _load_json(pdir / "scenes.json")
+        scene_cuts = [float(c) - start for c in (scenes_all or []) if start < float(c) < end] if isinstance(scenes_all, list) else []
         info = media.probe(source)
+
+        # optional silence removal (jump-cut)
+        keep_segments = None
+        dur = src_dur
+        if settings.get("remove_silences") and words and not words_override:
+            segs = highlights.silence_cuts(words, src_dur)
+            if len(segs) > 1:
+                keep_segments = segs
+                words = captions.remap_words_after_cuts(words, segs)
+                dur = sum(b - a for a, b in segs)
 
         # reframe
         layout = style.get("layout", "face_track")
         track = reframe.FaceTrack() if layout in ("center", "blur_fill") else _face_track(
             pdir, source, start, end, lambda: _clip_current(cid, created))
         _set_inflight(cid, pid, FACE_SHARE)
-        zooms = _emphasis_windows(words, energy, start) if style.get("zoom_on_emphasis") else []
-        lay = reframe.build_layout(layout, src_w=info.width, src_h=info.height, out_w=out_w, out_h=out_h,
-                                   track=track, style=style, zoom_windows=zooms)
 
-        spec = render.RenderSpec(source=source, start=start, end=end, out_path=work / "clip.mp4", work_dir=work,
-                                 video_filter=lay.filter, out_w=out_w, out_h=out_h, has_audio=info.has_audio,
-                                 fps=info.fps)
+        music_offset = 0.0
+        beats_list: list[float] = []
+        if music_info and music_info[0].exists():
+            _, drop, beats_list = music_info
+            if settings.get("match_drop_to_hook", True) and drop:
+                music_offset = float(drop) - _hook_time(words, dur)
+
+        use_beats = bool(settings.get("beat_sync_zoom", False))
+        zooms = _emphasis_windows(
+            words, energy, start,
+            beats=beats_list if use_beats else None,
+            music_offset=music_offset,
+        ) if (style.get("zoom_on_emphasis") or use_beats) else []
+
+        lay = reframe.build_layout(
+            layout, src_w=info.width, src_h=info.height, out_w=out_w, out_h=out_h,
+            track=track, style=style, zoom_windows=zooms, scene_cuts=scene_cuts,
+            has_broll=broll_path is not None,
+        )
+
+        runtime_cfg = load_runtime_config()
+        wm_text = settings.get("watermark_text")
+        if wm_text is None:
+            wm_text = runtime_cfg.get("default_watermark_text", "")
+        wm_pos = settings.get("watermark_position") or runtime_cfg.get("default_watermark_position", "bottom_right")
+
+        spec = render.RenderSpec(
+            source=source, start=start, end=end, out_path=work / "clip.mp4", work_dir=work,
+            video_filter=lay.filter, out_w=out_w, out_h=out_h, has_audio=info.has_audio,
+            broll_path=broll_path if lay.layout_used == "broll_split" else None,
+            keep_segments=keep_segments,
+            normalize_audio=bool(settings.get("normalize_audio", True)),
+            denoise_audio=bool(settings.get("denoise_audio", False)),
+            progress_bar=bool(settings.get("progress_bar", False)),
+            watermark_text=str(wm_text or ""),
+            watermark_position=str(wm_pos),
+            fps=info.fps,
+        )
 
         # captions
         caption_y = settings.get("caption_position") or style.get("caption_y", 0.62)
-        if lay.layout_used in ("split_faces", "gameplay_facecam"):
-            caption_y = 0.55 if lay.layout_used == "gameplay_facecam" else 0.5
+        if lay.layout_used in ("split_faces", "gameplay_facecam", "broll_split") and not settings.get("caption_position"):
+            caption_y = 0.55 if lay.layout_used in ("gameplay_facecam", "broll_split") else 0.5
         if cap_style and words:
             ass, cues = captions.build_ass(words, cap_style, out_w=out_w, out_h=out_h, caption_y=caption_y,
                                            clip_duration=dur, auto_emoji=bool(settings.get("auto_emoji", True)))
             spec.ass_path = captions.write_ass(work / "captions.ass", ass)
             spec.emoji = cues
-            spec.emoji_y = max(40, int(out_h * caption_y) - int(cap_style.get("size", 90)) - 190)
+            scale_factor = min(out_w, out_h) / 1080.0
+            cap_px = int(cap_style.get("size", 90)) * scale_factor
+            em_offset = int(cap_px * 1.45 + 140 * scale_factor)
+            spec.emoji_y = max(int(out_h * 0.04), int(out_h * caption_y) - em_offset)
 
         # hook title card
         if (style.get("hook_card") or settings.get("hook_title")) and hook_text:
-            png, cw, ch = hook_card.render_hook_card(hook_text, work / "hook.png", out_w=out_w)
+            png, cw, ch = hook_card.render_hook_card(
+                hook_text, work / "hook.png", out_w=out_w,
+                card_style=str(settings.get("hook_card_style", "light")),
+            )
             if lay.layout_used == "blur_fill":
                 fg_h = out_w * info.height / info.width
                 fg_top = (out_h - fg_h) * float(style.get("foreground_y", 0.5))
-                y = int(max(60, fg_top - ch - 28))
+                y = int(max(24, fg_top - ch - 20))
             else:
-                y = int(out_h * 0.1)
+                y = int(out_h * 0.08)
             spec.hook_png, spec.hook_xy = png, ((out_w - cw) // 2, y)
+            spec.hook_duration = float(settings.get("hook_card_duration", 0.0) or 0.0)
 
         # music + drop sync
         if music_info and music_info[0].exists():
-            mpath, drop = music_info
-            offset = 0.0
-            if settings.get("match_drop_to_hook", True) and drop:
-                offset = float(drop) - _hook_time(words, dur)
-            spec.music = render.MusicSpec(path=mpath, offset=offset, volume=float(settings.get("music_volume", 0.18)),
-                                          ducking=bool(settings.get("ducking", True)))
+            mpath = music_info[0]
+            spec.music = render.MusicSpec(
+                path=mpath, offset=music_offset,
+                volume=float(settings.get("music_volume", 0.18)),
+                ducking=bool(settings.get("ducking", True)),
+            )
 
         last_check = [time.monotonic()]
 
         def on_progress(f: float) -> None:
             _set_inflight(cid, pid, FACE_SHARE + (1 - FACE_SHARE) * f)
-            if time.monotonic() - last_check[0] >= 5:  # deleted or replaced meanwhile? stop the encode
+            if time.monotonic() - last_check[0] >= 5:
                 last_check[0] = time.monotonic()
                 _clip_current(cid, created)
 
@@ -571,7 +675,7 @@ def _render(payload: dict) -> None:
             try:
                 os.replace(work, final)
             except OSError:
-                if retired is not None:  # put the clip that was there back
+                if retired is not None:
                     os.replace(retired, final)
                     retired = None
                 raise
@@ -591,9 +695,9 @@ def _render(payload: dict) -> None:
                 s.commit()
         raise
     finally:
-        if work is not None:  # never went live
+        if work is not None:
             shutil.rmtree(work, ignore_errors=True)
-        elif retired is not None:  # the new clip is in place: the one it replaced goes
+        elif retired is not None:
             shutil.rmtree(retired, ignore_errors=True)
         with _inflight_lock:
             _inflight.pop(cid, None)
@@ -601,11 +705,6 @@ def _render(payload: dict) -> None:
 
 
 def refresh_project_progress(pid: int, final: bool = False, throttle: bool = False) -> None:
-    """Recompute the project's progress and stage from its clips.
-
-    `throttle=True` is for the once-a-second ticks during a render: it skips the write if
-    this project was updated less than a second ago.
-    """
     with _inflight_lock:
         now = time.monotonic()
         if throttle and now - _last_progress_write.get(pid, 0.0) < 1.0:
@@ -629,7 +728,6 @@ def refresh_project_progress(pid: int, final: bool = False, throttle: bool = Fal
         else:
             running = running[: n - len(done)]
             p.progress = round(0.7 + 0.3 * (len(done) + sum(running)) / n, 3)
-            # no percentage in the text: the app shows the overall one right next to it
             if len(running) == 1:
                 p.stage = f"Rendering clip {len(done) + 1} of {n}"
             elif running:
@@ -642,14 +740,13 @@ def refresh_project_progress(pid: int, final: bool = False, throttle: bool = Fal
 
 
 def fail_clip(payload: dict, error: str) -> None:
-    """A render job that was interrupted on its last attempt: stop its clip showing 'rendering' forever."""
     if not payload.get("clip_id"):
         return
     pid = None
     with session_scope() as s:
         clip = s.get(Clip, int(payload["clip_id"]))
         if clip and payload.get("created", stamp(clip.created_at)) != stamp(clip.created_at):
-            clip = None  # the job was for an earlier clip with the same id
+            clip = None
         if clip and clip.status != "ready":
             clip.status, clip.error = "failed", error[-800:]
             s.add(clip)
@@ -666,7 +763,7 @@ def fail_project(payload: dict, error: str) -> None:
         _update_project(int(payload["project_id"]), created=payload.get("created"), status="failed",
                         error=error[-800:], stage="Failed")
     except ProjectGone:
-        pass  # the project was deleted, or its id now belongs to a new one
+        pass
 
 
 # =====================================================================  music
@@ -686,6 +783,8 @@ def analyze_music(payload: dict) -> None:
         pass
     with session_scope() as s:
         t = s.get(MusicTrack, tid)
+        if not t:
+            return
         t.bpm, t.beats, t.drop_time, t.duration, t.analyzed = info["bpm"], info["beats"], info["drop_time"], dur, True
         s.add(t)
         s.commit()

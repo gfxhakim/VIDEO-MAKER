@@ -20,7 +20,7 @@ def test_presets_are_valid():
     assert {"face_track_zoom", "podcast_split", "talking_head", "gaming_fast"} <= set(editing_styles())
     assert {"hormozi", "netflix_kinetic", "neon_glow", "minimal_clean"} <= set(caption_styles())
     for s in editing_styles().values():
-        assert s["layout"] in {"face_track", "face_static", "split_faces", "gameplay_facecam", "blur_fill", "center"}
+        assert s["layout"] in {"face_track", "face_static", "split_faces", "gameplay_facecam", "broll_split", "blur_fill", "center"}
 
 
 def test_select_highlights_respects_count_length_and_overlap():

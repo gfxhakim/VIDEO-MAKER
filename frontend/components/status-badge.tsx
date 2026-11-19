@@ -1,19 +1,19 @@
 import { Badge } from "@/components/ui/badge";
-import type { Project } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-const MAP = {
+const MAP: Record<string, readonly ["secondary" | "warning" | "success" | "destructive", string]> = {
   draft: ["secondary", "Draft"],
   queued: ["warning", "Waiting"],
   processing: ["warning", "Working"],
+  running: ["warning", "Running"],
   done: ["success", "Ready"],
   failed: ["destructive", "Failed"],
-} as const;
+  cancelled: ["secondary", "Cancelled"],
+};
 
-export function StatusBadge({ status, className }: { status: Project["status"]; className?: string }) {
-  // an unknown status from a newer server still renders, as plain text
+export function StatusBadge({ status, className }: { status: string; className?: string }) {
   const [variant, label] = MAP[status] ?? (["secondary", String(status || "Unknown")] as const);
-  const live = status === "queued" || status === "processing";
+  const live = status === "queued" || status === "processing" || status === "running";
   return (
     <Badge variant={variant} className={cn("capitalize", className)}>
       {live && <span aria-hidden className="size-1.5 animate-pulse rounded-full bg-current motion-reduce:animate-none" />}

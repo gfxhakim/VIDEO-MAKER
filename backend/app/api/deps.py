@@ -31,3 +31,9 @@ def current_user(request: Request, session: Session = Depends(get_session)) -> U
     if not user:
         raise HTTPException(401, "Not signed in")
     return user
+
+
+def owns(record, user: User) -> bool:
+    """True when `record` has no owner (legacy/fixture) or belongs to `user`."""
+    uid = getattr(record, "user_id", None)
+    return uid is None or uid == user.id

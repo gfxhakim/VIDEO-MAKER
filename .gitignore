@@ -10,6 +10,7 @@ backend/data/
 backend/fonts/*.ttf
 backend/fonts/*.otf
 !backend/fonts/README.md
+backend/assets/models/*.onnx
 backend/.env
 
 # Node

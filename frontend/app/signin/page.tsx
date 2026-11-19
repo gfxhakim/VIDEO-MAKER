@@ -128,7 +128,7 @@ export default function SignInPage() {
           </div>
           <div className="flex gap-8 text-sm text-muted-foreground">
             <div><div className="text-2xl font-semibold text-foreground">9:16</div>ready to post</div>
-            <div><div className="text-2xl font-semibold text-foreground">10 to 50</div>clips per run</div>
+            <div><div className="text-2xl font-semibold text-foreground">1 to 50</div>clips per run</div>
             <div><div className="text-2xl font-semibold text-foreground">0</div>API keys</div>
           </div>
         </div>

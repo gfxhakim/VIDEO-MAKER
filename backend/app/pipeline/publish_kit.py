@@ -1,13 +1,11 @@
-"""Manual publishing helpers: ready-to-paste captions per platform + ZIP export.
-
-Posting stays 100% manual (you upload in each app yourself), so there is no API
-access to your accounts and nothing automated that a platform could flag.
-"""
+"""Manual publishing helpers: ready-to-paste captions per platform + ZIP export (MP4 + TXT + optional SRT)."""
 from __future__ import annotations
 
 import re
 import zipfile
 from pathlib import Path
+
+from .captions import build_srt
 
 PLATFORMS = {
     "tiktok": {"label": "TikTok", "caption_limit": 2200, "max_tags": 5},
@@ -41,7 +39,6 @@ def build_kit(title: str, description: str, hashtags: list[str]) -> dict:
             caption = "\n\n".join(p for p in (desc, " ".join(tags)) if p)
             kit[key] = {"label": cfg["label"], "title": yt_title, "caption": caption[: cfg["caption_limit"]], "hashtags": tags}
         else:
-            # short apps: the hook line is the caption, hashtags at the end
             caption = "\n\n".join(p for p in (title, " ".join(tags)) if p)
             kit[key] = {"label": cfg["label"], "title": title, "caption": caption[: cfg["caption_limit"]], "hashtags": tags}
     return kit
@@ -52,10 +49,9 @@ def _safe(name: str, fallback: str) -> str:
     return s or fallback
 
 
-def build_zip(clips: list, dest: Path) -> Path:
-    """ZIP with every clip's mp4 plus a captions .txt per clip (all platforms).
-    Written to disk, not memory, so 50 clips don't blow up RAM on a small server."""
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_STORED) as z:  # mp4 is already compressed
+def build_zip(clips: list, dest: Path, *, clip_words_fn=None) -> Path:
+    """ZIP with every clip's mp4, captions .txt, and optional .srt subtitle file."""
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_STORED) as z:
         for c in clips:
             if not c.video_path or not Path(c.video_path).exists():
                 continue
@@ -64,6 +60,11 @@ def build_zip(clips: list, dest: Path) -> Path:
             kit = build_kit(c.title, c.description, c.hashtags)
             lines = []
             for v in kit.values():
-                lines += [f"=== {v['label']} ===", *( [f"Title: {v['title']}"] if v['label'].startswith("YouTube") else []), v["caption"], ""]
+                lines += [f"=== {v['label']} ===", *([f"Title: {v['title']}"] if v["label"].startswith("YouTube") else []), v["caption"], ""]
             z.writestr(f"{base}.txt", "\n".join(lines))
+            if clip_words_fn is not None:
+                words = clip_words_fn(c)
+                srt = build_srt(words) if words else ""
+                if srt:
+                    z.writestr(f"{base}.srt", srt)
     return dest

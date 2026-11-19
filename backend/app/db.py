@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlmodel import Session, SQLModel, create_engine
 
 from .config import get_settings
@@ -25,10 +25,40 @@ def _sqlite_pragmas(dbapi_conn, _):  # pragma: no cover - trivial
     cur.close()
 
 
+_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "project": [
+        ("user_id", "INTEGER"),
+        ("source_start", "REAL"),
+        ("source_end", "REAL"),
+        ("source_deleted", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    "clip": [
+        ("words_override", "JSON"),
+        ("overrides", "JSON NOT NULL DEFAULT '{}'"),
+    ],
+    "musictrack": [
+        ("user_id", "INTEGER"),
+    ],
+}
+
+
+def _migrate_sqlite() -> None:
+    """Safely add new columns to pre-existing SQLite databases on startup."""
+    with engine.begin() as conn:
+        for table, cols in _MIGRATIONS.items():
+            existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).all()}
+            if not existing:
+                continue
+            for name, ddl in cols:
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+
 def init_db() -> None:
     from . import models  # noqa: F401  (register tables)
 
     SQLModel.metadata.create_all(engine)
+    _migrate_sqlite()
 
 
 def get_session() -> Iterator[Session]:

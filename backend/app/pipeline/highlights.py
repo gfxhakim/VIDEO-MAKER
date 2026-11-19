@@ -1,21 +1,4 @@
-"""Viral-moment detection and scoring.
-
-Inspired by open-source pipelines (Chopify, AI-Youtube-Shorts-Generator): split the
-transcript into sentences, build candidate windows that start and end on sentence
-boundaries, score each window on several signals, then greedily pick the best
-non-overlapping windows.
-
-Signals (each normalised to 0..1, weights in WEIGHTS):
-  hook        - does the first sentence grab attention? (questions, "here's why", numbers, "you")
-  density     - words per second; punchy speech beats rambling
-  energy      - mean loudness vs. the whole video (excited delivery)
-  spikes      - count of loudness spikes (laughs, shouts, reactions)
-  emotion     - emotional / intense vocabulary, exclamations
-  dead_air    - (penalty) long pauses
-  action      - visual cuts per second (gaming / action footage)
-  complete    - ends on a full sentence (payoff), not mid-thought
-  length_fit  - close to the preferred length
-"""
+"""Viral-moment detection, scoring, silence-cut calculation, and metadata helpers."""
 from __future__ import annotations
 
 import math
@@ -38,18 +21,31 @@ WEIGHTS = {
 }
 
 HOOK_PHRASES = [
+    # English
     "here's why", "here is why", "the secret", "nobody", "no one", "never", "stop", "the truth", "the reason",
     "how to", "how i", "what if", "did you know", "you won't believe", "i can't believe", "the biggest", "the worst",
     "the best", "mistake", "if you", "you need", "you have to", "listen", "watch this", "look at", "this is why",
     "let me tell you", "the problem", "everyone", "most people", "wait", "bro", "oh my god", "what the",
+    "unpopular opinion", "hear me out", "don't ever", "the hack", "3 things", "five things", "changed my life",
+    # Spanish / French / German / Portuguese / Arabic hooks
+    "por qué", "el secreto", "nadie te", "la verdad", "no hagas", "escucha", "mira esto",
+    "pourquoi", "le secret", "personne ne", "la vérité", "écoute", "regarde",
+    "warum", "das geheimnis", "niemand", "die wahrheit", "hör zu",
+    "por que", "o segredo", "ninguém", "a verdade", "olha isso",
+    "لماذا", "السر", "الحقيقة", "لا أحد", "اسمع", "شاهد",
 ]
+
 EMOTION_WORDS = set(
     """amazing awesome insane crazy unbelievable incredible love hate angry mad furious scared terrified shocked
     shocking wow omg holy damn hell literally actually seriously absolutely never always biggest worst best ever
     huge massive million billion money rich broke dead kill killed died crying cry laugh laughing funny hilarious
     secret truth lie lied lying fake real exposed wrong right winning won lost lose crazy wild sick fire goat
-    beautiful disgusting obsessed addicted dangerous illegal impossible""".split()
+    beautiful disgusting obsessed addicted dangerous illegal impossible
+    increible locura verdad secreto dinero nunca siempre mejor peor imposible
+    incroyable fou vérité secret argent jamais toujours meilleur pire impossible
+    unglaublich verrückt wahrheit geheimnis geld niemals immer beste schlechteste""".split()
 )
+
 STOPWORDS = set(
     """a an the and or but if then so to of in on at for with from by is are was were be been being i you he she it
     we they me him her us them my your his its our their this that these those there here what which who whom whose
@@ -57,8 +53,12 @@ STOPWORDS = set(
     will just don't do does did doing have has had having would should could i'm you're it's that's gonna wanna yeah
     like know really get got go going one thing things um uh okay ok oh well right also because about up out
     need want said says tell tells told make made just even still much many back over into then them than
-    wait listen look gonna kind sort mean thing stuff come came take took give gave keep every""".split()
+    wait listen look gonna kind sort mean thing stuff come came take took give gave keep every
+    today yesterday tomorrow people everyone everybody someone somebody anyone nobody something anything everything
+    actually basically literally probably maybe definitely honestly seriously totally always never""".split()
 )
+
+LEADING_FILLER = re.compile(r"^(?:(?:um|uh|ah|er|so|well|like|yeah|okay|ok|basically|actually|literally)[,\s]+)+", re.I)
 
 
 @dataclass
@@ -92,11 +92,11 @@ def build_sentences(words: list[dict], max_gap: float = 0.8, max_len: float = 12
             out.append(Sentence(cur[0]["start"], cur[-1]["end"], " ".join(w["word"] for w in cur), len(cur)))
             cur.clear()
 
-    for i, w in enumerate(words):
+    for w in words:
         if cur and (w["start"] - cur[-1]["end"] > max_gap or w["end"] - cur[0]["start"] > max_len):
             flush()
         cur.append(w)
-        if re.search(r"[.!?…]$", w["word"]):
+        if re.search(r"[.!?…؟]$", w["word"]):
             flush()
     flush()
     return out
@@ -111,24 +111,24 @@ def _norm(v: float, lo: float, hi: float) -> float:
 def _hook_score(text: str) -> float:
     t = text.lower()
     s = 0.0
-    if "?" in t:
+    if "?" in t or "؟" in t:
         s += 0.35
     if any(p in t for p in HOOK_PHRASES):
         s += 0.4
     if re.search(r"\d|\$|percent|%", t):
         s += 0.2
-    if re.search(r"\byou\b|\byour\b", t):
+    if re.search(r"\byou\b|\byour\b|\btu\b|\bvous\b|\bdu\b", t):
         s += 0.15
     if "!" in t:
         s += 0.1
     n = len(t.split())
-    if 4 <= n <= 18:  # short, punchy opener
+    if 4 <= n <= 18:
         s += 0.15
     return min(1.0, s)
 
 
 def _emotion_score(text: str) -> float:
-    toks = re.findall(r"[a-zA-Z']+", text.lower())
+    toks = re.findall(r"[\w']+", text.lower())
     if not toks:
         return 0.0
     hits = sum(1 for t in toks if t in EMOTION_WORDS)
@@ -166,7 +166,7 @@ class Scorer:
 
     def _sum(self, key: str, a: float, b: float) -> float:
         cs = self._cs[key]
-        last = len(cs) - 1  # times past the end (audio a little longer than the video) count as the end
+        last = len(cs) - 1
         i = min(max(0, int(a / self.step)), last)
         j = min(max(i + 1, int(b / self.step)), last)
         return float(cs[j] - cs[i])
@@ -200,7 +200,6 @@ class Scorer:
             b["complete"] = 1.0 if ends_clean else 0.3
         else:
             b.update(density=0.0, dead_air=0.0, hook=0.0, emotion=0.0, complete=0.5)
-            # opening loudness stands in for a verbal hook
             b["hook"] = _norm(self._sum("z", c.start, c.start + 3) / (3 / self.step), -0.5, 1.5)
         b["length_fit"] = max(0.0, 1 - abs(d - pref_len) / max(pref_len, 1))
         raw = sum(WEIGHTS[k] * v for k, v in b.items())
@@ -238,11 +237,10 @@ def select_highlights(
                     start = max(0.0, s0.start - 0.15)
                     end = min(duration, sj.end + 0.35)
                     c = Candidate(start, end, text=" ".join(text_parts), hook=s0.text)
-                    ends_clean = bool(re.search(r"[.!?…]$", sj.text))
+                    ends_clean = bool(re.search(r"[.!?…؟]$", sj.text))
                     scorer.score(c, s0.text, pref_len, ends_clean)
                     cands.append(c)
     else:
-        # No usable speech: slide fixed windows over the timeline.
         step = max(2.0, min_len / 3)
         t = 0.0
         while t + min_len <= duration:
@@ -255,7 +253,7 @@ def select_highlights(
 
     cands.sort(key=lambda c: c.score, reverse=True)
     chosen: list[Candidate] = []
-    for max_ov in (0.1, 0.35, 0.6):  # relax overlap if the source is too short for the requested count
+    for max_ov in (0.1, 0.35, 0.6):
         for c in cands:
             if len(chosen) >= count:
                 break
@@ -267,10 +265,39 @@ def select_highlights(
     return chosen
 
 
+def silence_cuts(words: list[dict], clip_duration: float, *, min_gap: float = 0.65, pad: float = 0.08) -> list[tuple[float, float]]:
+    """Compute kept [start, end] speech segments inside a clip (removes pauses > `min_gap`)."""
+    if not words or clip_duration <= 1.0:
+        return [(0.0, clip_duration)]
+    segs: list[tuple[float, float]] = []
+    cur_a = max(0.0, words[0]["start"] - pad)
+    cur_b = min(clip_duration, words[0]["end"] + pad)
+    for w in words[1:]:
+        wa = max(0.0, w["start"] - pad)
+        wb = min(clip_duration, w["end"] + pad)
+        if wa - cur_b > min_gap - 2 * pad:
+            if cur_b - cur_a > 0.15:
+                segs.append((round(cur_a, 3), round(cur_b, 3)))
+            cur_a, cur_b = wa, wb
+        else:
+            cur_b = max(cur_b, wb)
+    if cur_b - cur_a > 0.15:
+        segs.append((round(cur_a, 3), round(cur_b, 3)))
+    if not segs or sum(b - a for a, b in segs) < 2.0:
+        return [(0.0, clip_duration)]
+    # Keep at least 95% if barely anything was cut so we don't pay extra concat filter cost unnecessarily
+    if sum(b - a for a, b in segs) >= clip_duration - 0.5:
+        return [(0.0, clip_duration)]
+    return segs
+
+
 # ----------------------------------------------------------------- metadata
 def make_title(hook: str, text: str, max_len: int = 80) -> str:
     base = (hook or text or "").strip()
     base = re.sub(r"\s+", " ", base)
+    cleaned = LEADING_FILLER.sub("", base).strip()
+    if len(cleaned) >= 12:
+        base = cleaned
     if not base:
         return "Wait for it..."
     base = base[0].upper() + base[1:]
@@ -282,7 +309,6 @@ def make_title(hook: str, text: str, max_len: int = 80) -> str:
 def make_hashtags(text: str, n: int = 4) -> list[str]:
     toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z']{3,}", text)]
     counts = Counter(t for t in toks if t not in STOPWORDS and "'" not in t)
-    # favour specific, longer words ("marathon", "money") over filler ("need", "said")
     ranked = sorted(counts, key=lambda w: counts[w] * (1 + len(w) / 5) + (2 if w in EMOTION_WORDS else 0), reverse=True)
     tags = ranked[:n]
     return [f"#{t}" for t in tags] + ["#shorts", "#viral", "#fyp"]
