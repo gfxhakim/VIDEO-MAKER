@@ -355,11 +355,13 @@ export default function Studio() {
   const { data: projects, error: projectsError, mutate } = useSWR<Project[]>("/api/projects", firstFetcher, SWR_PROJECTS);
   const { data: clips, mutate: mutateClips } = useSWR<Clip[]>("/api/clips", firstFetcher, SWR_CLIPS);
   const up = useUpload(); // lives above the pages: the upload keeps going while you pick a style or browse
-  const { upload: u, start: startUpload, generate: queueGenerate, undoGenerate, cancel: cancelUpload } = up;
+  const { upload: u, start: startUpload, generate: queueGenerate, undoGenerate, cancel: cancelUpload, queuedSettings } = up;
   const [source, setSource] = useState<Source>("upload");
   const [url, setUrl] = useState("");
   const [path, setPath] = useState("");
-  const [settings, setSettings] = useState<GenerationSettings>(DEFAULT_SETTINGS);
+  // a queued Generate keeps its settings in the upload: coming back to this page shows that choice again
+  const [settings, setSettings] = useState<GenerationSettings>(() => queuedSettings() ?? DEFAULT_SETTINGS);
+  const firstSettings = useRef(settings);
   const [styleOpen, setStyleOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
@@ -414,10 +416,11 @@ export default function Studio() {
     requestAnimationFrame(() => document.getElementById("src-url")?.focus());
   }, []);
 
-  // what you see selected is what a queued upload will use
+  // what you see selected is what a queued upload will use. Only a change made on this page is sent:
+  // what the page opened with is already what the upload holds.
   const queued = !!u?.autoStart;
   useEffect(() => {
-    if (queued) queueGenerate(settings);
+    if (queued && settings !== firstSettings.current) queueGenerate(settings);
   }, [queued, settings, queueGenerate]);
 
   const link = toLink(url);

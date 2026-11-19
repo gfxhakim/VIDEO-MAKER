@@ -250,9 +250,9 @@ def _analyze(payload: dict) -> None:
         if not p or stamp(p.created_at) != created:
             raise ProjectGone(pid)
         # re-runs replace earlier clips
-        old_ids = []
+        old_ids: dict[int, str] = {}
         for old in s.exec(select(Clip).where(Clip.project_id == pid)).all():
-            old_ids.append(old.id)
+            old_ids[old.id] = stamp(old.created_at)
             s.delete(old)
         s.commit()
         clip_ids = []
@@ -270,9 +270,9 @@ def _analyze(payload: dict) -> None:
             s.refresh(clip)
             clip_ids.append((clip.id, stamp(clip.created_at)))
     # Render retries still waiting for the replaced clips would otherwise run against the
-    # new clips (same ids) and race their real renders.
-    gone = set(old_ids)
-    cancel_queued("render_clip", lambda pl: pl.get("clip_id") in gone)
+    # new clips (same ids) and race their real renders. Matched on id and creation time, so
+    # fresh jobs of another project's clips that took over one of these ids stay.
+    cancel_queued("render_clip", lambda pl: same_clip(pl, old_ids))
     # the files of replaced clips (15-25 MB each) and face tracks nobody uses any more
     for oid in old_ids:
         shutil.rmtree(pdir / "clips" / str(oid), ignore_errors=True)
@@ -388,8 +388,17 @@ def _face_cache_name(start: float, end: float) -> str:
     return f"{start:.3f}-{end:.3f}.json"
 
 
-def _face_track(pdir: Path, source: Path, start: float, end: float) -> reframe.FaceTrack:
-    """Face positions for one clip. Cached, so a new caption style or hook title does not redo the detection."""
+def same_clip(payload: dict, clips: dict[int, str]) -> bool:
+    """Is this render job for one of `clips` (id -> creation stamp)? Jobs queued by older
+    versions carry no stamp and are matched by id."""
+    cid = payload.get("clip_id")
+    return cid in clips and payload.get("created", clips[cid]) == clips[cid]
+
+
+def _face_track(pdir: Path, source: Path, start: float, end: float,
+                still_current: Callable[[], None] = lambda: None) -> reframe.FaceTrack:
+    """Face positions for one clip. Cached, so a new caption style or hook title does not redo the detection.
+    `still_current` raises if the clip was deleted or replaced meanwhile (the cache then stays untouched)."""
     cache = pdir / "faces" / _face_cache_name(start, end)
     data = _load_json(cache) if _fresh(cache, source) else None
     if isinstance(data, dict) and data.get("times"):  # an unreadable or empty file is a miss, not "no faces"
@@ -398,6 +407,7 @@ def _face_track(pdir: Path, source: Path, start: float, end: float) -> reframe.F
         except (ValueError, TypeError, IndexError, KeyError, AttributeError):
             pass
     track = reframe.analyze_faces(source, start, end)
+    still_current()  # the folder may belong to a newer project with the same id by now
     if track.times:
         try:
             cache.parent.mkdir(exist_ok=True)
@@ -457,6 +467,7 @@ def _render(payload: dict) -> None:
         return
 
     work: Optional[Path] = None
+    retired: Optional[Path] = None
     try:
         with session_scope() as s:
             clip = s.get(Clip, cid)
@@ -474,6 +485,11 @@ def _render(payload: dict) -> None:
         refresh_project_progress(pid, throttle=True)
 
         pdir = project_dir(pid)
+        # Nobody else renders this clip now, so half-built or retired folders of it are
+        # leftovers of a crash or a redeploy: each can hold a 15-25 MB video.
+        for pattern in (f"{cid}.part-*", f"{cid}.old-*"):
+            for d in (pdir / "clips").glob(pattern):
+                shutil.rmtree(d, ignore_errors=True)
         # Build everything in a folder of its own and move it into place at the end, so the
         # clip that is on screen right now stays playable until the new one is complete.
         work = pdir / "clips" / f"{cid}.part-{uuid.uuid4().hex[:8]}"
@@ -491,7 +507,8 @@ def _render(payload: dict) -> None:
 
         # reframe
         layout = style.get("layout", "face_track")
-        track = reframe.FaceTrack() if layout in ("center", "blur_fill") else _face_track(pdir, source, start, end)
+        track = reframe.FaceTrack() if layout in ("center", "blur_fill") else _face_track(
+            pdir, source, start, end, lambda: _clip_current(cid, created))
         _set_inflight(cid, pid, FACE_SHARE)
         zooms = _emphasis_windows(words, energy, start) if style.get("zoom_on_emphasis") else []
         lay = reframe.build_layout(layout, src_w=info.width, src_h=info.height, out_w=out_w, out_h=out_h,
@@ -548,11 +565,16 @@ def _render(payload: dict) -> None:
             clip = s.get(Clip, cid)
             if not clip or stamp(clip.created_at) != created:
                 raise ProjectGone(cid)
-            retired = None
             if final.exists():
                 retired = final.with_name(f"{cid}.old-{uuid.uuid4().hex[:8]}")
                 os.replace(final, retired)
-            os.replace(work, final)
+            try:
+                os.replace(work, final)
+            except OSError:
+                if retired is not None:  # put the clip that was there back
+                    os.replace(retired, final)
+                    retired = None
+                raise
             work = None
             clip.status, clip.video_path, clip.thumb_path = "ready", str(final / "clip.mp4"), str(final / "thumb.jpg")
             clip.error = None
@@ -560,8 +582,6 @@ def _render(payload: dict) -> None:
             clip.updated_at = utcnow()
             s.add(clip)
             s.commit()
-        if retired is not None:
-            shutil.rmtree(retired, ignore_errors=True)
     except Exception as e:
         with session_scope() as s:
             clip = s.get(Clip, cid)
@@ -571,8 +591,10 @@ def _render(payload: dict) -> None:
                 s.commit()
         raise
     finally:
-        if work is not None:
+        if work is not None:  # never went live
             shutil.rmtree(work, ignore_errors=True)
+        elif retired is not None:  # the new clip is in place: the one it replaced goes
+            shutil.rmtree(retired, ignore_errors=True)
         with _inflight_lock:
             _inflight.pop(cid, None)
         refresh_project_progress(pid)

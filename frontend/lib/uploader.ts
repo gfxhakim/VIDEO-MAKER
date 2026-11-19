@@ -312,6 +312,9 @@ export class ResumableUpload {
   // ------------------------------------------------------------ public
   getState = () => this.state;
 
+  /** The settings a queued "Generate" will use; null when nothing is queued. */
+  getSettings = () => this.settings;
+
   subscribe = (fn: (s: UploadState) => void) => {
     this.listeners.add(fn);
     return () => {
@@ -440,17 +443,19 @@ export class ResumableUpload {
       }
       const up = await call<ServerUpload>("POST", "/api/uploads", { filename: this.file.name, size: this.file.size, fingerprint: this.fp });
       if (this.state.phase === "canceled") {
-        // cancelled while the request travelled: cancel means the bytes go away
-        void call("DELETE", `/api/uploads/${up.id}`, undefined, { keepalive: true }).catch(() => {});
+        // Cancelled while the request travelled. An upload this request just made goes away; one that
+        // already holds bytes from an earlier visit stays, and is offered again as "continue".
+        if (!up.received_bytes) void call("DELETE", `/api/uploads/${up.id}`, undefined, { keepalive: true }).catch(() => {});
         return;
       }
       if (op !== this.op) return;
       if (want && up.id !== want.id) {
         // The server did not match this file to the unfinished upload. Either it is another file,
-        // or the unfinished upload has expired in the meantime.
+        // or the unfinished upload is over in the meantime (expired, or finished here or in another tab).
         let expired = false;
         try {
-          await call<ServerUpload>("GET", `/api/uploads/${want.id}`);
+          const old = await call<ServerUpload>("GET", `/api/uploads/${want.id}`);
+          expired = old.status !== "uploading";
         } catch (e) {
           expired = (e as HttpError).status === 404;
         }
@@ -590,7 +595,8 @@ export class ResumableUpload {
   private chunkFailed(i: number, status: number, text: string, slot?: Flight) {
     this.cursor = Math.min(this.cursor, i);
     if (this.state.phase !== "uploading" && this.state.phase !== "waiting") return;
-    if (status === 404) return void this.lost(); // the server no longer has this upload (expired, cancelled elsewhere)
+    // 404: expired or cancelled elsewhere, or finished from another tab while this chunk travelled. Ask first.
+    if (status === 404) return void this.resync(true);
     if (status === 409) return void this.resync(); // finished from another tab
     if (status === -1) {
       // the proxy gives a request body five minutes; this chunk did not make it in four
@@ -644,8 +650,9 @@ export class ResumableUpload {
       });
   }
 
-  /** Ask the server which chunks it really has (a chunk whose answer got lost may be there), then carry on. */
-  private async resync() {
+  /** Ask the server which chunks it really has (a chunk whose answer got lost may be there), then carry on.
+   *  `gone`: a chunk was just answered 404, so an upload still "uploading" has lost its bytes. */
+  private async resync(gone = false) {
     if (!this.id) return void this.prepare();
     const op = ++this.op;
     this.recent = new Set();
@@ -658,6 +665,7 @@ export class ResumableUpload {
         this.set({ phase: "uploaded", sent: up.size, safe: up.size, autoStart: true, message: null });
         return void this.complete(true);
       }
+      if (gone && up.status === "uploading") return void this.lost(); // the row is there but its bytes are not: start again
       this.merge(up.received, this.recent);
       if (up.status === "completing") return this.trouble("server"); // being turned into a project right now: look again shortly
       this.set({ sent: this.confirmed, safe: this.confirmed });

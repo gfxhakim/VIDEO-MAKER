@@ -126,6 +126,10 @@ def test_deleting_a_project_cancels_its_queued_work():
         queue.enqueue("render_clip", {"clip_id": a.id}, delay_seconds=60)
         queue.enqueue("render_clip", {"clip_id": b.id}, delay_seconds=60)
         queue.enqueue("render_clip", {"clip_id": oc.id}, delay_seconds=60)
+        # jobs of a newer project and clip that already took over these ids (other creation time)
+        queue.enqueue("analyze_project", {"project_id": p.id, "created": "newer"}, delay_seconds=60)
+        queue.enqueue("render_clip", {"clip_id": a.id, "created": "newer"}, delay_seconds=60)
+        queue.enqueue("render_clip", {"clip_id": b.id, "created": tasks.stamp(b.created_at)}, delay_seconds=60)
         assert c.delete(f"/api/projects/{p.id}").status_code == 200
     left = {(j.kind, tuple(sorted(j.payload.items()))): j.status for j in _jobs("render_clip") + _jobs("analyze_project")
             if j.payload.get("project_id") in (p.id,) or j.payload.get("clip_id") in (a.id, b.id, oc.id)}
@@ -133,6 +137,9 @@ def test_deleting_a_project_cancels_its_queued_work():
     assert left[("render_clip", (("clip_id", a.id),))] == "cancelled"
     assert left[("render_clip", (("clip_id", b.id),))] == "cancelled"
     assert left[("render_clip", (("clip_id", oc.id),))] == "queued"
+    assert left[("analyze_project", (("created", "newer"), ("project_id", p.id)))] == "queued"
+    assert left[("render_clip", (("clip_id", a.id), ("created", "newer")))] == "queued"
+    assert left[("render_clip", (("clip_id", b.id), ("created", tasks.stamp(b.created_at))))] == "cancelled"
 
 
 def test_rerender_replaces_a_waiting_retry_and_stamps_the_job():
@@ -207,14 +214,62 @@ def test_render_swaps_the_new_clip_into_place(tmp_path):
     final = tasks.project_dir(p.id) / "clips" / str(cl.id)
     final.mkdir(parents=True)
     (final / "clip.mp4").write_bytes(b"old render")
+    for name in (f"{cl.id}.part-dead0001", f"{cl.id}.old-dead0002", f"{cl.id + 1000}.part-busy0003"):
+        (final.parent / name).mkdir()  # left by a crash or a redeploy (the last one is another clip's)
+        (final.parent / name / "clip.mp4").write_bytes(b"x" * 1000)
     tasks.render_clip({"clip_id": cl.id, "created": tasks.stamp(cl.created_at)})
     with session_scope() as s:
         c = s.get(Clip, cl.id)
         assert (c.status, c.error, c.video_path) == ("ready", None, str(final / "clip.mp4"))
     assert media.probe(final / "clip.mp4").duration == pytest.approx(10.0, abs=0.2)
     assert (final / "thumb.jpg").exists()
-    assert sorted(d.name for d in final.parent.iterdir()) == [str(cl.id)]
+    assert sorted(d.name for d in final.parent.iterdir()) == sorted([str(cl.id), f"{cl.id + 1000}.part-busy0003"])
     assert tasks._inflight.get(cl.id) is None
+
+
+def test_failed_swap_puts_the_old_clip_back(tmp_path, monkeypatch):
+    p = _project(source_path=str(tmp_path / "src.mp4"))
+    cl = _clip(p.id, status="ready")
+    final = tasks.project_dir(p.id) / "clips" / str(cl.id)
+    final.mkdir(parents=True)
+    (final / "clip.mp4").write_bytes(b"the clip on screen")
+
+    def fake_render(spec, on_progress=None):
+        spec.out_path.write_bytes(b"new")
+
+    monkeypatch.setattr(tasks.render, "render", fake_render)
+    monkeypatch.setattr(tasks.media, "make_thumbnail", lambda *a, **k: None)
+    monkeypatch.setattr(tasks.media, "probe", lambda path: media.MediaInfo(
+        duration=20.0, width=640, height=360, fps=30.0, has_audio=False))
+    real_replace = tasks.os.replace
+
+    def replace(a, b):
+        if ".part-" in str(a):
+            raise OSError("disk trouble")
+        return real_replace(a, b)
+
+    monkeypatch.setattr(tasks.os, "replace", replace)
+    monkeypatch.setattr(tasks, "_face_track", lambda *a, **k: reframe.FaceTrack())
+    with pytest.raises(Exception):
+        tasks.render_clip({"clip_id": cl.id, "created": tasks.stamp(cl.created_at)})
+    assert (final / "clip.mp4").read_bytes() == b"the clip on screen"
+    assert sorted(d.name for d in final.parent.iterdir()) == [str(cl.id)]
+
+
+def test_a_dropped_render_does_not_write_the_face_cache(tmp_path, monkeypatch):
+    src = tmp_path / "s.mp4"
+    src.write_bytes(b"x")
+    track = reframe.FaceTrack(times=[0.0], faces=[[(0.5, 0.4, 0.2, 0.3)]])
+    monkeypatch.setattr(reframe, "analyze_faces", lambda *a, **k: track)
+
+    def replaced():
+        raise tasks.ProjectGone(1)
+
+    with pytest.raises(tasks.ProjectGone):
+        tasks._face_track(tmp_path, src, 1.0, 5.0, replaced)
+    assert not (tmp_path / "faces" / "1.000-5.000.json").exists()
+    assert tasks._face_track(tmp_path, src, 1.0, 5.0).times == [0.0]
+    assert (tmp_path / "faces" / "1.000-5.000.json").exists()
 
 
 def test_old_empty_transcript_is_not_reused_once_speech_is_on(tmp_path, monkeypatch):
@@ -282,8 +337,9 @@ def test_refused_upload_does_not_evict_and_idle_empty_uploads_do_not_reserve(sma
         assert c.post("/api/uploads", json={"filename": "d.mp4", "size": CHUNK * 20}).status_code == 507  # still fresh
         with session_scope() as s:  # ... but once it has sat idle, it stops blocking
             u = s.get(Upload, big)
-            old = time.time() - 600
+            old = time.time() - 20 * 60
             os.utime(uploads_api._map(big), (old, old))
+            os.utime(uploads_api._data(big), (old, old))
             u.updated_at = u.updated_at.replace(year=2001)
             s.add(u)
             s.commit()
@@ -369,3 +425,125 @@ def test_restart_before_the_move_rolls_back(small_chunks):
         assert r.status_code == 200
         with session_scope() as s:
             assert Path(s.get(Project, r.json()["id"]).source_path).read_bytes() == data
+
+
+def test_failed_completion_is_undone_and_can_be_retried(small_chunks, monkeypatch):
+    data = os.urandom(CHUNK * 2)
+    with _signed_in(TestClient(app, raise_server_exceptions=False)) as c:
+        uid = c.post("/api/uploads", json={"filename": "f.mp4", "size": len(data)}).json()["id"]
+        _put(c, uid, 0, data[:CHUNK])
+        _put(c, uid, 1, data[CHUNK:])
+        with session_scope() as s:
+            before = len(s.exec(select(Project)).all())
+        real = uploads_api.project_dir
+
+        def broken(pid):  # fails after the project row was committed, before the move
+            raise OSError("volume hiccup")
+
+        monkeypatch.setattr(uploads_api, "project_dir", broken)
+        assert c.post(f"/api/uploads/{uid}/complete", json={"start": False}).status_code == 500
+        monkeypatch.setattr(uploads_api, "project_dir", real)
+        with session_scope() as s:
+            u = s.get(Upload, uid)
+            assert (u.status, u.project_id) == ("uploading", None)
+            assert len(s.exec(select(Project)).all()) == before  # the half-made project is gone
+        r = c.post(f"/api/uploads/{uid}/complete", json={"start": False})
+        assert r.status_code == 200
+        with session_scope() as s:
+            assert Path(s.get(Project, r.json()["id"]).source_path).read_bytes() == data
+
+
+def test_interrupted_completion_is_repaired_without_a_restart(small_chunks):
+    data = os.urandom(CHUNK * 2)
+    with _signed_in(TestClient(app)) as c:
+        uid = c.post("/api/uploads", json={"filename": "g.mp4", "size": len(data)}).json()["id"]
+        _put(c, uid, 0, data[:CHUNK])
+        _put(c, uid, 1, data[CHUNK:])
+        with session_scope() as s:  # a complete() that died half way (no restart since)
+            p = Project(name="g", source_type="upload", source="g.mp4")
+            s.add(p)
+            s.commit()
+            s.refresh(p)
+            u = s.get(Upload, uid)
+            u.status, u.project_id = "completing", p.id
+            s.add(u)
+            s.commit()
+            pid = p.id
+        assert c.get(f"/api/uploads/{uid}").json()["status"] == "uploading"
+        with session_scope() as s:
+            assert s.get(Project, pid) is None
+        assert c.post(f"/api/uploads/{uid}/complete", json={"start": False}).status_code == 200
+
+
+def test_completion_in_progress_is_left_alone(small_chunks):
+    with _signed_in(TestClient(app)) as c:
+        uid = c.post("/api/uploads", json={"filename": "h.mp4", "size": CHUNK}).json()["id"]
+        with session_scope() as s:
+            u = s.get(Upload, uid)
+            u.status = "completing"
+            s.add(u)
+            s.commit()
+        assert uploads_api._claim(uid)  # complete() is working on it right now
+        try:
+            assert c.get(f"/api/uploads/{uid}").json()["status"] == "completing"
+            assert c.delete(f"/api/uploads/{uid}").status_code == 200
+            assert uploads_api.purge_stale_uploads() == 0
+            with session_scope() as s:
+                assert s.get(Upload, uid).status == "completing"
+            assert c.post(f"/api/uploads/{uid}/complete", json={"start": False}).status_code == 409
+        finally:
+            uploads_api._release(uid)
+
+
+def test_evicted_bytes_count_as_free_space(small_chunks, monkeypatch):
+    Usage = namedtuple("Usage", "total used free")
+    free = {"bytes": CHUNK * 100}
+    monkeypatch.setattr(uploads_api.shutil, "disk_usage", lambda p: Usage(0, 0, free["bytes"]))
+    monkeypatch.setattr(get_settings(), "upload_min_free_mb", 0)
+    monkeypatch.setattr(get_settings(), "max_active_uploads", 1)
+    monkeypatch.setattr(uploads_api, "_on_disk", lambda u: CHUNK * 3 if u.id == state["a"] else 0)
+    state = {}
+    with _signed_in(TestClient(app), "evict@example.com") as c:
+        state["a"] = c.post("/api/uploads", json={"filename": "a.mp4", "size": CHUNK * 3}).json()["id"]
+        for i in range(3):
+            assert _put(c, state["a"], i, b"a" * CHUNK).status_code == 200
+        free["bytes"] = CHUNK * 2
+        # 2 chunks free on the volume + 3 that dropping the old upload gives back
+        r = c.post("/api/uploads", json={"filename": "b.mp4", "size": CHUNK * 4})
+        assert r.status_code == 200, r.text
+        assert [u["id"] for u in c.get("/api/uploads").json()] == [r.json()["id"]]
+
+
+def test_start_saves_status_and_job_together(monkeypatch):
+    p = _project(status="draft", source_path="/nowhere/x.mp4")
+    from app.api import projects as projects_api
+
+    with session_scope() as s:
+        row = s.get(Project, p.id)
+
+        def fail_commit():
+            raise RuntimeError("database locked")
+
+        monkeypatch.setattr(s, "commit", fail_commit)
+        with pytest.raises(RuntimeError):
+            projects_api._start(s, row)
+        s.rollback()
+    with session_scope() as s:
+        assert s.get(Project, p.id).status == "draft"  # neither the status ...
+    assert not [j for j in _jobs("analyze_project") if j.payload.get("project_id") == p.id]  # ... nor the job
+    with session_scope() as s:
+        projects_api._start(s, s.get(Project, p.id))
+    with session_scope() as s:
+        assert s.get(Project, p.id).status == "queued"
+    assert [j for j in _jobs("analyze_project") if j.payload.get("project_id") == p.id]
+
+
+def test_a_queued_project_with_no_job_can_be_started_again():
+    from app.api import projects as projects_api
+
+    p = _project(status="queued", source_path="/nowhere/x.mp4")  # left so by a crash in an older version
+    with session_scope() as s:
+        assert projects_api.needs_start(s, s.get(Project, p.id))
+    queue.enqueue("analyze_project", {"project_id": p.id}, delay_seconds=60)
+    with session_scope() as s:
+        assert not projects_api.needs_start(s, s.get(Project, p.id))

@@ -32,6 +32,8 @@ type UploadCtx = {
   cancel: () => void;
   generate: (settings: GenerationSettings) => void; // now, or as soon as the last byte is in
   undoGenerate: () => void;
+  /** What a queued "Generate" will use, so a page that opens again shows the same choice. Null when nothing is queued. */
+  queuedSettings: () => GenerationSettings | null;
   discard: (id: string) => void;
   dismissSlowHint: () => void;
 };
@@ -181,6 +183,7 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
       if (!ok) return;
     }
     clear();
+    if (s.id) setUnfinished((list) => list.filter((x) => x.id !== s.id)); // being deleted: nothing to continue
     void up.cancel().then(loadUnfinished);
   }, [clear, loadUnfinished]);
 
@@ -196,6 +199,7 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
       retry: () => current.current?.retry(),
       generate: (settings: GenerationSettings) => current.current?.finish(settings),
       undoGenerate: () => current.current?.cancelFinish(),
+      queuedSettings: () => current.current?.getSettings() ?? null,
       dismissSlowHint: () => {
         slow.current.dismissed = true;
         setUpload((u) => (u && u.slow ? { ...u, slow: false } : u));
@@ -236,6 +240,8 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     if (phase === "done" && s.project) {
       const project = s.project;
       clear();
+      setUnfinished((list) => list.filter((x) => x.id !== s.id)); // finished: nothing left to continue
+      loadUnfinished();
       setAnnounce("Upload complete. Your clips are being made.");
       void mutate(`/api/projects/${project.id}`, project, { revalidate: false }); // the project page opens without a loading state
       void mutate("/api/projects");

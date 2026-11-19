@@ -37,11 +37,17 @@ def register(kind: str, handler: Handler, on_final_failure: Callable[[dict, str]
         _failure_hooks[kind] = on_final_failure
 
 
-def enqueue(kind: str, payload: dict[str, Any], *, priority: int = 0, delay_seconds: float = 0, max_attempts: int | None = None) -> int:
+def enqueue(kind: str, payload: dict[str, Any], *, priority: int = 0, delay_seconds: float = 0, max_attempts: int | None = None,
+            session=None) -> int | None:
+    """Queue a job. With `session`, the job is only added to it, so it is saved in the same
+    commit as the caller's own changes (both or neither); the id is then not known yet."""
+    job = Job(kind=kind, payload=payload, priority=priority,
+              max_attempts=max_attempts or get_settings().job_max_attempts,
+              run_after=utcnow() + timedelta(seconds=delay_seconds))
+    if session is not None:
+        session.add(job)
+        return None
     with session_scope() as s:
-        job = Job(kind=kind, payload=payload, priority=priority,
-                  max_attempts=max_attempts or get_settings().job_max_attempts,
-                  run_after=utcnow() + timedelta(seconds=delay_seconds))
         s.add(job)
         s.commit()
         s.refresh(job)

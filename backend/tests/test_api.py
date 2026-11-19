@@ -239,6 +239,7 @@ def test_chunked_upload_cancel_limit_and_stale_cleanup(small_chunks, monkeypatch
         # untouched for longer than UPLOAD_TTL_HOURS -> removed, with its bytes
         old = time.time() - (get_settings().upload_ttl_hours + 1) * 3600
         os.utime(root / ids[1] / "received.map", (old, old))
+        os.utime(root / ids[1] / "data.part", (old, old))  # bytes arriving count as activity too
         with session_scope() as s:
             u = s.get(Upload, ids[1])
             u.updated_at = u.created_at = u.created_at - timedelta(days=3)
