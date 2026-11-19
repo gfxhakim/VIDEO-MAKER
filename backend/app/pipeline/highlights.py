@@ -166,8 +166,9 @@ class Scorer:
 
     def _sum(self, key: str, a: float, b: float) -> float:
         cs = self._cs[key]
-        i, j = int(a / self.step), max(int(a / self.step) + 1, int(b / self.step))
-        j = min(j, len(cs) - 1)
+        last = len(cs) - 1  # times past the end (audio a little longer than the video) count as the end
+        i = min(max(0, int(a / self.step)), last)
+        j = min(max(i + 1, int(b / self.step)), last)
         return float(cs[j] - cs[i])
 
     def longest_pause(self, a: float, b: float) -> float:

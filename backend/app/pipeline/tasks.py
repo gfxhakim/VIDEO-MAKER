@@ -6,19 +6,27 @@ analyze_music    bpm / beats / drop for an uploaded song
 
 Each clip renders as its own job, so one bad clip never sinks the whole project and
 renders can run in parallel (WORKER_CONCURRENCY).
+
+Everything that only depends on the source video (transcript, loudness curve, scene cuts,
+face tracks) is cached in the project folder, so changing the style or re-rendering a clip
+does not pay for it again.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 from sqlmodel import select
 
-from ..config import get_settings
+from ..config import effective_cpus, ffmpeg_thread_count, get_settings
 from ..db import session_scope
 from ..models import Clip, MusicTrack, Project, utcnow
 from ..presets import ASPECT_RATIOS, get_caption_style, get_editing_style
@@ -51,6 +59,29 @@ def _stage(project_id: int, stage: str, progress: float) -> None:
     _update_project(project_id, stage=stage, progress=round(progress, 3), status="processing")
 
 
+def _fresh(cache: Path, source: Path) -> bool:
+    """True when a cached analysis file exists, is not empty and is not older than the source video."""
+    try:
+        st = cache.stat()
+        return st.st_size > 0 and st.st_mtime >= source.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _write_json(path: Path, obj) -> None:
+    """Write through a temp file, so a crash can never leave half a cache file that looks valid."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    os.replace(tmp, path)
+
+
+def _load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 # =====================================================================  analyze
 def analyze_project(payload: dict) -> None:
     pid = int(payload["project_id"])
@@ -64,17 +95,22 @@ def analyze_project(payload: dict) -> None:
     # 1. ingest ----------------------------------------------------------------
     _stage(pid, "Fetching video", 0.02)
     if source_type == "url":
-        def dl_progress(f: float):
-            _stage(pid, f"Downloading video {int(f * 100)}%", 0.02 + 0.13 * f)
+        have = Path(source_path) if source_path else None
+        if have and have.is_file() and have.stat().st_size > 0:
+            path = have  # already downloaded (new style or a retry): do not fetch it again
+        else:
+            def dl_progress(f: float):
+                # the app shows the overall percentage next to this text, so say what the number is
+                _stage(pid, f"Downloading video ({int(f * 100)}% of the file)", 0.02 + 0.13 * f)
 
-        path, title = ingest.download_url(source, pdir, dl_progress)
-        with session_scope() as s:
-            p = s.get(Project, pid)
-            if p.name.startswith("http") or not p.name:
-                p.name = title[:120]
-            p.source_path = str(path)
-            s.add(p)
-            s.commit()
+            path, title = ingest.download_url(source, pdir, dl_progress)
+            with session_scope() as s:
+                p = s.get(Project, pid)
+                if p.name.startswith("http") or not p.name:
+                    p.name = title[:120]
+                p.source_path = str(path)
+                s.add(p)
+                s.commit()
     elif source_type == "path":
         path = ingest.resolve_local_path(source, pdir)
         _update_project(pid, source_path=str(path))
@@ -88,39 +124,45 @@ def analyze_project(payload: dict) -> None:
     if info.duration < 8:
         raise media.MediaError("Video is too short (need at least 8 seconds)")
 
-    # 2. audio + transcript -----------------------------------------------------
-    _stage(pid, "Extracting audio", 0.16)
-    wav = pdir / "audio16k.wav"
-    words: list[dict] = []
-    energy = np.zeros(0, dtype=np.float32)
-    if info.has_audio:
-        media.extract_audio(path, wav)
-        pcm = media.load_pcm(wav, sr=16000)
-        energy = audio_analysis.energy_curve(pcm, 16000, ENERGY_STEP)
-        np.save(pdir / "energy.npy", energy)
+    # 2. scene cuts start now, in the background ---------------------------------
+    # They only need the source file, so they run next to audio and transcription
+    # instead of holding the bar at 62% for minutes afterwards.
+    scenes_path = pdir / "scenes.json"
+    cuts = _load_json(scenes_path) if _fresh(scenes_path, path) else None
+    stop_scan = threading.Event()
+    pool = ThreadPoolExecutor(1, thread_name_prefix="scenes")
+    scan: Future | None = None
+    if not isinstance(cuts, list):
+        cuts = None
+        spare = max(1, effective_cpus() - transcribe.whisper_cpu_threads())
+        scan = pool.submit(media.scan_scene_changes, path, threads=min(spare, ffmpeg_thread_count()), stop=stop_scan)
 
-        tpath = pdir / "transcript.json"
-        if tpath.exists():
-            tr = json.loads(tpath.read_text())
-        else:
-            _stage(pid, "Transcribing speech (Whisper)", 0.2)
+    try:
+        # 3. audio + transcript -------------------------------------------------
+        words: list[dict] = []
+        energy = np.zeros(0, dtype=np.float32)
+        if info.has_audio:
+            energy, words = _analyze_audio(pid, pdir, path, info, settings)
+            # an audio track can run a little longer than the picture: never clip past the end
+            words = [w for w in words if w["start"] < info.duration]
 
-            def tr_progress(f: float):
-                _stage(pid, f"Transcribing speech {int(f * 100)}%", 0.2 + 0.4 * f)
+        # 4. visual activity ----------------------------------------------------
+        if scan is not None:
+            _stage(pid, "Detecting scene changes", 0.62)
+            try:
+                cuts = scan.result()
+                _write_json(scenes_path, cuts)
+            except media.MediaError as e:  # only costs the "action" part of the score
+                log.warning("%s", e)
+                cuts = []
+    finally:
+        stop_scan.set()  # if anything above failed, end the background ffmpeg too
+        pool.shutdown(wait=True)
 
-            tr = transcribe.transcribe(wav, settings.get("language"), tr_progress, info.duration)
-            tpath.write_text(json.dumps(tr))
-        words = tr.get("words", [])
-
-    # 3. visual activity ------------------------------------------------------
-    _stage(pid, "Detecting scene changes", 0.62)
-    cuts = media.detect_scene_changes(path)
-    (pdir / "scenes.json").write_text(json.dumps(cuts))
-
-    # 4. scoring --------------------------------------------------------------
+    # 5. scoring --------------------------------------------------------------
     _stage(pid, "Scoring viral moments", 0.68)
     chosen = highlights.select_highlights(
-        duration=info.duration, words=words, energy_db=energy, energy_step=ENERGY_STEP, scene_cuts=cuts,
+        duration=info.duration, words=words, energy_db=energy, energy_step=ENERGY_STEP, scene_cuts=cuts or [],
         count=int(settings.get("clip_count", 20)), min_len=float(settings.get("min_duration", 15)),
         max_len=float(settings.get("max_duration", 60)),
     )
@@ -130,7 +172,9 @@ def analyze_project(payload: dict) -> None:
     music_ids = list(settings.get("music_track_ids") or [])
     with session_scope() as s:
         # re-runs replace earlier clips
+        old_ids = []
         for old in s.exec(select(Clip).where(Clip.project_id == pid)).all():
+            old_ids.append(old.id)
             s.delete(old)
         s.commit()
         clip_ids = []
@@ -147,9 +191,69 @@ def analyze_project(payload: dict) -> None:
             s.commit()
             s.refresh(clip)
             clip_ids.append(clip.id)
+    # the files of replaced clips (15-25 MB each) and face tracks nobody uses any more
+    for oid in old_ids:
+        shutil.rmtree(pdir / "clips" / str(oid), ignore_errors=True)
+    keep = {_face_cache_name(round(c.start, 3), round(c.end, 3)) for c in chosen}
+    for f in (pdir / "faces").glob("*.json"):
+        if f.name not in keep:
+            f.unlink(missing_ok=True)
+
     _update_project(pid, stage=f"Rendering {len(clip_ids)} clips", progress=0.7, status="processing")
     for i, cid in enumerate(clip_ids):
         enqueue("render_clip", {"clip_id": cid}, priority=-i)
+
+
+def _analyze_audio(pid: int, pdir: Path, path: Path, info, settings: dict) -> tuple[np.ndarray, list[dict]]:
+    """Loudness curve and word-level transcript for the source, reusing earlier results."""
+    epath, tpath = pdir / "energy.npy", pdir / "transcript.json"
+    backend = get_settings().transcribe_backend.lower()
+    language = settings.get("language") or None
+
+    tr = _load_json(tpath) if _fresh(tpath, path) else None
+    if isinstance(tr, dict):
+        # made with another engine or for another language: do it again
+        if tr.get("backend", backend) != backend or tr.get("requested_language", language) != language:
+            tr = None
+    else:
+        tr = None
+    energy = None
+    if _fresh(epath, path):
+        try:
+            energy = np.load(epath)
+        except (OSError, ValueError):
+            energy = None
+
+    if tr is None or energy is None:
+        wav = pdir / "audio16k.wav"
+        try:
+            _stage(pid, "Extracting audio", 0.16)
+            media.extract_audio(path, wav, duration=info.duration,
+                                on_progress=lambda f: _stage(pid, "Extracting audio", 0.16 + 0.04 * f))
+            if energy is None:
+                try:
+                    energy = audio_analysis.energy_curve_wav(wav, ENERGY_STEP)
+                except (ValueError, EOFError, OSError):  # not the WAV we expected: let ffmpeg decode it
+                    energy = audio_analysis.energy_curve(media.load_pcm(wav, sr=16000), 16000, ENERGY_STEP)
+                tmp = epath.with_name("energy.npy.tmp")
+                with open(tmp, "wb") as fh:
+                    np.save(fh, energy)
+                os.replace(tmp, epath)
+            if tr is None:
+                _stage(pid, "Transcribing speech (Whisper)", 0.2)
+
+                minutes = int(-(-info.duration // 60))
+
+                def tr_progress(f: float):
+                    where = f", minute {min(minutes, int(f * info.duration / 60) + 1)} of {minutes}" if minutes > 2 else ""
+                    _stage(pid, f"Transcribing speech{where}", 0.2 + 0.4 * f)
+
+                tr = transcribe.transcribe(wav, language, tr_progress, info.duration)
+                tr["backend"], tr["requested_language"] = backend, language
+                _write_json(tpath, tr)
+        finally:
+            wav.unlink(missing_ok=True)  # ~115 MB per hour of video, and nothing reads it again
+    return energy, tr.get("words", [])
 
 
 # =====================================================================  render
@@ -181,6 +285,43 @@ def _hook_time(words: list[dict], dur: float) -> float:
     return min(1.5, dur / 4)
 
 
+def _face_cache_name(start: float, end: float) -> str:
+    return f"{start:.3f}-{end:.3f}.json"
+
+
+def _face_track(pdir: Path, source: Path, start: float, end: float) -> reframe.FaceTrack:
+    """Face positions for one clip. Cached, so a new caption style or hook title does not redo the detection."""
+    cache = pdir / "faces" / _face_cache_name(start, end)
+    data = _load_json(cache) if _fresh(cache, source) else None
+    if isinstance(data, dict) and data.get("times"):  # an unreadable or empty file is a miss, not "no faces"
+        try:
+            return reframe.FaceTrack.from_dict(data)
+        except (ValueError, TypeError, IndexError, KeyError, AttributeError):
+            pass
+    track = reframe.analyze_faces(source, start, end)
+    if track.times:
+        try:
+            cache.parent.mkdir(exist_ok=True)
+            _write_json(cache, track.to_dict())
+        except OSError:
+            log.debug("could not save face track", exc_info=True)
+    return track
+
+
+# Clips being rendered right now: clip id -> (project id, fraction done). Kept in memory
+# (not a column) so the progress bar can move during a render without a schema change.
+_inflight: dict[int, tuple[int, float]] = {}
+_inflight_lock = threading.Lock()
+_last_progress_write: dict[int, float] = {}
+FACE_SHARE = 0.12  # rough share of a clip's time spent finding faces before ffmpeg starts
+
+
+def _set_inflight(cid: int, pid: int, fraction: float) -> None:
+    with _inflight_lock:
+        _inflight[cid] = (pid, max(0.0, min(1.0, fraction)))
+    refresh_project_progress(pid, throttle=True)
+
+
 def render_clip(payload: dict) -> None:
     cid = int(payload["clip_id"])
     s_cfg = get_settings()
@@ -200,6 +341,7 @@ def render_clip(payload: dict) -> None:
         music_info = (Path(music.path), music.drop_time) if music else None
 
     try:
+        _set_inflight(cid, pid, 0.0)
         pdir = project_dir(pid)
         work = pdir / "clips" / f"{cid}"
         if work.exists():
@@ -218,13 +360,15 @@ def render_clip(payload: dict) -> None:
 
         # reframe
         layout = style.get("layout", "face_track")
-        track = reframe.FaceTrack() if layout in ("center", "blur_fill") else reframe.analyze_faces(source, start, end)
+        track = reframe.FaceTrack() if layout in ("center", "blur_fill") else _face_track(pdir, source, start, end)
+        _set_inflight(cid, pid, FACE_SHARE)
         zooms = _emphasis_windows(words, energy, start) if style.get("zoom_on_emphasis") else []
         lay = reframe.build_layout(layout, src_w=info.width, src_h=info.height, out_w=out_w, out_h=out_h,
                                    track=track, style=style, zoom_windows=zooms)
 
         spec = render.RenderSpec(source=source, start=start, end=end, out_path=work / "clip.mp4", work_dir=work,
-                                 video_filter=lay.filter, out_w=out_w, out_h=out_h, has_audio=info.has_audio)
+                                 video_filter=lay.filter, out_w=out_w, out_h=out_h, has_audio=info.has_audio,
+                                 fps=info.fps)
 
         # captions
         caption_y = settings.get("caption_position") or style.get("caption_y", 0.62)
@@ -257,7 +401,7 @@ def render_clip(payload: dict) -> None:
             spec.music = render.MusicSpec(path=mpath, offset=offset, volume=float(settings.get("music_volume", 0.18)),
                                           ducking=bool(settings.get("ducking", True)))
 
-        render.render(spec)
+        render.render(spec, lambda f: _set_inflight(cid, pid, FACE_SHARE + (1 - FACE_SHARE) * f))
         thumb = media.make_thumbnail(spec.out_path, work / "thumb.jpg", at=min(1.5, dur / 2))
         with session_scope() as s:
             clip = s.get(Clip, cid)
@@ -275,10 +419,23 @@ def render_clip(payload: dict) -> None:
                 s.commit()
         raise
     finally:
+        with _inflight_lock:
+            _inflight.pop(cid, None)
         refresh_project_progress(pid)
 
 
-def refresh_project_progress(pid: int, final: bool = False) -> None:
+def refresh_project_progress(pid: int, final: bool = False, throttle: bool = False) -> None:
+    """Recompute the project's progress and stage from its clips.
+
+    `throttle=True` is for the once-a-second ticks during a render: it skips the write if
+    this project was updated less than a second ago.
+    """
+    with _inflight_lock:
+        now = time.monotonic()
+        if throttle and now - _last_progress_write.get(pid, 0.0) < 1.0:
+            return
+        _last_progress_write[pid] = now
+        running = [f for (p_id, f) in _inflight.values() if p_id == pid]
     with session_scope() as s:
         p = s.get(Project, pid)
         clips = s.exec(select(Clip).where(Clip.project_id == pid)).all()
@@ -286,18 +443,42 @@ def refresh_project_progress(pid: int, final: bool = False) -> None:
             return
         done = [c for c in clips if c.status in ("ready", "failed")]
         ready = [c for c in clips if c.status == "ready"]
-        p.progress = round(0.7 + 0.3 * len(done) / len(clips), 3)
-        if len(done) == len(clips):
+        n = len(clips)
+        if len(done) == n:
             p.status = "done" if ready else "failed"
-            p.stage = f"{len(ready)} of {len(clips)} clips ready"
+            p.stage = f"{len(ready)} of {n} clips ready"
             if not ready:
                 p.error = "All clip renders failed: " + (clips[0].error or "")[:300]
             p.progress = 1.0
         else:
-            p.stage = f"Rendered {len(done)} of {len(clips)} clips"
+            running = running[: n - len(done)]
+            p.progress = round(0.7 + 0.3 * (len(done) + sum(running)) / n, 3)
+            # no percentage in the text: the app shows the overall one right next to it
+            if len(running) == 1:
+                p.stage = f"Rendering clip {len(done) + 1} of {n}"
+            elif running:
+                p.stage = f"Rendering clips {len(done) + 1} to {len(done) + len(running)} of {n}"
+            else:
+                p.stage = f"Rendered {len(done)} of {n} clips"
         p.updated_at = utcnow()
         s.add(p)
         s.commit()
+
+
+def fail_clip(payload: dict, error: str) -> None:
+    """A render job that was interrupted on its last attempt: stop its clip showing 'rendering' forever."""
+    if not payload.get("clip_id"):
+        return
+    pid = None
+    with session_scope() as s:
+        clip = s.get(Clip, int(payload["clip_id"]))
+        if clip and clip.status != "ready":
+            clip.status, clip.error = "failed", error[-800:]
+            s.add(clip)
+            s.commit()
+            pid = clip.project_id
+    if pid:
+        refresh_project_progress(pid)
 
 
 def fail_project(payload: dict, error: str) -> None:

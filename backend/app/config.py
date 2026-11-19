@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # worker
     embedded_worker: bool = True
-    worker_concurrency: int = 1
+    worker_concurrency: int = 0  # jobs run side by side; 0 = decide from the CPU cores and memory available
     worker_poll_seconds: float = 1.5
     job_max_attempts: int = 3
 
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
     ffmpeg_preset: str = "veryfast"
-    ffmpeg_crf: int = 18
+    ffmpeg_crf: int = 21  # 18 made ~35% larger files for no visible gain on a phone screen
     ffmpeg_threads: int = 0
     output_width: int = 1080
     output_height: int = 1920
@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     whisper_model: str = "base"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
-    whisper_threads: int = 0  # 0 = let CTranslate2 decide
+    whisper_threads: int = 0  # 0 = auto (leaves a core for the scene scan that runs alongside)
 
     # uploads (chunked + resumable, see api/uploads.py)
     # One chunk = one short request. Railway's proxy requires a request body to finish
@@ -149,6 +149,42 @@ def get_settings() -> Settings:
             key_file.write_text(secrets.token_urlsafe(48))
         s.app_secret_key = key_file.read_text().strip()
     return s
+
+
+@lru_cache
+def memory_limit_bytes() -> int:
+    """Memory this process may use: the container limit if there is one, else the machine's RAM. 0 = unknown."""
+    for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = Path(f).read_text().strip()
+            if raw.isdigit() and 0 < int(raw) < 1 << 60:  # cgroup v1 reports a huge number for "no limit"
+                return int(raw)
+        except OSError:
+            pass
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def auto_worker_concurrency() -> int:
+    """How many jobs to run at once when WORKER_CONCURRENCY is 0.
+
+    One render already uses about three cores, so a second worker only pays off from
+    4 cores up. Each 1080x1920 render needs roughly 0.5 GB and the speech model plus a
+    long video's audio can take 1.5 GB, so memory caps it too.
+    """
+    by_cpu = min(3, effective_cpus() // 2)
+    mem = memory_limit_bytes()
+    by_mem = 3 if not mem else int(mem // (2 * 1024**3))
+    return max(1, min(by_cpu, by_mem))
+
+
+def worker_count() -> int:
+    return get_settings().worker_concurrency or auto_worker_concurrency()
 
 
 def ffmpeg_thread_count() -> int:

@@ -29,8 +29,10 @@ Optional variables (**Variables** tab):
 | Variable | Default | What it does |
 |---|---|---|
 | `WHISPER_MODEL` | `base` | `tiny` is fastest, `small` is more accurate but needs more RAM and CPU. |
-| `WORKER_CONCURRENCY` | `1` | Clips rendered at the same time. Raise it only on a plan with several vCPUs. |
+| `WORKER_CONCURRENCY` | `0` (auto) | Clips rendered at the same time. Auto picks 1 below 4 vCPUs or 4 GB RAM, up to 3 on bigger plans. |
 | `FFMPEG_PRESET` | `veryfast` | `medium` gives smaller files at the same quality but renders slower. |
+| `FFMPEG_CRF` | `21` | Quality. Lower is sharper and bigger; `18` makes files about a third larger. |
+| `CPU_LIMIT` | auto | Set it to your plan's vCPU count if `/api/health` reports more `cpus` than you pay for. |
 | `ALLOW_SIGNUP` | `false` | Set `true` to let more people create their own accounts. |
 | `APP_SECRET_KEY` | auto | Session signing key. Generated into `/data/secret.key` if you leave it empty. |
 
@@ -76,7 +78,7 @@ Or run the production image locally: `docker build -t autoclip . && docker run -
    stacked lead line + keyword, and auto emoji (Twemoji) keyed off the spoken words.
 6. **Music**: upload several songs; each is analyzed for tempo, beats and the drop. Songs rotate across clips, the drop
    lands on the clip's hook, and a sidechain compressor ducks the music whenever someone speaks.
-7. **Render**: one FFmpeg pass per clip, H.264 CRF 18, AAC 192k, `+faststart`, 1080×1920.
+7. **Render**: one FFmpeg pass per clip, H.264 CRF 21, AAC 192k, `+faststart`, 1080×1920.
 8. **Review and post**: approve or reject, edit titles and hashtags, copy the caption for each platform, download, and mark where you posted.
 
 Each step is a durable job in a SQLite-backed queue with retries and backoff. Each clip renders as its own job,

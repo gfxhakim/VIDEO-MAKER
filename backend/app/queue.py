@@ -19,12 +19,14 @@ from typing import Any, Callable
 from sqlalchemy import text
 from sqlmodel import select
 
-from .config import get_settings
+from .config import get_settings, worker_count
 from .db import engine, session_scope
 from .models import Job, utcnow
 
 log = logging.getLogger("autoclip.queue")
 Handler = Callable[[dict], None]
+INTERRUPTED_ERROR = ("The server restarted while this was running, several times in a row. "
+                     "It may have run out of memory: try a shorter video or fewer clips.")
 _handlers: dict[str, Handler] = {}
 _failure_hooks: dict[str, Callable[[dict, str], None]] = {}
 
@@ -69,15 +71,36 @@ def _claim(worker_id: str) -> Job | None:
 
 
 def recover_stale_jobs() -> int:
-    """Jobs left 'running' by a crashed/stopped worker go back to the queue."""
+    """Jobs left 'running' by a crashed/stopped worker go back to the queue.
+
+    A job that has already used every attempt is failed instead. Without this a job that
+    kills the whole process (out of memory on a very long video, say) would be picked up
+    again on every restart, forever.
+    """
+    requeued = 0
+    dead: list[tuple[str, dict]] = []
     with session_scope() as s:
         stale = s.exec(select(Job).where(Job.status == "running")).all()
         for j in stale:
-            j.status = "queued"
             j.locked_by = None
+            if j.attempts >= j.max_attempts:
+                j.status, j.finished_at = "failed", utcnow()
+                j.error = (j.error or "") or INTERRUPTED_ERROR
+                dead.append((j.kind, dict(j.payload or {})))
+            else:
+                j.status = "queued"
+                requeued += 1
             s.add(j)
         s.commit()
-        return len(stale)
+    for kind, payload in dead:
+        log.error("job of kind %s was interrupted on its last attempt; marking it failed", kind)
+        hook = _failure_hooks.get(kind)
+        if hook:
+            try:
+                hook(payload, INTERRUPTED_ERROR)
+            except Exception:  # noqa: BLE001
+                log.exception("failure hook crashed")
+    return requeued
 
 
 def _run_one(job: Job) -> None:
@@ -116,7 +139,7 @@ def _run_one(job: Job) -> None:
 
 class Worker:
     def __init__(self, concurrency: int | None = None):
-        self.concurrency = max(1, concurrency or get_settings().worker_concurrency)
+        self.concurrency = max(1, concurrency or worker_count())
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self.id = f"{socket.gethostname()}:{os.getpid()}"

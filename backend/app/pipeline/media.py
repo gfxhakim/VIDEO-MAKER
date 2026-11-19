@@ -5,13 +5,17 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-from ..config import get_settings
+from ..config import ffmpeg_thread_count, get_settings, nice_prefix
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +51,69 @@ def run(cmd: Sequence[str], *, timeout: float | None = None) -> subprocess.Compl
     return proc
 
 
+def run_progress(cmd: Sequence[str], total_seconds: float, on_progress: Optional[Callable[[float], None]] = None, *,
+                 timeout: float | None = None, cwd: str | Path | None = None) -> None:
+    """Run an ffmpeg command and report how far through `total_seconds` of output it is.
+
+    ffmpeg writes machine-readable progress to stdout (-progress pipe:1), so the command
+    must not use stdout for its own output. `on_progress` gets a 0..1 fraction at most
+    once a second; an error inside it never stops the encode.
+    """
+    cmd = list(map(str, cmd))
+    try:
+        at = cmd.index(get_settings().ffmpeg_bin) + 1
+    except ValueError:
+        at = 1
+    cmd[at:at] = ["-progress", "pipe:1", "-nostats"]
+    name = Path(cmd[at - 1]).name
+    log.debug("run: %s", " ".join(cmd))
+    timed_out = threading.Event()
+    with tempfile.TemporaryFile() as err:  # stderr goes to a file: a full pipe would stall ffmpeg
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, cwd=cwd)
+
+        def _kill() -> None:
+            timed_out.set()
+            proc.kill()
+
+        timer = threading.Timer(timeout, _kill) if timeout else None
+        if timer:
+            timer.daemon = True
+            timer.start()
+        last = 0.0
+        try:
+            for raw in proc.stdout:  # type: ignore[union-attr]
+                key, _, val = raw.decode("ascii", "replace").strip().partition("=")
+                if key != "out_time_us" and key != "out_time_ms":  # both are microseconds
+                    continue
+                now = time.monotonic()
+                if not on_progress or total_seconds <= 0 or now - last < 1.0:
+                    continue
+                try:
+                    frac = int(val) / 1e6 / total_seconds
+                except ValueError:  # "N/A" before the first frame
+                    continue
+                last = now
+                try:
+                    on_progress(max(0.0, min(1.0, frac)))
+                except Exception:  # noqa: BLE001
+                    log.debug("progress callback failed", exc_info=True)
+            proc.wait()
+        finally:
+            if timer:
+                timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if proc.stdout:
+                proc.stdout.close()
+        if timed_out.is_set():
+            raise MediaError(f"{name} timed out after {timeout:.0f}s")
+        if proc.returncode != 0:
+            err.seek(0)
+            tail = err.read().decode(errors="replace")[-2000:]
+            raise MediaError(f"{name} failed ({proc.returncode}): {tail}")
+
+
 def probe(path: str | Path) -> MediaInfo:
     s = get_settings()
     out = run([s.ffprobe_bin, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)])
@@ -72,9 +139,15 @@ def probe(path: str | Path) -> MediaInfo:
     return MediaInfo(duration=duration, width=w, height=h, fps=fps or 30.0, has_audio=a is not None)
 
 
-def extract_audio(src: str | Path, dst: str | Path, sr: int = 16000) -> Path:
+def extract_audio(src: str | Path, dst: str | Path, sr: int = 16000, *, duration: float = 0.0,
+                  on_progress: Optional[Callable[[float], None]] = None) -> Path:
     s = get_settings()
-    run([s.ffmpeg_bin, "-y", "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(dst)])
+    cmd = [*nice_prefix(), s.ffmpeg_bin, "-y", "-v", "error", "-threads", str(ffmpeg_thread_count()), "-i", str(src),
+           "-vn", "-sn", "-dn", "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(dst)]
+    if on_progress and duration > 0:
+        run_progress(cmd, duration, on_progress)
+    else:
+        run(cmd)
     return Path(dst)
 
 
@@ -91,31 +164,70 @@ def load_pcm(path: str | Path, sr: int = 16000, start: float | None = None, dura
     return np.frombuffer(out.stdout, dtype=np.float32)
 
 
-def detect_scene_changes(src: str | Path, threshold: float = 0.32) -> list[float]:
-    """Timestamps of hard cuts. Runs on a tiny 2 fps proxy so it is cheap."""
+def scan_scene_changes(src: str | Path, threshold: float = 0.32, *, threads: int | None = None,
+                       stop: threading.Event | None = None) -> list[float]:
+    """Timestamps of hard cuts. Raises MediaError if ffmpeg fails or the scan is stopped.
+
+    The comparison runs on 2 fps, 160 px wide frames, but ffmpeg still has to decode every
+    frame of the source to get there, so this costs 1.5 to 3 minutes per hour of 1080p
+    video. It needs nothing but the source file, which is why analyze_project runs it in
+    the background next to transcription. Set `stop` to end it early.
+    """
     s = get_settings()
     cmd = [
-        s.ffmpeg_bin, "-v", "info", "-i", str(src), "-an",
+        *nice_prefix(), s.ffmpeg_bin, "-hide_banner", "-nostats", "-v", "info",
+        "-threads", str(threads or ffmpeg_thread_count()), "-i", str(src), "-an", "-sn", "-dn",
         "-vf", f"fps=2,scale=160:-2,select='gt(scene,{threshold})',showinfo", "-f", "null", "-",
     ]
-    try:
-        proc = run(cmd)
-    except MediaError as e:
-        log.warning("scene detection failed: %s", e)
-        return []
+    log.debug("run: %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if stop is not None:
+        def _watch() -> None:
+            while proc.poll() is None:
+                if stop.wait(0.5):
+                    proc.kill()
+                    return
+
+        threading.Thread(target=_watch, daemon=True, name="scene-scan-watch").start()
     times: list[float] = []
-    for line in proc.stderr.decode(errors="replace").splitlines():
-        if "pts_time:" in line:
-            try:
-                times.append(float(line.split("pts_time:")[1].split()[0]))
-            except (IndexError, ValueError):
-                pass
+    tail: deque[str] = deque(maxlen=12)
+    try:
+        for raw in proc.stderr:  # type: ignore[union-attr]
+            line = raw.decode(errors="replace")
+            if "pts_time:" in line:
+                try:
+                    times.append(float(line.split("pts_time:")[1].split()[0]))
+                except (IndexError, ValueError):
+                    pass
+            else:
+                tail.append(line)
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if proc.stderr:
+            proc.stderr.close()
+    if stop is not None and stop.is_set():
+        raise MediaError("scene detection was stopped")
+    if proc.returncode != 0:
+        raise MediaError(f"scene detection failed ({proc.returncode}): {''.join(tail)[-1500:]}")
     return times
+
+
+def detect_scene_changes(src: str | Path, threshold: float = 0.32) -> list[float]:
+    """scan_scene_changes(), but a failure only costs the "action" score: it returns []."""
+    try:
+        return scan_scene_changes(src, threshold)
+    except MediaError as e:
+        log.warning("%s", e)
+        return []
 
 
 def make_thumbnail(video: str | Path, dst: str | Path, at: float = 1.0) -> Path:
     s = get_settings()
-    run([s.ffmpeg_bin, "-y", "-v", "error", "-ss", f"{at:.2f}", "-i", str(video), "-frames:v", "1", "-vf", "scale=360:-2", "-q:v", "4", str(dst)])
+    run([s.ffmpeg_bin, "-y", "-v", "error", "-threads", "2", "-ss", f"{at:.2f}", "-i", str(video), "-an", "-frames:v", "1",
+         "-vf", "scale=360:-2", "-q:v", "4", str(dst)])
     return Path(dst)
 
 

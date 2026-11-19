@@ -7,5 +7,5 @@ from .queue import register
 
 def register_all() -> None:
     register("analyze_project", tasks.analyze_project, on_final_failure=tasks.fail_project)
-    register("render_clip", tasks.render_clip)
+    register("render_clip", tasks.render_clip, on_final_failure=tasks.fail_clip)
     register("analyze_music", tasks.analyze_music)
