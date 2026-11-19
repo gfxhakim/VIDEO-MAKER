@@ -74,9 +74,9 @@ Or run the production image locally: `docker build -t autoclip . && docker run -
    (laughs, shouts), emotional words, dead air (penalty), visual cuts and whether it ends on a full sentence (`backend/app/pipeline/highlights.py`).
 4. **Reframe (`9:16`, `4:5`, `1:1`, `16:9`)**: OpenCV YuNet face detection (with Haar fallback), scene-cut-aware smoothing, and punch-in zooms (optionally synced to music beats). Layouts: face tracking with punch-in zooms, locked talking head,
    podcast split-screen, gameplay + facecam, speaker + looping B-roll split, blurred fill with hook title, center crop.
-5. **Captions & Polish**: ASS subtitles from word timestamps with pixel-accurate wrapping, active-word highlight, bounce, keyword colors, neon glow, boxed pill, stacked lead line + keyword, iOS auto-emojis (`backend/assets/emoji/`), themed hook cards, optional silence jump-cutting, retention progress bar, watermark handle, `-14 LUFS` loudness normalization, and noise cleanup.
+5. **Trending Effects, Speed, Captions & Polish**: choose from 10 curated clipper video effects (`backend/app/presets/video_effects.json` — HDR Crisp, Hook Flash, RGB Glitch Burst, Blur Reveal, Impact Shake, Dark Podcast Studio, Warm Halation Bloom, 35mm Grain, VHS Retro, B&W Noir) plus `0.9x–1.25x` clip pacing before or after generating. ASS subtitles feature pixel-accurate wrapping, active-word highlight, bounce, keyword colors, neon glow, boxed pill, stacked lead line + keyword, Apple iOS auto-emojis (`backend/assets/emoji/`), themed hook cards, silence jump-cutting, retention progress bar, watermark handle, `-14 LUFS` loudness normalization, and noise cleanup.
 6. **Music & B-Roll**: upload songs (auto BPM, beat grid, and drop detection with manual drop override) and looping B-roll videos; sidechain ducking lowers music under speech.
-7. **Edit, review & post**: trim start/end timestamps, fix burned-in transcript words, override styles per clip, create manual clips from the transcript, pick custom cover frames, bulk-approve/reject, export `.MP4` + captions + `.SRT` ZIP, and free raw source video storage when done.
+7. **Edit, batch-style, review & post**: after generating, customize per-clip video effects, speed, music track/volume, audio polish, captions, trim timestamps (with Snap to speech end), fix burned-in transcript words, batch-apply FX/music across selected clips, create manual clips from the transcript, pick custom cover frames, export `.MP4` + captions + `.SRT` ZIP, and free raw source video storage when done.
 
 Each step is a durable job in a SQLite-backed queue with retries and backoff. Each clip renders as its own job,
 so one bad clip never sinks a run, and interrupted jobs resume after a restart.
@@ -85,6 +85,7 @@ so one bad clip never sinks a run, and interrupted jobs resume after a restart.
 
 - `backend/app/presets/editing_styles.json`: layout, zoom, smoothing, caption position, hook card.
 - `backend/app/presets/caption_styles.json`: font, size, colors, stroke, glow, bounce, words per phrase, mode.
+- `backend/app/presets/video_effects.json`: trending color grades, hook flashes, RGB glitch, blur reveal & shake FX.
 - `backend/app/presets/emoji_map.json`: spoken keyword → iOS emoji (`python scripts/download_emojis.py` refreshes Apple artwork).
 
 ## Tests

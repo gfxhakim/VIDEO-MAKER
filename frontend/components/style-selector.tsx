@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import useSWR from "swr";
-import { CaptionsOff, Check, ExternalLink, Film, Music2, Plus, RotateCw, SlidersHorizontal, Sparkles } from "lucide-react";
+import { CaptionsOff, Check, ExternalLink, Film, Gauge, Music2, Plus, RotateCw, SlidersHorizontal, Sparkles, Wand2 } from "lucide-react";
 import { CaptionPreview } from "@/components/caption-preview";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,6 +18,7 @@ import {
   type HookCardStyle,
   type MusicTrack,
   type Presets,
+  type VideoEffect,
   type WatermarkPosition,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -168,6 +169,8 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
   const { data: music } = useSWR<MusicTrack[]>("/api/music", fetcher);
   const { data: broll } = useSWR<BrollClip[]>("/api/broll", fetcher);
   const [peek, setPeek] = useState<string | null>(null);
+  const [peekFx, setPeekFx] = useState<string | null>(null);
+  const [fxTab, setFxTab] = useState<"all" | "hook" | "grade" | "retro">("all");
   const [hover, setHover] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const set = <K extends keyof GenerationSettings>(k: K, v: GenerationSettings[K]) => onChange({ ...value, [k]: v });
@@ -185,6 +188,27 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
   }
 
   const shown = presets.editing_styles.find((s) => s.key === peek) ?? presets.editing_styles.find((s) => s.key === value.editing_style);
+  const allEffects: VideoEffect[] = presets.video_effects ?? [
+    { key: "none", name: "Clean Original", category: "Base", badge: "Natural", description: "Original camera colors.", preview_filter: "none", preview_tint: "" },
+  ];
+  const currentFxKey = value.video_effect || "none";
+  const shownFx = allEffects.find((f) => f.key === peekFx) ?? allEffects.find((f) => f.key === currentFxKey) ?? allEffects[0];
+  const visibleEffects = allEffects.filter((f) => {
+    if (fxTab === "all") return true;
+    if (fxTab === "hook") return f.key === "none" || f.category === "Hook FX" || f.category === "Motion FX" || f.category === "Trending 2026";
+    if (fxTab === "grade") return f.key === "none" || f.category === "Color Grade" || f.category === "Trending 2026";
+    return f.key === "none" || f.category === "Retro" || f.category === "Filmic" || f.category === "Mood";
+  });
+  const speeds = presets.playback_speeds ?? [
+    { value: 0.9, label: "0.9x Slow" },
+    { value: 1.0, label: "1.0x Normal" },
+    { value: 1.05, label: "1.05x Tight" },
+    { value: 1.1, label: "1.1x Viral" },
+    { value: 1.15, label: "1.15x Fast" },
+    { value: 1.25, label: "1.25x Rapid" },
+  ];
+  const currentSpeed = value.playback_speed ?? 1.0;
+
   const activeStyle = presets.editing_styles.find((s) => s.key === value.editing_style);
   const hookOn = !!(value.hook_title || activeStyle?.hook_card);
   const isBroll = activeStyle?.layout === "broll_split";
@@ -384,10 +408,115 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
           </section>
         )}
 
-        {/* 3. Shape + 4. Length */}
+        {/* 3. Trending clipper video effects & clip pacing */}
+        <section>
+          <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+            <Heading
+              hint="Applied to the footage only — captions & iOS emojis stay vivid on top."
+              className="mb-0"
+            >
+              <span className="inline-flex items-center gap-1.5"><Wand2 className="size-4 text-primary" /> 3. Trending clipper effects</span>
+            </Heading>
+            <div role="tablist" aria-label="Filter effect categories" className="flex flex-wrap gap-1 rounded-full bg-white/[.04] p-0.5 text-[11px]">
+              {(
+                [
+                  { id: "all", label: "All FX" },
+                  { id: "hook", label: "Hook & Motion" },
+                  { id: "grade", label: "Color Grades" },
+                  { id: "retro", label: "Retro & Mood" },
+                ] as const
+              ).map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={fxTab === t.id}
+                  onClick={() => setFxTab(t.id)}
+                  className={cn(
+                    "rounded-full px-2.5 py-1 transition-colors",
+                    fxTab === t.id ? "bg-white/15 font-medium text-foreground" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 @md:grid-cols-3 @2xl:grid-cols-6">
+            {visibleEffects.map((fx) => {
+              const on = currentFxKey === fx.key;
+              return (
+                <button
+                  key={fx.key}
+                  type="button"
+                  aria-pressed={on}
+                  onClick={() => set("video_effect", fx.key)}
+                  onPointerEnter={(e) => mouse(e) && setPeekFx(fx.key)}
+                  onPointerLeave={() => setPeekFx(null)}
+                  onFocus={() => setPeekFx(fx.key)}
+                  onBlur={() => setPeekFx(null)}
+                  className={cn(card, "flex flex-col text-left hover:border-primary/60", on && cardOn)}
+                >
+                  <span className="relative block aspect-[16/9] w-full overflow-hidden rounded-t-[calc(var(--radius)-1px)] bg-zinc-900">
+                    <span
+                      aria-hidden
+                      className="absolute inset-0 block bg-gradient-to-br from-amber-500/75 via-fuchsia-600/65 to-sky-500/80"
+                      style={{ filter: fx.preview_filter && fx.preview_filter !== "none" ? fx.preview_filter : undefined }}
+                    >
+                      <span className="absolute right-3 bottom-1 left-3 h-7 rounded-t-full bg-zinc-950/60" />
+                      <span className="absolute top-2.5 left-1/2 size-5 -translate-x-1/2 rounded-full bg-amber-100/90 shadow" />
+                    </span>
+                    {fx.preview_tint && <span aria-hidden className="absolute inset-0" style={{ background: fx.preview_tint }} />}
+                    {fx.badge && (
+                      <span className="absolute top-1.5 left-1.5 rounded-full bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white backdrop-blur-xs">
+                        {fx.badge}
+                      </span>
+                    )}
+                  </span>
+                  <span className="block px-2 py-1.5">
+                    <span className="block truncate text-xs font-medium">{fx.name}</span>
+                    <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{fx.category}</span>
+                  </span>
+                  {on && <Picked />}
+                </button>
+              );
+            })}
+          </div>
+          <div aria-hidden className="mt-2 rounded-md bg-white/[.04] px-2.5 py-1.5 text-xs leading-snug text-muted-foreground">
+            <span className="font-medium text-foreground">{shownFx.name}.</span> {shownFx.description}
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-white/[.02] px-3 py-2.5">
+            <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              <Gauge className="size-3.5 text-primary" /> Clip pace (speed):
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {speeds.map((sp) => {
+                const on = Math.abs(currentSpeed - sp.value) < 0.01;
+                return (
+                  <button
+                    key={sp.value}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() => set("playback_speed", sp.value)}
+                    className={cn(
+                      "rounded-full border px-2.5 py-1 text-xs tabular-nums transition-colors",
+                      on ? "border-primary bg-primary/15 font-medium text-foreground" : "border-white/15 text-muted-foreground hover:bg-white/5 hover:text-foreground",
+                    )}
+                  >
+                    {sp.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        {/* 4. Shape + 5. Length */}
         <div className="grid gap-x-8 gap-y-6 @2xl:grid-cols-2">
           <section>
-            <Heading>3. Shape</Heading>
+            <Heading>4. Shape</Heading>
             <div className="flex flex-wrap gap-2">
               {presets.aspect_ratios.map((a) => {
                 const on = value.aspect_ratio === a.key;
@@ -409,7 +538,7 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
           </section>
           <section>
             <Heading hint="Between 5 and 180 seconds.">
-              4. Clip length{" "}
+              5. Clip length{" "}
               <span className="ml-1 font-normal text-muted-foreground tabular-nums">
                 {value.min_duration}s to {value.max_duration}s
               </span>
@@ -426,9 +555,9 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
           </section>
         </div>
 
-        {/* 5. Music */}
+        {/* 6. Music */}
         <section>
-          <Heading hint="Optional. Pick one or more songs and they take turns across your clips.">5. Background music</Heading>
+          <Heading hint="Optional. Pick one or more songs and they take turns across your clips.">6. Background music</Heading>
           <div className="flex flex-wrap gap-2">
             {music?.map((m) => {
               const on = value.music_track_ids.includes(m.id);

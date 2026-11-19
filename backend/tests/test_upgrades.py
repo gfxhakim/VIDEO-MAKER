@@ -215,3 +215,151 @@ def test_ssrf_guard_user_isolation_and_new_clip_endpoints(tmp_path):
             s.commit()
         pruned = alice.post(f"/api/projects/{pid}/prune-source").json()
         assert pruned["freed_bytes"] == 4096
+
+
+def test_viral_scoring_and_clean_speech_end_boundaries():
+    # Segment A (0..18s): strong contrarian hook + numbers + emotion + complete ending + 0.6s pause
+    # Segment B (18.6..36.6s): weak rambling filler ending mid-clause with trailing chatter
+    words_a = [
+        ("Stop", 0.5, 0.8), ("doing", 0.85, 1.15), ("this", 1.2, 1.45), ("biggest", 1.5, 1.9),
+        ("mistake!", 1.95, 2.4), ("Nobody", 2.7, 3.05), ("tells", 3.1, 3.4), ("you", 3.45, 3.65),
+        ("how", 3.7, 3.95), ("$10,000", 4.0, 4.6), ("changed", 4.65, 5.1), ("my", 5.15, 5.35),
+        ("entire", 5.4, 5.8), ("life", 5.85, 6.2), ("forever.", 6.25, 6.8),
+        ("Here's", 7.1, 7.5), ("the", 7.55, 7.75), ("unbelievable", 7.8, 8.4), ("truth", 8.45, 8.85),
+        ("everyone", 8.9, 9.35), ("missed!", 9.4, 9.9), ("It", 10.2, 10.4), ("was", 10.45, 10.7),
+        ("literally", 10.75, 11.2), ("insane!", 11.25, 11.9),
+    ]
+    words_b = [
+        ("And", 13.0, 13.2), ("then", 13.25, 13.5), ("basically", 13.55, 14.0), ("we", 14.05, 14.2),
+        ("kind", 14.25, 14.5), ("of", 14.55, 14.7), ("went", 14.75, 15.05), ("over", 15.1, 15.4),
+        ("stuff", 15.45, 15.8), ("like", 15.85, 16.1), ("that", 16.15, 16.45), ("you", 16.5, 16.7),
+        ("know", 16.75, 17.0), ("what", 17.05, 17.3), ("I", 17.35, 17.5), ("mean", 17.55, 17.85),
+        ("or", 17.9, 18.1), ("whatever", 18.15, 18.6), ("anyway", 18.65, 19.0), ("so", 19.05, 19.3),
+        ("yeah", 19.35, 19.7), ("things", 19.75, 20.1), ("happen", 20.15, 20.6), ("sometimes", 20.65, 21.3),
+        ("really", 21.35, 21.8), ("often", 21.85, 22.3), ("maybe", 22.35, 22.9), ("okay", 22.95, 23.4),
+    ]
+    words = [{"word": w, "start": a, "end": b} for w, a, b in (words_a + words_b)]
+    dur = 25.0
+    energy = np.full(int(dur / 0.25) + 2, -28.0, dtype=np.float32)
+    energy[1:48] = -14.0  # energetic delivery during viral section A
+    energy[48:50] = -42.0  # clear pause after "insane!"
+
+    chosen = highlights.select_highlights(
+        duration=dur, words=words, energy_db=energy, energy_step=0.25,
+        scene_cuts=[1.0, 4.0], count=2, min_len=9.0, max_len=14.0,
+    )
+    assert len(chosen) >= 1
+    top = chosen[0]
+    assert top.start < 5.0 and 12.0 <= top.end <= 12.95  # inside viral section A, ends cleanly on "insane!" before "And" (13.0)
+    assert top.ends_clean is True
+    if len(chosen) > 1:
+        assert chosen[0].score > chosen[1].score + 10.0
+
+    # Manual snap_range_to_speech snaps mid-sentence end (9.5s) cleanly to "missed!" sentence boundary
+    s_snap, e_snap = highlights.snap_range_to_speech(words, 0.5, 9.5, dur)
+    assert s_snap < 0.6 and 9.9 <= e_snap <= 10.18
+
+
+@needs_ffmpeg
+def test_video_effects_and_playback_speed_render(tmp_path):
+    from app.presets import video_effects
+
+    fx_map = video_effects()
+    assert {"none", "hdr_punch", "hook_flash", "chromatic_glitch", "blur_reveal", "motion_shake",
+            "dark_cinema", "dreamy_bloom", "warm_film", "vhs_retro", "noir_sigma"} <= set(fx_map)
+
+    src = tmp_path / "src.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=8:r=30",
+                    "-f", "lavfi", "-i", "sine=f=330:d=8", "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", str(src)], check=True)
+    for fx_key in ("chromatic_glitch", "dreamy_bloom", "motion_shake"):
+        work = tmp_path / fx_key
+        work.mkdir()
+        spec = render.RenderSpec(
+            source=src, start=0.0, end=6.0, out_path=work / "clip.mp4", work_dir=work,
+            video_filter="[0:v]crop=202:360:219:0,scale=360:640:flags=lanczos,setsar=1[vbase]",
+            out_w=360, out_h=640, has_audio=True, video_effect=fx_key, speed=1.25,
+        )
+        out = render.render(spec)
+        info = media.probe(out)
+        assert (info.width, info.height) == (360, 640)
+        assert info.duration == pytest.approx(6.0 / 1.25, abs=0.35)
+        assert info.has_audio is True
+
+
+def test_post_gen_overrides_reset_batch_apply_and_presets_api(tmp_path):
+    init_db()
+    with _signed_in(TestClient(app), "fxuser@example.com") as c:
+        presets = c.get("/api/presets").json()
+        assert any(fx["key"] == "hdr_punch" for fx in presets["video_effects"])
+        assert len(presets["playback_speeds"]) >= 4
+
+        # Invalid video_effect rejected
+        assert c.post("/api/projects?start=false", json={"url": "https://e.com/v", "settings": {"video_effect": "bogus_fx"}}).status_code == 400
+
+        src = tmp_path / "src.mp4"
+        src.write_bytes(b"\x00" * 1024)
+        song = tmp_path / "track.mp3"
+        song.write_bytes(b"\x00" * 512)
+        with session_scope() as s:
+            u = s.exec(select(User).where(User.email == "fxuser@example.com")).first()
+            p = Project(user_id=u.id, name="FX", source_type="path", source=str(src), source_path=str(src),
+                        duration=40.0, status="done", settings={"video_effect": "none", "playback_speed": 1.0})
+            mt = MusicTrack(user_id=u.id, name="Hype Beat", path=str(song), analyzed=True)
+            s.add(p)
+            s.add(mt)
+            s.commit()
+            s.refresh(p)
+            s.refresh(mt)
+            c1 = Clip(project_id=p.id, rank=1, start=1.0, end=12.0, status="ready")
+            c2 = Clip(project_id=p.id, rank=2, start=14.0, end=25.0, status="ready")
+            s.add(c1)
+            s.add(c2)
+            s.commit()
+            s.refresh(c1)
+            s.refresh(c2)
+            pid, mid, id1, id2 = p.id, mt.id, c1.id, c2.id
+
+        # Per-clip override then clear via None
+        r = c.patch(f"/api/clips/{id1}", json={
+            "music_track_id": mid,
+            "overrides": {"video_effect": "dark_cinema", "playback_speed": 1.15, "music_volume": 0.25},
+        })
+        assert r.status_code == 200
+        assert r.json()["music_track_id"] == mid
+        assert r.json()["overrides"]["video_effect"] == "dark_cinema"
+
+        r2 = c.patch(f"/api/clips/{id1}", json={"overrides": {"video_effect": None}})
+        assert r2.status_code == 200
+        assert "video_effect" not in r2.json()["overrides"]
+        assert r2.json()["overrides"]["playback_speed"] == 1.15
+
+        # Batch apply FX + speed + music + re-render
+        rb = c.post("/api/clips/bulk", json={
+            "clip_ids": [id1, id2],
+            "action": "apply",
+            "music_track_id": mid,
+            "overrides": {"video_effect": "hdr_punch", "playback_speed": 1.1},
+            "rerender": True,
+        })
+        assert rb.status_code == 200 and rb.json()["count"] == 2
+        with session_scope() as s:
+            for cid in (id1, id2):
+                cl = s.get(Clip, cid)
+                assert cl.music_track_id == mid
+                assert cl.overrides["video_effect"] == "hdr_punch"
+                assert cl.overrides["playback_speed"] == 1.1
+                assert cl.status == "pending"
+
+        # Cleanup manual clip with snap_speech
+        (tasks.project_dir(pid) / "transcript.json").write_text(json.dumps({
+            "words": [
+                {"word": "First", "start": 2.0, "end": 2.4},
+                {"word": "line.", "start": 2.45, "end": 3.0},
+                {"word": "Second", "start": 3.6, "end": 4.0},
+                {"word": "finish!", "start": 4.05, "end": 4.5},
+            ]
+        }))
+        mc = c.post(f"/api/projects/{pid}/clips", json={"start": 2.0, "end": 4.3, "snap_speech": True})
+        assert mc.status_code == 200 and mc.json()["end"] >= 4.5
+

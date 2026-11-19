@@ -16,6 +16,8 @@ class GenerationSettings(BaseModel):
     editing_style: str = "face_track_zoom"
     caption_style: str = "hormozi"
     aspect_ratio: str = "9:16"
+    video_effect: str = "none"
+    playback_speed: float = Field(1.0, ge=0.75, le=1.5)
     auto_emoji: bool = True
     hook_title: bool = False  # force the hook-title card on any style
     hook_card_style: Literal["light", "dark", "accent", "glass"] = "light"
@@ -127,11 +129,16 @@ class ManualClipCreate(BaseModel):
     end: float = Field(gt=0.0)
     title: Optional[str] = None
     hook: Optional[str] = None
+    snap_speech: bool = False
 
 
 class BulkClipAction(BaseModel):
     clip_ids: list[int] = Field(min_length=1, max_length=200)
-    action: Literal["approve", "reject", "pending", "delete", "rerender"]
+    action: Literal["approve", "reject", "pending", "delete", "rerender", "apply"]
+    overrides: Optional[dict[str, Any]] = None
+    music_track_id: Optional[int] = None
+    clear_music: bool = False
+    rerender: bool = True
 
 
 class ThumbnailCapture(BaseModel):

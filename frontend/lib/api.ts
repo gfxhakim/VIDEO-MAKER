@@ -11,6 +11,8 @@ export type GenerationSettings = {
   editing_style: string;
   caption_style: string;
   aspect_ratio: string;
+  video_effect?: string;
+  playback_speed?: number;
   auto_emoji: boolean;
   hook_title: boolean;
   hook_card_style?: HookCardStyle;
@@ -39,6 +41,8 @@ export const DEFAULT_SETTINGS: GenerationSettings = {
   editing_style: "face_track_zoom",
   caption_style: "hormozi",
   aspect_ratio: "9:16",
+  video_effect: "none",
+  playback_speed: 1.0,
   auto_emoji: true,
   hook_title: false,
   hook_card_style: "light",
@@ -61,6 +65,15 @@ export const DEFAULT_SETTINGS: GenerationSettings = {
 };
 
 export type EditingStyle = { key: string; name: string; description: string; layout: string; hook_card?: boolean };
+export type VideoEffect = {
+  key: string;
+  name: string;
+  category: string;
+  badge?: string;
+  description: string;
+  preview_filter?: string;
+  preview_tint?: string;
+};
 export type CaptionStyle = {
   key: string;
   name: string;
@@ -86,6 +99,8 @@ export type CaptionStyle = {
 export type Presets = {
   editing_styles: EditingStyle[];
   caption_styles: CaptionStyle[];
+  video_effects?: VideoEffect[];
+  playback_speeds?: { value: number; label: string }[];
   aspect_ratios: { key: string; width: number; height: number }[];
   hook_card_styles?: { key: HookCardStyle; name: string }[];
   clip_count: { min: number; max: number; default: number };
@@ -316,19 +331,23 @@ export const api = {
   pruneSource: (id: number) => request<{ ok: boolean; freed_bytes: number }>(`/api/projects/${id}/prune-source`, json("POST")),
   deleteProject: (id: number) => request(`/api/projects/${id}`, { method: "DELETE" }),
   transcript: (id: number) => request<TranscriptResponse>(`/api/projects/${id}/transcript`),
-  createManualClip: (id: number, body: { start: number; end: number; title?: string; hook?: string }) =>
+  createManualClip: (id: number, body: { start: number; end: number; title?: string; hook?: string; snap_speech?: boolean }) =>
     request<Clip>(`/api/projects/${id}/clips`, json("POST", body)),
 
   updateClip: (
     id: number,
-    body: Partial<Pick<Clip, "title" | "description" | "hashtags" | "review_status" | "hook" | "start" | "end" | "music_track_id" | "overrides">> & {
+    body: Partial<Pick<Clip, "title" | "description" | "hashtags" | "review_status" | "hook" | "start" | "end" | "music_track_id">> & {
+      overrides?: Record<string, unknown>;
       clear_music?: boolean;
       words_override?: WordToken[] | null;
     },
   ) => request<Clip>(`/api/clips/${id}`, json("PATCH", body)),
   deleteClip: (id: number) => request(`/api/clips/${id}`, { method: "DELETE" }),
-  bulkClips: (clip_ids: number[], action: "approve" | "reject" | "pending" | "delete" | "rerender") =>
-    request<{ ok: boolean; count: number }>("/api/clips/bulk", json("POST", { clip_ids, action })),
+  bulkClips: (
+    clip_ids: number[],
+    action: "approve" | "reject" | "pending" | "delete" | "rerender" | "apply",
+    extra?: { overrides?: Record<string, unknown>; music_track_id?: number | null; clear_music?: boolean; rerender?: boolean },
+  ) => request<{ ok: boolean; count: number }>("/api/clips/bulk", json("POST", { clip_ids, action, ...extra })),
   getClipWords: (id: number) => request<{ words: WordToken[]; is_override: boolean }>(`/api/clips/${id}/words`),
   rerenderClip: (id: number) => request<Clip>(`/api/clips/${id}/rerender`, json("POST")),
   aiRewriteClip: (id: number) => request<Clip>(`/api/clips/${id}/ai-copy`, json("POST")),

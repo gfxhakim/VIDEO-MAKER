@@ -2,7 +2,7 @@
 
 import { memo, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Check, Flame, Hourglass, Loader2, Play, RefreshCw, TriangleAlert } from "lucide-react";
+import { Check, Flame, Hourglass, Loader2, Music2, Play, RefreshCw, Sliders, TriangleAlert, Wand2 } from "lucide-react";
 import { PlatformIcon } from "@/components/platform-icon";
 import { api, type Clip, type Platform } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -65,6 +65,7 @@ export const ClipCard = memo(function ClipCard({
   selected = false,
   onToggleSelect,
   onOpen,
+  onEdit,
   onChange,
 }: {
   clip: Clip;
@@ -74,6 +75,7 @@ export const ClipCard = memo(function ClipCard({
   selected?: boolean;
   onToggleSelect?: (id: number) => void;
   onOpen: (id: number) => void;
+  onEdit?: (id: number) => void;
   onChange?: (c: Clip) => void;
 }) {
   const video = useRef<HTMLVideoElement>(null);
@@ -84,6 +86,8 @@ export const ClipCard = memo(function ClipCard({
   const failed = clip.status === "failed";
   const posted = Object.keys(clip.posted ?? {}) as Platform[];
   const cardRatio = aspectClass((clip.overrides?.aspect_ratio as string | undefined) ?? ratio);
+  const hasFx = !!clip.overrides?.video_effect && clip.overrides.video_effect !== "none";
+  const hasMusic = clip.music_track_id != null;
 
   useEffect(() => () => window.clearTimeout(timer.current), []);
 
@@ -156,7 +160,15 @@ export const ClipCard = memo(function ClipCard({
           </div>
         )}
         <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/0 to-black/30" />
-        <div className="absolute top-2.5 left-2.5"><ScoreRing score={clip.score} /></div>
+        <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5">
+          <ScoreRing score={clip.score} />
+          {(hasFx || hasMusic) && (
+            <span className="flex items-center gap-1 rounded-full bg-black/65 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-xs">
+              {hasFx && <Wand2 className="size-2.5 text-fuchsia-400" aria-label="Custom effect" />}
+              {hasMusic && <Music2 className="size-2.5 text-sky-400" aria-label="Music added" />}
+            </span>
+          )}
+        </div>
         <div className="absolute top-3 right-3 flex items-center gap-1.5">
           {selectable ? (
             <span className={cn("grid size-6 place-items-center rounded-full border shadow transition-colors", selected ? "border-primary bg-primary text-primary-foreground" : "border-white/50 bg-black/60")}>
@@ -182,6 +194,20 @@ export const ClipCard = memo(function ClipCard({
           </div>
         </div>
       </button>
+      {ready && !selectable && onEdit && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            stopPreview();
+            onEdit(clip.id);
+          }}
+          title="Edit FX, music, captions & trim"
+          className="absolute top-2.5 right-2.5 z-10 flex items-center gap-1 rounded-full bg-black/75 px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow backdrop-blur-xs transition group-focus-within:opacity-100 group-hover:opacity-100 hover:bg-primary hover:text-primary-foreground [@media(hover:none)]:opacity-100"
+        >
+          <Sliders className="size-3" /> Edit
+        </button>
+      )}
       {failed && !selectable && (
         <div className="pointer-events-none absolute inset-x-0 top-1/2 flex justify-center pt-4">
           <button

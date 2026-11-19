@@ -1,0 +1,91 @@
+{
+  "_doc": "Trending clipper video effects applied cleanly before captions and overlays by app/pipeline/effects.py.",
+  "none": {
+    "name": "Clean Original",
+    "category": "Base",
+    "badge": "Natural",
+    "description": "Original camera colors with no filter or motion FX overlay.",
+    "preview_filter": "none",
+    "preview_tint": ""
+  },
+  "hdr_punch": {
+    "name": "Viral HDR Crisp",
+    "category": "Trending 2026",
+    "badge": "Most Used",
+    "description": "Punchy micro-contrast, rich skin/color pop, sharpening & subtle edge vignette used by top podcast clippers.",
+    "preview_filter": "contrast(1.18) saturate(1.26) brightness(1.03)",
+    "preview_tint": "radial-gradient(circle, transparent 55%, rgba(0,0,0,0.45) 100%)"
+  },
+  "hook_flash": {
+    "name": "Hook White Flash",
+    "category": "Hook FX",
+    "badge": "Retention Reset",
+    "description": "2-frame bright flash at 0.0s to reset viewer attention immediately, paired with a crisp contrast boost.",
+    "preview_filter": "contrast(1.12) saturate(1.14) brightness(1.06)",
+    "preview_tint": "linear-gradient(135deg, rgba(255,255,255,0.42) 0%, transparent 45%)"
+  },
+  "chromatic_glitch": {
+    "name": "RGB Chromatic Burst",
+    "category": "Hook FX",
+    "badge": "TikTok Trend",
+    "description": "RGB lens channel split burst on the opening hook and at 5s for instant tech/viral energy.",
+    "preview_filter": "contrast(1.14) saturate(1.18)",
+    "preview_tint": "linear-gradient(90deg, rgba(255,0,90,0.22) 0%, transparent 28%, transparent 72%, rgba(0,225,255,0.24) 100%)"
+  },
+  "blur_reveal": {
+    "name": "Blur-to-Sharp Reveal",
+    "category": "Hook FX",
+    "badge": "Reels Intro",
+    "description": "Opens with a smooth 0.38s lens blur that snaps razor-sharp right as the speaker hooks the viewer.",
+    "preview_filter": "contrast(1.10) saturate(1.14) blur(0.6px)",
+    "preview_tint": "radial-gradient(circle, transparent 40%, rgba(255,255,255,0.16) 100%)"
+  },
+  "motion_shake": {
+    "name": "Impact Hook Shake",
+    "category": "Motion FX",
+    "badge": "High Energy",
+    "description": "Controlled punch camera shake + flash in the opening 0.55s to lock eyes on high-energy reactions.",
+    "preview_filter": "contrast(1.12) saturate(1.12)",
+    "preview_tint": "linear-gradient(120deg, rgba(255,255,255,0.25) 0%, transparent 50%)"
+  },
+  "dark_cinema": {
+    "name": "Dark Podcast Studio",
+    "category": "Color Grade",
+    "badge": "Studio Look",
+    "description": "Moody studio contrast with cool teal shadows, warm midtones, and a deep vignette.",
+    "preview_filter": "contrast(1.22) brightness(0.92) saturate(1.10)",
+    "preview_tint": "radial-gradient(circle, rgba(245,158,11,0.08) 25%, rgba(6,78,99,0.35) 100%)"
+  },
+  "dreamy_bloom": {
+    "name": "Warm Halation Bloom",
+    "category": "Color Grade",
+    "badge": "Storytelling",
+    "description": "Soft glowing highlights with warm golden halation for motivational, lifestyle & emotional stories.",
+    "preview_filter": "contrast(1.06) brightness(1.08) saturate(1.20)",
+    "preview_tint": "radial-gradient(circle at 30% 25%, rgba(251,191,36,0.28) 0%, transparent 65%)"
+  },
+  "warm_film": {
+    "name": "35mm Cinema Grain",
+    "category": "Filmic",
+    "badge": "Filmic",
+    "description": "Kodak-inspired warm film tone with subtle organic 35mm texture and soft shadow falloff.",
+    "preview_filter": "contrast(1.12) sepia(0.14) saturate(1.08)",
+    "preview_tint": "radial-gradient(circle, transparent 50%, rgba(120,53,15,0.32) 100%)"
+  },
+  "vhs_retro": {
+    "name": "Retro Cam / Y2K",
+    "category": "Retro",
+    "badge": "Vintage",
+    "description": "Analog chroma bleed, nostalgic tape grain & vintage fade used in storytelling & trivia edits.",
+    "preview_filter": "contrast(1.08) saturate(0.88) hue-rotate(-6deg)",
+    "preview_tint": "linear-gradient(180deg, rgba(255,0,128,0.14) 0%, transparent 50%, rgba(0,255,255,0.14) 100%)"
+  },
+  "noir_sigma": {
+    "name": "B&W Contrast Noir",
+    "category": "Mood",
+    "badge": "Hot Takes",
+    "description": "Stark high-contrast monochrome with deep vignette — iconic for bold hot takes & dramatic quotes.",
+    "preview_filter": "grayscale(1) contrast(1.36) brightness(0.95)",
+    "preview_tint": "radial-gradient(circle, transparent 45%, rgba(0,0,0,0.55) 100%)"
+  }
+}

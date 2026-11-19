@@ -61,6 +61,12 @@ export default function LibraryPage() {
     return m;
   }, [projects]);
 
+  const projectSettingsMap = useMemo(() => {
+    const m = new Map<number, Project["settings"]>();
+    for (const p of projects ?? []) m.set(p.id, p.settings);
+    return m;
+  }, [projects]);
+
   const counts = useMemo(() => {
     const n = {} as Record<Filter, number>;
     for (const f of FILTERS) n[f.key] = (clips ?? []).filter((c) => matches(c, f.key)).length;
@@ -262,7 +268,8 @@ export default function LibraryPage() {
                 selected={selected.has(c.id)}
                 onToggleSelect={toggleSelect}
                 onChange={update}
-                onOpen={studio.open}
+                onOpen={(cid) => studio.open(cid, "publish")}
+                onEdit={(cid) => studio.open(cid, "edit")}
               />
             ))}
           </div>
@@ -277,7 +284,9 @@ export default function LibraryPage() {
       <ClipStudio
         clips={studio.clips}
         index={studio.index}
+        initialTab={studio.tab}
         projectAspect={studio.index != null && studio.clips[studio.index] ? projectAspects.get(studio.clips[studio.index].project_id) : undefined}
+        projectSettings={studio.index != null && studio.clips[studio.index] ? projectSettingsMap.get(studio.clips[studio.index].project_id) : undefined}
         onOpen={studio.open}
         onClose={studio.close}
         onChange={update}

@@ -5,23 +5,26 @@ import useSWR, { mutate as globalMutate, preload } from "swr";
 import { motion } from "motion/react";
 import { toast } from "sonner";
 import {
-  Camera, Check, ChevronLeft, ChevronRight, Copy, Download, FileText, Loader2, RefreshCw, Save, Scissors, Share2, Sliders, Sparkles, ThumbsDown, ThumbsUp, Trash2, X,
+  Camera, Check, ChevronLeft, ChevronRight, Copy, Download, FileText, Loader2, Music2, RefreshCw, Save, Scissors, Share2, Sliders, Sparkles, ThumbsDown, ThumbsUp, Trash2, Upload, Wand2, X,
 } from "lucide-react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { aspectClass, ScoreRing } from "@/components/clip-card";
 import { PLATFORMS, PLATFORM_LABEL, PLATFORM_SHORT, PlatformIcon } from "@/components/platform-icon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
 import {
   api,
   fetcher,
+  type BrollClip,
   type Clip,
   type GenerationSettings,
   type MusicTrack,
   type Platform,
   type Presets,
   type PublishKit,
+  type TranscriptResponse,
   type WordToken,
 } from "@/lib/api";
 import { cn, fmtDuration } from "@/lib/utils";
@@ -29,7 +32,7 @@ import { cn, fmtDuration } from "@/lib/utils";
 const NO_CLIPS: Clip[] = [];
 
 export function useClipStudio(all: Clip[] | undefined, visible: Clip[]) {
-  const [session, setSession] = useState<{ id: number; keep: ReadonlySet<number> } | null>(null);
+  const [session, setSession] = useState<{ id: number; keep: ReadonlySet<number>; tab: "publish" | "edit" } | null>(null);
   const visibleRef = useRef(visible);
   useEffect(() => {
     visibleRef.current = visible;
@@ -47,12 +50,16 @@ export function useClipStudio(all: Clip[] | undefined, visible: Clip[]) {
     if (gone) setSession(null);
   }, [gone]);
 
-  const open = useCallback((id: number) => {
-    setSession((s) => ({ id, keep: s?.keep ?? new Set(visibleRef.current.map((c) => c.id)) }));
+  const open = useCallback((id: number, tab?: "publish" | "edit") => {
+    setSession((s) => ({
+      id,
+      keep: s?.keep ?? new Set(visibleRef.current.map((c) => c.id)),
+      tab: tab ?? s?.tab ?? "publish",
+    }));
   }, []);
   const close = useCallback(() => setSession(null), []);
 
-  return { clips, index, open, close };
+  return { clips, index, tab: session?.tab ?? "publish", open, close };
 }
 
 async function copyText(text: string) {
@@ -93,7 +100,7 @@ function CopyBlock({ label, text }: { label: string; text: string }) {
   );
 }
 
-const SIGNALS: [string, string][] = [["hook", "Hook"], ["energy", "Energy"], ["emotion", "Emotion"], ["density", "Pace"], ["spikes", "Reactions"], ["action", "Action"]];
+const SIGNALS: [string, string][] = [["hook", "Hook"], ["energy", "Energy"], ["emotion", "Emotion"], ["density", "Pace"], ["spikes", "Reactions"], ["complete", "Ending"]];
 
 type FormState = {
   title: string;
@@ -103,27 +110,66 @@ type FormState = {
   start: number;
   end: number;
   music_track_id: number | null;
-  caption_style: string;
+  music_volume: number | null;
+  ducking: string;
+  match_drop_to_hook: string;
+  beat_sync_zoom: string;
+  video_effect: string;
+  playback_speed: string;
   editing_style: string;
+  broll_id: string;
   aspect_ratio: string;
-  auto_emoji: string; // "" (inherit) | "true" | "false"
-  hook_title: string; // "" | "true" | "false"
+  caption_style: string;
+  caption_position: number | null;
+  auto_emoji: string;
+  hook_title: string;
+  hook_card_style: string;
+  hook_card_duration: string;
+  remove_silences: string;
+  normalize_audio: string;
+  denoise_audio: string;
+  progress_bar: string;
+  watermark_text: string;
+  watermark_custom: boolean;
+  watermark_position: string;
 };
 
-const formOf = (c: Clip): FormState => ({
-  title: c.title,
-  hook: c.hook,
-  description: c.description,
-  tags: c.hashtags.join(" "),
-  start: Number(c.start.toFixed(2)),
-  end: Number(c.end.toFixed(2)),
-  music_track_id: c.music_track_id ?? null,
-  caption_style: (c.overrides?.caption_style as string) || "",
-  editing_style: (c.overrides?.editing_style as string) || "",
-  aspect_ratio: (c.overrides?.aspect_ratio as string) || "",
-  auto_emoji: c.overrides?.auto_emoji === undefined ? "" : String(c.overrides.auto_emoji),
-  hook_title: c.overrides?.hook_title === undefined ? "" : String(c.overrides.hook_title),
-});
+const boolStr = (v: unknown) => (v === undefined || v === null ? "" : String(Boolean(v)));
+
+const formOf = (c: Clip): FormState => {
+  const ov = c.overrides || {};
+  return {
+    title: c.title,
+    hook: c.hook,
+    description: c.description,
+    tags: c.hashtags.join(" "),
+    start: Number(c.start.toFixed(2)),
+    end: Number(c.end.toFixed(2)),
+    music_track_id: c.music_track_id ?? null,
+    music_volume: typeof ov.music_volume === "number" ? ov.music_volume : null,
+    ducking: boolStr(ov.ducking),
+    match_drop_to_hook: boolStr(ov.match_drop_to_hook),
+    beat_sync_zoom: boolStr(ov.beat_sync_zoom),
+    video_effect: (ov.video_effect as string) || "",
+    playback_speed: ov.playback_speed != null ? String(ov.playback_speed) : "",
+    editing_style: (ov.editing_style as string) || "",
+    broll_id: ov.broll_id != null ? String(ov.broll_id) : "",
+    aspect_ratio: (ov.aspect_ratio as string) || "",
+    caption_style: (ov.caption_style as string) || "",
+    caption_position: typeof ov.caption_position === "number" ? ov.caption_position : null,
+    auto_emoji: boolStr(ov.auto_emoji),
+    hook_title: boolStr(ov.hook_title),
+    hook_card_style: (ov.hook_card_style as string) || "",
+    hook_card_duration: ov.hook_card_duration != null ? String(ov.hook_card_duration) : "",
+    remove_silences: boolStr(ov.remove_silences),
+    normalize_audio: boolStr(ov.normalize_audio),
+    denoise_audio: boolStr(ov.denoise_audio),
+    progress_bar: boolStr(ov.progress_bar),
+    watermark_text: typeof ov.watermark_text === "string" ? ov.watermark_text : "",
+    watermark_custom: ov.watermark_text !== undefined,
+    watermark_position: (ov.watermark_position as string) || "",
+  };
+};
 
 function canShareFiles() {
   try {
@@ -142,12 +188,47 @@ const FRAME_VARS = cn(
 );
 
 const NAV_ARROW = "absolute top-1/2 z-10 hidden size-10 -translate-y-1/2 place-items-center rounded-full bg-white/10 transition outline-none hover:bg-white/20 focus-visible:ring-[3px] focus-visible:ring-ring/60 active:scale-95 disabled:pointer-events-none disabled:opacity-20 lg:grid short:hidden";
-const SELECT = "mt-1.5 h-10 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const SELECT = "mt-1.5 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const MINI_SELECT = "h-8 rounded-md border border-white/15 bg-zinc-900 px-2 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+const EMPTY_FORM: FormState = {
+  title: "",
+  hook: "",
+  description: "",
+  tags: "",
+  start: 0,
+  end: 10,
+  music_track_id: null,
+  music_volume: null,
+  ducking: "",
+  match_drop_to_hook: "",
+  beat_sync_zoom: "",
+  video_effect: "",
+  playback_speed: "",
+  editing_style: "",
+  broll_id: "",
+  aspect_ratio: "",
+  caption_style: "",
+  caption_position: null,
+  auto_emoji: "",
+  hook_title: "",
+  hook_card_style: "",
+  hook_card_duration: "",
+  remove_silences: "",
+  normalize_audio: "",
+  denoise_audio: "",
+  progress_bar: "",
+  watermark_text: "",
+  watermark_custom: false,
+  watermark_position: "",
+};
 
 export function ClipStudio({
   clips,
   index,
+  initialTab = "publish",
   projectAspect,
+  projectSettings,
   onOpen,
   onClose,
   onChange,
@@ -155,8 +236,10 @@ export function ClipStudio({
 }: {
   clips: Clip[];
   index: number | null;
+  initialTab?: "publish" | "edit";
   projectAspect?: string;
-  onOpen: (id: number) => void;
+  projectSettings?: GenerationSettings;
+  onOpen: (id: number, tab?: "publish" | "edit") => void;
   onClose: () => void;
   onChange: (c: Clip) => void;
   onDelete?: (id: number) => void;
@@ -165,17 +248,22 @@ export function ClipStudio({
   const at = clip ? (index as number) : -1;
   const { data: kit, error: kitError, mutate: mutateKit } = useSWR<PublishKit>(clip ? `/api/clips/${clip.id}/kit` : null, fetcher, { revalidateOnFocus: false });
   const { data: presets } = useSWR<Presets>("/api/presets", fetcher, { revalidateOnFocus: false });
-  const { data: music } = useSWR<MusicTrack[]>("/api/music", fetcher);
+  const { data: music, mutate: mutateMusic } = useSWR<MusicTrack[]>("/api/music", fetcher);
+  const { data: broll } = useSWR<BrollClip[]>("/api/broll", fetcher);
   const [platform, setPlatform] = useState<Platform>("tiktok");
-  const [tab, setTab] = useState<"publish" | "edit">("publish");
-  const [form, setForm] = useState<FormState>(() => (clip ? formOf(clip) : { title: "", hook: "", description: "", tags: "", start: 0, end: 10, music_track_id: null, caption_style: "", editing_style: "", aspect_ratio: "", auto_emoji: "", hook_title: "" }));
+  const [tab, setTab] = useState<"publish" | "edit">(initialTab);
+  const [form, setForm] = useState<FormState>(() => (clip ? formOf(clip) : EMPTY_FORM));
   const [words, setWords] = useState<WordToken[] | null>(null);
   const [wordsDirty, setWordsDirty] = useState(false);
   const [loadingWords, setLoadingWords] = useState(false);
+  const [uploadingMusic, setUploadingMusic] = useState(false);
+  const [snappingSpeech, setSnappingSpeech] = useState(false);
   const [saving, setSaving] = useState<"save" | "render" | "thumb" | "ai" | "delete" | null>(null);
   const [share, setShare] = useState<ShareState | null>(null);
   const [shareable] = useState(canShareFiles);
   const shareAbort = useRef<AbortController | null>(null);
+  const musicInput = useRef<HTMLInputElement>(null);
+  const transcriptCache = useRef<Record<number, TranscriptResponse>>({});
   const seq = useRef(new Map<string, number>());
   const scroller = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLDivElement>(null);
@@ -194,6 +282,10 @@ export function ClipStudio({
     for (const el of [scroller.current, panel.current, body.current]) el?.scrollTo({ top: 0 });
     return () => shareAbort.current?.abort();
   }, [clipId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (clipId != null) setTab(initialTab);
+  }, [clipId, initialTab]);
 
   const loadWords = useCallback(async () => {
     if (!clipId || words !== null) return;
@@ -292,14 +384,36 @@ export function ClipStudio({
     Math.abs(form.start - initial.start) > 0.01 ||
     Math.abs(form.end - initial.end) > 0.01 ||
     form.music_track_id !== initial.music_track_id ||
+    form.music_volume !== initial.music_volume ||
+    form.ducking !== initial.ducking ||
+    form.match_drop_to_hook !== initial.match_drop_to_hook ||
+    form.beat_sync_zoom !== initial.beat_sync_zoom ||
+    form.video_effect !== initial.video_effect ||
+    form.playback_speed !== initial.playback_speed ||
     form.caption_style !== initial.caption_style ||
+    form.caption_position !== initial.caption_position ||
     form.editing_style !== initial.editing_style ||
+    form.broll_id !== initial.broll_id ||
     form.aspect_ratio !== initial.aspect_ratio ||
     form.auto_emoji !== initial.auto_emoji ||
-    form.hook_title !== initial.hook_title;
+    form.hook_title !== initial.hook_title ||
+    form.hook_card_style !== initial.hook_card_style ||
+    form.hook_card_duration !== initial.hook_card_duration ||
+    form.remove_silences !== initial.remove_silences ||
+    form.normalize_audio !== initial.normalize_audio ||
+    form.denoise_audio !== initial.denoise_audio ||
+    form.progress_bar !== initial.progress_bar ||
+    form.watermark_custom !== initial.watermark_custom ||
+    (form.watermark_custom && form.watermark_text !== initial.watermark_text) ||
+    form.watermark_position !== initial.watermark_position;
 
   const activeAspect = (clip.overrides?.aspect_ratio as string | undefined) || projectAspect || "9:16";
   const isWide = activeAspect === "16:9";
+  const effectiveEditingStyle = form.editing_style || projectSettings?.editing_style || "face_track_zoom";
+  const activeLayout = presets?.editing_styles.find((s) => s.key === effectiveEditingStyle)?.layout;
+  const showBrollPicker = activeLayout === "broll_split";
+  const allEffects = presets?.video_effects ?? [];
+  const selectedEffectMeta = allEffects.find((f) => f.key === (form.video_effect || projectSettings?.video_effect || "none"));
 
   async function togglePosted() {
     const target = clip!;
@@ -315,17 +429,29 @@ export function ClipStudio({
     const target = clip!;
     setSaving(rerender ? "render" : "save");
     try {
-      const overrides: Partial<GenerationSettings> = { ...(target.overrides || {}) };
-      if (form.caption_style) overrides.caption_style = form.caption_style;
-      else delete overrides.caption_style;
-      if (form.editing_style) overrides.editing_style = form.editing_style;
-      else delete overrides.editing_style;
-      if (form.aspect_ratio) overrides.aspect_ratio = form.aspect_ratio;
-      else delete overrides.aspect_ratio;
-      if (form.auto_emoji) overrides.auto_emoji = form.auto_emoji === "true";
-      else delete overrides.auto_emoji;
-      if (form.hook_title) overrides.hook_title = form.hook_title === "true";
-      else delete overrides.hook_title;
+      const overrides: Record<string, unknown> = {
+        video_effect: form.video_effect || null,
+        playback_speed: form.playback_speed ? Number(form.playback_speed) : null,
+        caption_style: form.caption_style || null,
+        caption_position: form.caption_position ?? null,
+        editing_style: form.editing_style || null,
+        broll_id: form.broll_id ? Number(form.broll_id) : null,
+        aspect_ratio: form.aspect_ratio || null,
+        auto_emoji: form.auto_emoji ? form.auto_emoji === "true" : null,
+        hook_title: form.hook_title ? form.hook_title === "true" : null,
+        hook_card_style: form.hook_card_style || null,
+        hook_card_duration: form.hook_card_duration ? Number(form.hook_card_duration) : null,
+        music_volume: form.music_volume ?? null,
+        ducking: form.ducking ? form.ducking === "true" : null,
+        match_drop_to_hook: form.match_drop_to_hook ? form.match_drop_to_hook === "true" : null,
+        beat_sync_zoom: form.beat_sync_zoom ? form.beat_sync_zoom === "true" : null,
+        remove_silences: form.remove_silences ? form.remove_silences === "true" : null,
+        normalize_audio: form.normalize_audio ? form.normalize_audio === "true" : null,
+        denoise_audio: form.denoise_audio ? form.denoise_audio === "true" : null,
+        progress_bar: form.progress_bar ? form.progress_bar === "true" : null,
+        watermark_text: form.watermark_custom ? form.watermark_text : null,
+        watermark_position: form.watermark_position || null,
+      };
 
       const saved = await api.updateClip(target.id, {
         title: form.title,
@@ -351,6 +477,53 @@ export function ClipStudio({
       toast.error("Could not save", { description: (e as Error).message });
     } finally {
       setSaving(null);
+    }
+  }
+
+  async function uploadInlineMusic(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setUploadingMusic(true);
+    try {
+      const tracks = await api.uploadMusic([file]);
+      await mutateMusic();
+      if (tracks[0]) {
+        setForm((f) => ({ ...f, music_track_id: tracks[0].id }));
+        toast.success(`Uploaded "${tracks[0].name}" — click Save & re-render to mix it in`);
+      }
+    } catch (err) {
+      toast.error("Could not upload song", { description: (err as Error).message });
+    } finally {
+      setUploadingMusic(false);
+    }
+  }
+
+  async function snapTrimToSpeech() {
+    const target = clip!;
+    setSnappingSpeech(true);
+    try {
+      let tr = transcriptCache.current[target.project_id];
+      if (!tr) {
+        tr = await api.transcript(target.project_id);
+        transcriptCache.current[target.project_id] = tr;
+      }
+      const sents = tr.sentences ?? [];
+      if (!sents.length) return void toast("No speech transcript available to snap to");
+      const cand = sents
+        .filter((s) => s.end >= form.start + 2.0 && s.end >= form.end - 2.5 && s.end <= form.end + 4.5)
+        .sort((a, b) => Math.abs(a.end - form.end) - Math.abs(b.end - form.end))[0];
+      if (!cand) return void toast("No sentence boundary found near the end timestamp");
+      const idx = sents.indexOf(cand);
+      const nextStart = idx >= 0 && idx + 1 < sents.length ? sents[idx + 1].start : cand.end + 1.0;
+      const gap = Math.max(0, nextStart - cand.end);
+      const cleanEnd = Number((gap >= 0.12 ? Math.min(nextStart - 0.04, cand.end + Math.min(0.35, gap * 0.65)) : (cand.end + nextStart) / 2).toFixed(2));
+      setForm((f) => ({ ...f, end: Math.max(f.start + 1.5, cleanEnd) }));
+      toast.success(`Snapped end to finished sentence (${fmtDuration(cleanEnd)})`);
+    } catch (err) {
+      toast.error("Could not snap to speech", { description: (err as Error).message });
+    } finally {
+      setSnappingSpeech(false);
     }
   }
 
@@ -694,32 +867,286 @@ export function ClipStudio({
                       </div>
                     ) : (
                       <form className="flex flex-col gap-3.5" onSubmit={(e) => { e.preventDefault(); if (dirty && !saving) void save(false); }}>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-xs font-medium text-muted-foreground">Copy & Hook</span>
-                          {presets?.llm_configured && (
-                            <Button type="button" variant="outline" size="sm" disabled={!!saving} onClick={aiRewrite} className="h-8 text-xs">
-                              {saving === "ai" ? <Loader2 className="animate-spin" /> : <Sparkles className="text-primary" />} Rewrite with AI
-                            </Button>
+                        {/* 1. Video Effect, Speed & Layout */}
+                        <div className="rounded-xl border border-white/10 bg-white/[.02] p-3 text-xs">
+                          <div className="mb-2.5 flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 font-semibold text-foreground"><Wand2 className="size-3.5 text-primary" /> Trending FX, Speed &amp; Layout</span>
+                            {selectedEffectMeta?.badge && form.video_effect && (
+                              <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-medium text-primary">{selectedEffectMeta.badge}</span>
+                            )}
+                          </div>
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <label className="text-muted-foreground">Video effect (on footage)
+                              <select value={form.video_effect} onChange={(e) => setForm({ ...form, video_effect: e.target.value })} className={SELECT}>
+                                <option value="">Project default</option>
+                                {allEffects.map((fx) => (
+                                  <option key={fx.key} value={fx.key}>{fx.name}{fx.badge ? ` (${fx.badge})` : ""}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="text-muted-foreground">Clip pace (speed)
+                              <select value={form.playback_speed} onChange={(e) => setForm({ ...form, playback_speed: e.target.value })} className={SELECT}>
+                                <option value="">Project default</option>
+                                {(presets?.playback_speeds ?? [
+                                  { value: 0.9, label: "0.9x Slow" },
+                                  { value: 1.0, label: "1.0x Normal" },
+                                  { value: 1.05, label: "1.05x Tight" },
+                                  { value: 1.1, label: "1.1x Viral" },
+                                  { value: 1.15, label: "1.15x Fast" },
+                                  { value: 1.25, label: "1.25x Rapid" },
+                                ]).map((sp) => (
+                                  <option key={sp.value} value={String(sp.value)}>{sp.label}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="text-muted-foreground">Editing layout
+                              <select value={form.editing_style} onChange={(e) => setForm({ ...form, editing_style: e.target.value })} className={SELECT}>
+                                <option value="">Project default</option>
+                                {presets?.editing_styles.map((s) => <option key={s.key} value={s.key}>{s.name}</option>)}
+                              </select>
+                            </label>
+                            <label className="text-muted-foreground">Shape
+                              <select value={form.aspect_ratio} onChange={(e) => setForm({ ...form, aspect_ratio: e.target.value })} className={SELECT}>
+                                <option value="">Project default</option>
+                                {presets?.aspect_ratios.map((a) => <option key={a.key} value={a.key}>{a.key}</option>)}
+                              </select>
+                            </label>
+                            {showBrollPicker && (
+                              <label className="text-muted-foreground sm:col-span-2">Bottom B-roll video
+                                <select value={form.broll_id} onChange={(e) => setForm({ ...form, broll_id: e.target.value })} className={SELECT}>
+                                  <option value="">Project default B-roll</option>
+                                  {broll?.map((b) => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
+                                </select>
+                              </label>
+                            )}
+                          </div>
+                          {selectedEffectMeta?.description && form.video_effect && (
+                            <p className="mt-2 text-[11px] text-muted-foreground">{selectedEffectMeta.description}</p>
                           )}
                         </div>
-                        <label className="text-xs text-muted-foreground">Post title / first line
-                          <Input className="mt-1.5 text-foreground pointer-coarse:h-11 pointer-coarse:text-base" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
-                        </label>
-                        <label className="text-xs text-muted-foreground">On-screen hook title (used by hook-card styles)
-                          <Input className="mt-1.5 text-foreground pointer-coarse:h-11 pointer-coarse:text-base" value={form.hook} onChange={(e) => setForm({ ...form, hook: e.target.value })} />
-                        </label>
-                        <label className="text-xs text-muted-foreground">Description
-                          <Textarea className="mt-1.5 text-foreground pointer-coarse:text-base" rows={3} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
-                        </label>
-                        <label className="text-xs text-muted-foreground">Hashtags
-                          <Input className="mt-1.5 text-foreground pointer-coarse:h-11 pointer-coarse:text-base" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} placeholder="#money #mindset" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
-                        </label>
 
-                        {/* Trim boundaries */}
+                        {/* 2. Music & Audio Polish */}
+                        <div className="rounded-xl border border-white/10 bg-white/[.02] p-3 text-xs">
+                          <div className="mb-2.5 flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 font-semibold text-foreground"><Music2 className="size-3.5 text-primary" /> Background Music &amp; Audio</span>
+                            <input
+                              ref={musicInput}
+                              type="file"
+                              accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
+                              onChange={uploadInlineMusic}
+                              className="sr-only"
+                            />
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              disabled={uploadingMusic}
+                              onClick={() => musicInput.current?.click()}
+                              className="h-7 gap-1 px-2 text-[11px]"
+                            >
+                              {uploadingMusic ? <Loader2 className="size-3 animate-spin" /> : <Upload className="size-3" />} Upload song
+                            </Button>
+                          </div>
+                          <div className="grid gap-3">
+                            <div>
+                              <select
+                                aria-label="Background music track"
+                                value={form.music_track_id == null ? "" : String(form.music_track_id)}
+                                onChange={(e) => setForm({ ...form, music_track_id: e.target.value ? Number(e.target.value) : null })}
+                                className={cn(SELECT, "mt-0")}
+                              >
+                                <option value="">No background music</option>
+                                {music?.map((m) => (
+                                  <option key={m.id} value={m.id}>{m.name}{m.bpm ? ` · ${Math.round(m.bpm)} BPM` : ""}</option>
+                                ))}
+                              </select>
+                            </div>
+                            {form.music_track_id != null && (
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-muted-foreground">
+                                  <span>Music volume</span>
+                                  <span className="tabular-nums">
+                                    {form.music_volume == null ? "Project default" : `${Math.round(form.music_volume * 100)}%`}
+                                    {form.music_volume != null && (
+                                      <button type="button" onClick={() => setForm({ ...form, music_volume: null })} className="ml-2 text-primary hover:underline">
+                                        Reset
+                                      </button>
+                                    )}
+                                  </span>
+                                </div>
+                                <Slider
+                                  min={0}
+                                  max={60}
+                                  step={1}
+                                  value={[Math.round((form.music_volume ?? projectSettings?.music_volume ?? 0.18) * 100)]}
+                                  onValueChange={([v]) => setForm({ ...form, music_volume: v / 100 })}
+                                />
+                              </div>
+                            )}
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              {form.music_track_id != null && (
+                                <>
+                                  <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                                    <span>Duck under voice</span>
+                                    <select value={form.ducking} onChange={(e) => setForm({ ...form, ducking: e.target.value })} className={MINI_SELECT}>
+                                      <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                                    </select>
+                                  </label>
+                                  <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                                    <span>Drop on hook</span>
+                                    <select value={form.match_drop_to_hook} onChange={(e) => setForm({ ...form, match_drop_to_hook: e.target.value })} className={MINI_SELECT}>
+                                      <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                                    </select>
+                                  </label>
+                                  <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                                    <span>Beat-sync zoom</span>
+                                    <select value={form.beat_sync_zoom} onChange={(e) => setForm({ ...form, beat_sync_zoom: e.target.value })} className={MINI_SELECT}>
+                                      <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                                    </select>
+                                  </label>
+                                </>
+                              )}
+                              <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                                <span>Cut dead pauses</span>
+                                <select value={form.remove_silences} onChange={(e) => setForm({ ...form, remove_silences: e.target.value })} className={MINI_SELECT}>
+                                  <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                                </select>
+                              </label>
+                              <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                                <span>Normalize loudness</span>
+                                <select value={form.normalize_audio} onChange={(e) => setForm({ ...form, normalize_audio: e.target.value })} className={MINI_SELECT}>
+                                  <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                                </select>
+                              </label>
+                              <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                                <span>Reduce noise</span>
+                                <select value={form.denoise_audio} onChange={(e) => setForm({ ...form, denoise_audio: e.target.value })} className={MINI_SELECT}>
+                                  <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                                </select>
+                              </label>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* 3. Captions, Hook Card & Branding */}
+                        <details className="rounded-xl border border-white/10 text-xs">
+                          <summary className="flex min-h-10 items-center gap-2 px-3 font-medium text-muted-foreground select-none">
+                            <Sliders className="size-3.5 text-primary" /> Captions, hook card &amp; watermark overrides
+                          </summary>
+                          <div className="grid gap-3 border-t border-white/10 p-3 sm:grid-cols-2">
+                            <label className="text-muted-foreground">Caption style
+                              <select value={form.caption_style} onChange={(e) => setForm({ ...form, caption_style: e.target.value })} className={SELECT}>
+                                <option value="">Project default</option>
+                                {presets?.caption_styles.map((s) => <option key={s.key} value={s.key}>{s.name}</option>)}
+                                <option value="none">No captions</option>
+                              </select>
+                            </label>
+                            <label className="text-muted-foreground">Hook card theme
+                              <select value={form.hook_card_style} onChange={(e) => setForm({ ...form, hook_card_style: e.target.value })} className={SELECT}>
+                                <option value="">Project default</option>
+                                <option value="light">Light pill</option>
+                                <option value="dark">Dark pill</option>
+                                <option value="accent">Brand gradient</option>
+                                <option value="glass">Frosted glass</option>
+                              </select>
+                            </label>
+                            <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                              <span>Auto emojis</span>
+                              <select value={form.auto_emoji} onChange={(e) => setForm({ ...form, auto_emoji: e.target.value })} className={MINI_SELECT}>
+                                <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                              </select>
+                            </label>
+                            <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                              <span>Hook card</span>
+                              <select value={form.hook_title} onChange={(e) => setForm({ ...form, hook_title: e.target.value })} className={MINI_SELECT}>
+                                <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                              </select>
+                            </label>
+                            <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                              <span>Hook duration</span>
+                              <select value={form.hook_card_duration} onChange={(e) => setForm({ ...form, hook_card_duration: e.target.value })} className={MINI_SELECT}>
+                                <option value="">Default</option>
+                                <option value="0">Entire clip</option>
+                                <option value="3">First 3s</option>
+                                <option value="5">First 5s</option>
+                                <option value="8">First 8s</option>
+                              </select>
+                            </label>
+                            <label className="flex items-center justify-between gap-2 text-muted-foreground">
+                              <span>Progress bar</span>
+                              <select value={form.progress_bar} onChange={(e) => setForm({ ...form, progress_bar: e.target.value })} className={MINI_SELECT}>
+                                <option value="">Default</option><option value="true">On</option><option value="false">Off</option>
+                              </select>
+                            </label>
+                            <div className="sm:col-span-2">
+                              <div className="mb-1 flex items-center justify-between text-muted-foreground">
+                                <span>Caption vertical height</span>
+                                <span className="tabular-nums">
+                                  {form.caption_position == null ? "Project default" : `${Math.round(form.caption_position * 100)}%`}
+                                  {form.caption_position != null && (
+                                    <button type="button" onClick={() => setForm({ ...form, caption_position: null })} className="ml-2 text-primary hover:underline">
+                                      Reset
+                                    </button>
+                                  )}
+                                </span>
+                              </div>
+                              <Slider
+                                min={15}
+                                max={82}
+                                step={1}
+                                value={[Math.round((form.caption_position ?? projectSettings?.caption_position ?? 0.65) * 100)]}
+                                onValueChange={([v]) => setForm({ ...form, caption_position: v / 100 })}
+                              />
+                            </div>
+                            <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 sm:col-span-2">
+                              <label className="text-muted-foreground">
+                                <span className="flex items-center justify-between">
+                                  <span>Watermark handle</span>
+                                  {form.watermark_custom && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setForm({ ...form, watermark_custom: false, watermark_text: "" })}
+                                      className="text-[11px] text-primary hover:underline"
+                                    >
+                                      Use default
+                                    </button>
+                                  )}
+                                </span>
+                                <Input
+                                  value={form.watermark_text}
+                                  placeholder={projectSettings?.watermark_text || "@handle (project default)"}
+                                  onChange={(e) => setForm({ ...form, watermark_custom: true, watermark_text: e.target.value })}
+                                  className="mt-1 h-8 text-xs text-foreground"
+                                />
+                              </label>
+                              <label className="text-muted-foreground">Corner
+                                <select value={form.watermark_position} onChange={(e) => setForm({ ...form, watermark_position: e.target.value })} className={cn(SELECT, "mt-1 h-8")}>
+                                  <option value="">Default</option>
+                                  <option value="top_left">Top left</option>
+                                  <option value="top_right">Top right</option>
+                                  <option value="bottom_left">Bottom left</option>
+                                  <option value="bottom_right">Bottom right</option>
+                                </select>
+                              </label>
+                            </div>
+                          </div>
+                        </details>
+
+                        {/* 4. Trim boundaries */}
                         <div className="rounded-xl border border-white/10 bg-white/[.02] p-3">
-                          <div className="mb-2 flex items-center justify-between text-xs font-medium">
-                            <span className="flex items-center gap-1.5"><Scissors className="size-3.5 text-primary" /> Trim clip timestamps</span>
-                            <span className="text-muted-foreground tabular-nums">{(form.end - form.start).toFixed(1)}s long</span>
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs font-medium">
+                            <span className="flex items-center gap-1.5"><Scissors className="size-3.5 text-primary" /> Trim timestamps</span>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={snappingSpeech}
+                                onClick={snapTrimToSpeech}
+                                className="inline-flex items-center gap-1 rounded-full bg-primary/15 px-2 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/25 disabled:opacity-50"
+                              >
+                                {snappingSpeech ? <Loader2 className="size-3 animate-spin" /> : <Scissors className="size-3" />} Snap end to speech
+                              </button>
+                              <span className="text-muted-foreground tabular-nums">{(form.end - form.start).toFixed(1)}s</span>
+                            </div>
                           </div>
                           <div className="grid grid-cols-2 gap-3 text-xs">
                             <div>
@@ -749,61 +1176,7 @@ export function ClipStudio({
                           </div>
                         </div>
 
-                        {/* Per-clip style & music overrides */}
-                        <details className="rounded-xl border border-white/10 text-xs">
-                          <summary className="flex min-h-10 items-center gap-2 px-3 font-medium text-muted-foreground select-none">
-                            <Sliders className="size-3.5 text-primary" /> Style, layout & music overrides (this clip only)
-                          </summary>
-                          <div className="grid gap-3 border-t border-white/10 p-3 sm:grid-cols-2">
-                            <label className="text-muted-foreground">Caption style
-                              <select value={form.caption_style} onChange={(e) => setForm({ ...form, caption_style: e.target.value })} className={SELECT}>
-                                <option value="">Project default</option>
-                                {presets?.caption_styles.map((s) => <option key={s.key} value={s.key}>{s.name}</option>)}
-                                <option value="none">No captions</option>
-                              </select>
-                            </label>
-                            <label className="text-muted-foreground">Editing layout
-                              <select value={form.editing_style} onChange={(e) => setForm({ ...form, editing_style: e.target.value })} className={SELECT}>
-                                <option value="">Project default</option>
-                                {presets?.editing_styles.map((s) => <option key={s.key} value={s.key}>{s.name}</option>)}
-                              </select>
-                            </label>
-                            <label className="text-muted-foreground">Shape
-                              <select value={form.aspect_ratio} onChange={(e) => setForm({ ...form, aspect_ratio: e.target.value })} className={SELECT}>
-                                <option value="">Project default</option>
-                                {presets?.aspect_ratios.map((a) => <option key={a.key} value={a.key}>{a.key}</option>)}
-                              </select>
-                            </label>
-                            <label className="text-muted-foreground">Background music
-                              <select
-                                value={form.music_track_id == null ? "" : String(form.music_track_id)}
-                                onChange={(e) => setForm({ ...form, music_track_id: e.target.value ? Number(e.target.value) : null })}
-                                className={SELECT}
-                              >
-                                <option value="">No music</option>
-                                {music?.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
-                              </select>
-                            </label>
-                            <label className="flex items-center justify-between gap-2 text-muted-foreground">
-                              <span>Auto emojis</span>
-                              <select value={form.auto_emoji} onChange={(e) => setForm({ ...form, auto_emoji: e.target.value })} className="h-8 rounded-md border border-white/15 bg-zinc-900 px-2 text-xs text-foreground">
-                                <option value="">Default</option>
-                                <option value="true">On</option>
-                                <option value="false">Off</option>
-                              </select>
-                            </label>
-                            <label className="flex items-center justify-between gap-2 text-muted-foreground">
-                              <span>Hook card</span>
-                              <select value={form.hook_title} onChange={(e) => setForm({ ...form, hook_title: e.target.value })} className="h-8 rounded-md border border-white/15 bg-zinc-900 px-2 text-xs text-foreground">
-                                <option value="">Default</option>
-                                <option value="true">On</option>
-                                <option value="false">Off</option>
-                              </select>
-                            </label>
-                          </div>
-                        </details>
-
-                        {/* Word-level caption typo editor */}
+                        {/* 5. Word-level caption typo editor */}
                         <details
                           className="rounded-xl border border-white/10 text-sm"
                           onToggle={(e) => (e.currentTarget as HTMLDetailsElement).open && void loadWords()}
@@ -837,18 +1210,39 @@ export function ClipStudio({
                           </div>
                         </details>
 
-                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                        {/* 6. Copy & Hook */}
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                          <span className="text-xs font-medium text-muted-foreground">Copy &amp; Hook text</span>
+                          {presets?.llm_configured && (
+                            <Button type="button" variant="outline" size="sm" disabled={!!saving} onClick={aiRewrite} className="h-8 text-xs">
+                              {saving === "ai" ? <Loader2 className="animate-spin" /> : <Sparkles className="text-primary" />} Rewrite with AI
+                            </Button>
+                          )}
+                        </div>
+                        <label className="text-xs text-muted-foreground">Post title / first line
+                          <Input className="mt-1 text-foreground pointer-coarse:h-11 pointer-coarse:text-base" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+                        </label>
+                        <label className="text-xs text-muted-foreground">On-screen hook title (used by hook-card styles)
+                          <Input className="mt-1 text-foreground pointer-coarse:h-11 pointer-coarse:text-base" value={form.hook} onChange={(e) => setForm({ ...form, hook: e.target.value })} />
+                        </label>
+                        <label className="text-xs text-muted-foreground">Description
+                          <Textarea className="mt-1 text-foreground pointer-coarse:text-base" rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+                        </label>
+                        <label className="text-xs text-muted-foreground">Hashtags
+                          <Input className="mt-1 text-foreground pointer-coarse:h-11 pointer-coarse:text-base" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} placeholder="#money #mindset" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+                        </label>
+
+                        <div className="sticky bottom-0 z-10 -mx-4 mt-1 flex flex-wrap items-center gap-2 border-t border-white/10 bg-card/95 px-4 py-3 backdrop-blur sm:-mx-5 sm:px-5">
                           <Button type="submit" className="pointer-coarse:h-11" disabled={!dirty || !!saving}>
                             {saving === "save" ? <Loader2 className="animate-spin" /> : <Save />} Save
                           </Button>
                           <Button type="button" variant="secondary" className="pointer-coarse:h-11" disabled={!!saving} onClick={() => save(true)}>
-                            {saving === "render" ? <Loader2 className="animate-spin" /> : <RefreshCw />} Save & re-render
+                            {saving === "render" ? <Loader2 className="animate-spin" /> : <RefreshCw />} Save &amp; re-render
                           </Button>
                           <Button type="button" variant="ghost" className="ml-auto text-destructive hover:bg-destructive/10 hover:text-destructive pointer-coarse:h-11" disabled={!!saving} onClick={removeClip}>
                             {saving === "delete" ? <Loader2 className="animate-spin" /> : <Trash2 />} Delete
                           </Button>
                         </div>
-                        <p className="text-xs leading-relaxed text-muted-foreground">Save updates copy/metadata. Save & re-render applies trim, transcript fixes, and style overrides to the video.</p>
                       </form>
                     )}
                   </div>

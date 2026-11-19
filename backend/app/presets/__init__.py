@@ -30,6 +30,11 @@ def emoji_map() -> dict[str, str]:
     return _load("emoji_map.json")
 
 
+@lru_cache
+def video_effects() -> dict[str, dict[str, Any]]:
+    return _load("video_effects.json")
+
+
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
     "9:16": (1080, 1920),
     "4:5": (1080, 1350),
@@ -48,3 +53,8 @@ def get_caption_style(key: str) -> dict[str, Any] | None:
         return None
     styles = caption_styles()
     return {"key": key, **styles.get(key, styles["hormozi"])}
+
+
+def get_video_effect(key: str) -> dict[str, Any]:
+    effects = video_effects()
+    return {"key": key, **effects.get(key, effects["none"])}

@@ -19,7 +19,7 @@ from ..pipeline import captions, highlights, ingest, llm, media
 from ..pipeline.ingest import VIDEO_EXTS
 from ..pipeline.publish_kit import PLATFORMS, build_kit, build_zip
 from ..pipeline.tasks import project_dir, same_clip, stamp, words_for_clip
-from ..presets import ASPECT_RATIOS, caption_styles, editing_styles
+from ..presets import ASPECT_RATIOS, caption_styles, editing_styles, video_effects
 from ..queue import cancel_queued, enqueue
 from ..schemas import (
     BulkClipAction,
@@ -45,7 +45,45 @@ def _validate(settings: GenerationSettings) -> GenerationSettings:
         raise HTTPException(400, f"Unknown caption_style '{settings.caption_style}'")
     if settings.aspect_ratio not in ASPECT_RATIOS:
         raise HTTPException(400, f"Unknown aspect_ratio '{settings.aspect_ratio}'")
+    if settings.video_effect not in video_effects():
+        raise HTTPException(400, f"Unknown video_effect '{settings.video_effect}'")
     return settings
+
+
+def _merge_overrides(current: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current or {})
+    for k, v in patch.items():
+        if v is None:
+            merged.pop(k, None)
+            continue
+        if k == "editing_style" and v not in editing_styles():
+            raise HTTPException(400, f"Unknown editing_style '{v}'")
+        if k == "caption_style" and v not in caption_styles() and v != "none":
+            raise HTTPException(400, f"Unknown caption_style '{v}'")
+        if k == "aspect_ratio" and v not in ASPECT_RATIOS:
+            raise HTTPException(400, f"Unknown aspect_ratio '{v}'")
+        if k == "video_effect" and v not in video_effects():
+            raise HTTPException(400, f"Unknown video_effect '{v}'")
+        if k == "playback_speed":
+            try:
+                spd = float(v)
+            except (TypeError, ValueError) as e:
+                raise HTTPException(400, "Invalid playback_speed") from e
+            if not (0.75 <= spd <= 1.5):
+                raise HTTPException(400, "playback_speed must be between 0.75 and 1.5")
+            v = spd
+        if k == "hook_card_style" and v not in ("light", "dark", "accent", "glass"):
+            raise HTTPException(400, f"Unknown hook_card_style '{v}'")
+        if k == "hook_card_duration":
+            v = max(0.0, min(30.0, float(v)))
+        if k == "music_volume":
+            v = max(0.0, min(1.0, float(v)))
+        if k == "caption_position":
+            v = max(0.1, min(0.9, float(v)))
+        if k == "watermark_position" and v not in ("top_left", "top_right", "bottom_left", "bottom_right"):
+            raise HTTPException(400, f"Unknown watermark_position '{v}'")
+        merged[k] = v
+    return merged
 
 
 def _require_project(session: Session, pid: int, user: User) -> Project:
@@ -297,7 +335,10 @@ def create_manual_clip(pid: int, body: ManualClipCreate, user: User = Depends(cu
             all_words = json.loads(tpath.read_text(encoding="utf-8")).get("words", [])
         except (OSError, ValueError):
             pass
-    words = captions.clip_words(all_words, body.start, body.end)
+    start_t, end_t = round(body.start, 3), round(body.end, 3)
+    if body.snap_speech and all_words:
+        start_t, end_t = highlights.snap_range_to_speech(all_words, start_t, end_t, p.duration or (end_t + 10.0))
+    words = captions.clip_words(all_words, start_t, end_t)
     text = " ".join(w["word"] for w in words).strip()
     existing = session.exec(select(Clip).where(Clip.project_id == pid)).all()
     next_rank = max((c.rank for c in existing), default=0) + 1
@@ -307,8 +348,8 @@ def create_manual_clip(pid: int, body: ManualClipCreate, user: User = Depends(cu
     clip = Clip(
         project_id=pid,
         rank=next_rank,
-        start=round(body.start, 3),
-        end=round(body.end, 3),
+        start=start_t,
+        end=end_t,
         score=80.0,
         score_breakdown={"manual": 1.0},
         transcript=text,
@@ -367,7 +408,15 @@ def all_ready_clips(
 
 @router.post("/clips/bulk")
 def bulk_clips(body: BulkClipAction, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    """Bulk approve / reject / reset / delete / rerender clips."""
+    """Bulk approve / reject / reset / delete / rerender / apply overrides+music across clips."""
+    if body.action == "apply":
+        if body.overrides:
+            _merge_overrides(None, body.overrides)
+        if body.music_track_id is not None and not body.clear_music:
+            mt = session.get(MusicTrack, body.music_track_id)
+            if not mt or not owns(mt, user):
+                raise HTTPException(404, "Music track not found")
+
     updated = 0
     for cid in body.clip_ids:
         c = session.get(Clip, cid)
@@ -397,6 +446,20 @@ def bulk_clips(body: BulkClipAction, user: User = Depends(current_user), session
             session.add(c)
             cancel_queued("render_clip", lambda pl, id_=cid: pl.get("clip_id") == id_)
             enqueue("render_clip", {"clip_id": c.id, "created": stamp(c.created_at)}, priority=8, session=session)
+            updated += 1
+        elif body.action == "apply":
+            if body.overrides:
+                c.overrides = _merge_overrides(c.overrides, body.overrides)
+            if body.clear_music:
+                c.music_track_id = None
+            elif body.music_track_id is not None:
+                c.music_track_id = body.music_track_id
+            if body.rerender and not p.source_deleted:
+                c.status, c.error = "pending", None
+                cancel_queued("render_clip", lambda pl, id_=cid: pl.get("clip_id") == id_)
+                enqueue("render_clip", {"clip_id": c.id, "created": stamp(c.created_at)}, priority=8, session=session)
+            c.updated_at = utcnow()
+            session.add(c)
             updated += 1
     session.commit()
     return {"ok": True, "count": updated}
@@ -456,14 +519,7 @@ def update_clip(cid: int, body: ClipUpdate, user: User = Depends(current_user), 
             c.transcript = " ".join(w["word"] for w in cleaned_words)
 
     if "overrides" in data:
-        ov = dict(data.pop("overrides") or {})
-        if "editing_style" in ov and ov["editing_style"] not in editing_styles():
-            raise HTTPException(400, f"Unknown editing_style '{ov['editing_style']}'")
-        if "caption_style" in ov and ov["caption_style"] not in caption_styles() and ov["caption_style"] != "none":
-            raise HTTPException(400, f"Unknown caption_style '{ov['caption_style']}'")
-        if "aspect_ratio" in ov and ov["aspect_ratio"] not in ASPECT_RATIOS:
-            raise HTTPException(400, f"Unknown aspect_ratio '{ov['aspect_ratio']}'")
-        c.overrides = {**dict(c.overrides or {}), **ov}
+        c.overrides = _merge_overrides(c.overrides, dict(data.pop("overrides") or {}))
 
     for k, v in data.items():
         setattr(c, k, v)

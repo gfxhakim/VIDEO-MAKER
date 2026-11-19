@@ -7,7 +7,7 @@ import useSWR, { type SWRConfiguration } from "swr";
 import { motion } from "motion/react";
 import { toast } from "sonner";
 import {
-  ArrowLeft, Check, CheckSquare, Clock, Download, HardDrive, Loader2, Palette, Plus, RotateCcw, Search, Sparkles, ThumbsDown, ThumbsUp, Trash2, TriangleAlert, WifiOff,
+  ArrowLeft, Check, CheckSquare, Clock, Download, HardDrive, Loader2, Palette, Plus, RotateCcw, Search, Sparkles, ThumbsDown, ThumbsUp, Trash2, TriangleAlert, Wand2, WifiOff,
 } from "lucide-react";
 import { PageHeader } from "@/components/app-shell";
 import { aspectClass, CLIP_GRID, ClipCard, ClipGridSkeleton } from "@/components/clip-card";
@@ -18,7 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { ApiError, api, fetcher, type Clip, type GenerationSettings, type Project, type TranscriptResponse } from "@/lib/api";
+import { ApiError, api, fetcher, type Clip, type GenerationSettings, type MusicTrack, type Presets, type Project, type TranscriptResponse } from "@/lib/api";
 import { cn, fmtBytes, fmtDuration } from "@/lib/utils";
 
 const isLive = (p?: Project) => p?.status === "queued" || p?.status === "processing";
@@ -268,6 +268,16 @@ function ProjectView() {
   const [restyleMode, setRestyleMode] = useState<"restyle" | "rescore">("restyle");
   const [starting, setStarting] = useState(false);
 
+  // Batch FX / Music modal
+  const { data: presets } = useSWR<Presets>("/api/presets", fetcher, { revalidateOnFocus: false });
+  const { data: music } = useSWR<MusicTrack[]>("/api/music", fetcher);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchEffect, setBatchEffect] = useState("");
+  const [batchSpeed, setBatchSpeed] = useState("");
+  const [batchCaption, setBatchCaption] = useState("");
+  const [batchMusic, setBatchMusic] = useState("__keep__");
+  const [batchSilences, setBatchSilences] = useState("");
+
   // Manual clip modal
   const [manualOpen, setManualOpen] = useState(false);
   const [trData, setTrData] = useState<TranscriptResponse | null>(null);
@@ -275,6 +285,7 @@ function ProjectView() {
   const [mStart, setMStart] = useState(0);
   const [mEnd, setMEnd] = useState(20);
   const [mTitle, setMTitle] = useState("");
+  const [mSnap, setMSnap] = useState(true);
   const [mBusy, setMBusy] = useState(false);
 
   const counts = useMemo(() => {
@@ -331,6 +342,41 @@ function ProjectView() {
     }
   }
 
+  async function submitBatchEdit(e: React.FormEvent) {
+    e.preventDefault();
+    const ids = Array.from(selected);
+    if (!ids.length) return;
+    const overrides: Record<string, unknown> = {};
+    if (batchEffect) overrides.video_effect = batchEffect;
+    if (batchSpeed) overrides.playback_speed = Number(batchSpeed);
+    if (batchCaption) overrides.caption_style = batchCaption;
+    if (batchSilences) overrides.remove_silences = batchSilences === "true";
+    const clear_music = batchMusic === "__clear__";
+    const music_track_id = !clear_music && batchMusic !== "__keep__" ? Number(batchMusic) : undefined;
+    if (!Object.keys(overrides).length && !clear_music && music_track_id == null) {
+      return void toast("Pick at least one FX, speed, caption, or music change to apply");
+    }
+    setBulkBusy(true);
+    try {
+      await api.bulkClips(ids, "apply", { overrides, music_track_id, clear_music, rerender: true });
+      setBatchOpen(false);
+      setBatchEffect("");
+      setBatchSpeed("");
+      setBatchCaption("");
+      setBatchMusic("__keep__");
+      setBatchSilences("");
+      setSelected(new Set());
+      setSelectMode(false);
+      await mutateClips();
+      await mutateProject();
+      toast.success(`Applying edits & re-rendering ${ids.length} clip(s)`);
+    } catch (err) {
+      toast.error("Batch update failed", { description: (err as Error).message });
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   async function openManualDialog() {
     setManualOpen(true);
     if (!trData && project) {
@@ -347,7 +393,7 @@ function ProjectView() {
     if (!project) return;
     setMBusy(true);
     try {
-      const c = await api.createManualClip(project.id, { start: mStart, end: mEnd, title: mTitle || undefined });
+      const c = await api.createManualClip(project.id, { start: mStart, end: mEnd, title: mTitle || undefined, snap_speech: mSnap });
       await mutateClips((list) => (list ? [...list, c] : [c]), { revalidate: true });
       await mutateProject();
       setManualOpen(false);
@@ -400,6 +446,8 @@ function ProjectView() {
     project.duration != null && `${fmtDuration(project.duration)} source`,
     styleName(project.settings.editing_style),
     project.settings.caption_style && `${styleName(project.settings.caption_style)} captions`,
+    project.settings.video_effect && project.settings.video_effect !== "none" && `${styleName(project.settings.video_effect)} FX`,
+    project.settings.playback_speed && project.settings.playback_speed !== 1 && `${project.settings.playback_speed}x speed`,
     project.settings.aspect_ratio,
   ].filter(Boolean).join(" · ");
 
@@ -527,6 +575,7 @@ function ProjectView() {
           <div className="ml-auto flex flex-wrap gap-1.5">
             <Button size="sm" variant="secondary" disabled={!selected.size || bulkBusy} onClick={() => runBulk("approve")}><ThumbsUp className="size-3.5" /> Approve</Button>
             <Button size="sm" variant="secondary" disabled={!selected.size || bulkBusy} onClick={() => runBulk("reject")}><ThumbsDown className="size-3.5" /> Reject</Button>
+            <Button size="sm" variant="default" disabled={!selected.size || bulkBusy || project.source_deleted} onClick={() => setBatchOpen(true)}><Wand2 className="size-3.5" /> Batch FX / Music</Button>
             <Button size="sm" variant="secondary" disabled={!selected.size || bulkBusy || project.source_deleted} onClick={() => runBulk("rerender")}><RotateCcw className="size-3.5" /> Re-render</Button>
             <Button size="sm" variant="destructive" disabled={!selected.size || bulkBusy} onClick={() => runBulk("delete")}><Trash2 className="size-3.5" /> Delete</Button>
           </div>
@@ -545,7 +594,8 @@ function ProjectView() {
               selected={selected.has(c.id)}
               onToggleSelect={toggleSelect}
               onChange={updateClip}
-              onOpen={studio.open}
+              onOpen={(cid) => studio.open(cid, "publish")}
+              onEdit={(cid) => studio.open(cid, "edit")}
             />
           ))}
         </div>
@@ -574,7 +624,9 @@ function ProjectView() {
       <ClipStudio
         clips={studio.clips}
         index={studio.index}
+        initialTab={studio.tab}
         projectAspect={project.settings.aspect_ratio}
+        projectSettings={project.settings}
         onOpen={studio.open}
         onClose={studio.close}
         onChange={updateClip}
@@ -600,7 +652,7 @@ function ProjectView() {
                   )}
                 >
                   <div className="font-semibold text-foreground">Keep existing clips &amp; edits</div>
-                  <p className="mt-0.5 text-muted-foreground">Re-renders all {counts.all} clips with the new captions, layout, music &amp; polish while keeping titles, approvals, and posted badges.</p>
+                  <p className="mt-0.5 text-muted-foreground">Re-renders all {counts.all} clips with the new effects, captions, layout, music &amp; polish while keeping titles, approvals, and posted badges.</p>
                 </button>
                 <button
                   type="button"
@@ -627,6 +679,74 @@ function ProjectView() {
         </DialogContent>
       </Dialog>
 
+      {/* Batch FX / Music modal */}
+      <Dialog open={batchOpen} onOpenChange={(o) => !o && !bulkBusy && setBatchOpen(false)}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Edit {selected.size} selected clip{selected.size === 1 ? "" : "s"}</DialogTitle>
+            <DialogDescription>Apply a trending effect, speed adjustment, caption style, or background music track to the selected clips and re-render them.</DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <form id="batch-edit-form" onSubmit={submitBatchEdit} className="grid gap-3 text-xs">
+              <label className="text-muted-foreground">Trending video effect
+                <select value={batchEffect} onChange={(e) => setBatchEffect(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="">Keep existing</option>
+                  {presets?.video_effects?.map((fx) => (
+                    <option key={fx.key} value={fx.key}>{fx.name}{fx.badge ? ` (${fx.badge})` : ""}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-muted-foreground">Clip pace (speed)
+                <select value={batchSpeed} onChange={(e) => setBatchSpeed(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="">Keep existing</option>
+                  {(presets?.playback_speeds ?? [
+                    { value: 0.9, label: "0.9x Slow" },
+                    { value: 1.0, label: "1.0x Normal" },
+                    { value: 1.05, label: "1.05x Tight" },
+                    { value: 1.1, label: "1.1x Viral" },
+                    { value: 1.15, label: "1.15x Fast" },
+                    { value: 1.25, label: "1.25x Rapid" },
+                  ]).map((sp) => (
+                    <option key={sp.value} value={String(sp.value)}>{sp.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-muted-foreground">Background music
+                <select value={batchMusic} onChange={(e) => setBatchMusic(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="__keep__">Keep existing music</option>
+                  <option value="__clear__">Remove music</option>
+                  {music?.map((m) => (
+                    <option key={m.id} value={String(m.id)}>{m.name}{m.bpm ? ` · ${Math.round(m.bpm)} BPM` : ""}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-muted-foreground">Caption style
+                <select value={batchCaption} onChange={(e) => setBatchCaption(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="">Keep existing</option>
+                  {presets?.caption_styles.map((s) => (
+                    <option key={s.key} value={s.key}>{s.name}</option>
+                  ))}
+                  <option value="none">No captions</option>
+                </select>
+              </label>
+              <label className="text-muted-foreground">Auto jump-cut awkward silences
+                <select value={batchSilences} onChange={(e) => setBatchSilences(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="">Keep existing</option>
+                  <option value="true">Turn On</option>
+                  <option value="false">Turn Off</option>
+                </select>
+              </label>
+            </form>
+          </DialogBody>
+          <DialogFooter>
+            <Button variant="ghost" disabled={bulkBusy} onClick={() => setBatchOpen(false)}>Cancel</Button>
+            <Button type="submit" form="batch-edit-form" className="bg-brand text-white" disabled={bulkBusy}>
+              {bulkBusy ? <Loader2 className="animate-spin" /> : <Wand2 />} Apply &amp; re-render {selected.size}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Manual Clip Creator dialog */}
       <Dialog open={manualOpen} onOpenChange={(o) => !o && !mBusy && setManualOpen(false)}>
         <DialogContent className="sm:max-w-2xl">
@@ -644,6 +764,10 @@ function ProjectView() {
                   <Input type="number" step="0.5" min={1} max={project.duration ?? undefined} value={mEnd} onChange={(e) => setMEnd(Number(e.target.value))} className="mt-1" required />
                 </label>
               </div>
+              <label className="flex items-center gap-2 text-xs text-foreground">
+                <input type="checkbox" checked={mSnap} onChange={(e) => setMSnap(e.target.checked)} className="size-4 accent-primary" />
+                Snap clip end cleanly to when the speaker finishes their sentence / stops talking
+              </label>
               <label className="text-xs text-muted-foreground">Title / Hook (optional)
                 <Input value={mTitle} onChange={(e) => setMTitle(e.target.value)} placeholder="Leave empty to auto-fill from speech" className="mt-1" />
               </label>
@@ -671,7 +795,7 @@ function ProjectView() {
                         key={idx}
                         type="button"
                         onClick={() => {
-                          setMStart(Math.max(0, Number((s.start - 0.2).toFixed(1))));
+                          setMStart(Math.max(0, Number((s.start - 0.15).toFixed(1))));
                           setMEnd(Math.min(project.duration || s.end + 25, Number((s.start + 25).toFixed(1))));
                           if (!mTitle) setMTitle(s.text.slice(0, 75));
                         }}

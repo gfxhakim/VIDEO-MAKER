@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from ..config import ffmpeg_thread_count, get_settings, nice_prefix
 from .captions import EmojiCue
+from .effects import apply_video_effect
 from .media import MediaError, ffmpeg_escape_path, run, run_progress
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,8 @@ class RenderSpec:
     progress_bar: bool = False
     watermark_text: str = ""
     watermark_position: str = "bottom_right"
+    video_effect: str = "none"
+    speed: float = 1.0
     fps: float = 0.0
 
 
@@ -89,7 +92,10 @@ def build_command(spec: RenderSpec) -> list[str]:
     s = get_settings()
     src_dur = spec.end - spec.start
     segs = spec.keep_segments if spec.keep_segments and len(spec.keep_segments) > 1 else None
-    dur = sum(b - a for a, b in segs) if segs else src_dur
+    base_dur = sum(b - a for a, b in segs) if segs else src_dur
+    spd = max(0.75, min(1.5, float(spec.speed or 1.0)))
+    has_speed = abs(spd - 1.0) > 1e-3
+    dur = base_dur / spd
     threads = str(ffmpeg_thread_count())
     cmd: list[str] = [*nice_prefix(), s.ffmpeg_bin, "-y", "-hide_banner", "-v", "error",
                       "-filter_complex_threads", threads, "-threads", threads,
@@ -146,12 +152,21 @@ def build_command(spec: RenderSpec) -> list[str]:
             parts.append(f"{a_refs}concat=n={len(segs)}:v=0:a=1[acut]")
             a_label = "[acut]"
 
+    if has_speed:
+        parts.append(f"{v_label}setpts=PTS/{spd:.4f}[vspd]")
+        v_label = "[vspd]"
+
     vf = spec.video_filter.replace("[0:v]", v_label) if v_label != "[0:v]" else spec.video_filter
     if broll_idx is not None:
         vf = vf.replace("[broll:v]", f"[{broll_idx}:v]")
     parts.append(vf)
 
     last = "vbase"
+    if spec.video_effect and spec.video_effect != "none":
+        fx_parts = apply_video_effect(last, spec.video_effect, spec.out_w, spec.out_h, "vefx")
+        if fx_parts:
+            parts.extend(fx_parts)
+            last = "vefx"
     if spec.ass_path:
         fonts = ffmpeg_escape_path(s.fonts_dir)
         parts.append(f"[{last}]subtitles=filename={spec.ass_path.name}:fontsdir={fonts}[vsub]")
@@ -193,6 +208,8 @@ def build_command(spec: RenderSpec) -> list[str]:
     a_out = None
     if spec.has_audio:
         achain = [f"{a_label}aresample=48000", "aformat=channel_layouts=stereo"]
+        if has_speed:
+            achain.append(f"atempo={spd:.4f}")
         if spec.denoise_audio:
             achain.append("highpass=f=80,afftdn=nf=-22")
         if spec.normalize_audio:
@@ -223,7 +240,7 @@ def build_command(spec: RenderSpec) -> list[str]:
         else:
             parts.append("[mus]anull[aout]")
         a_out = "[aout]"
-    elif spec.has_audio and (segs or spec.denoise_audio or spec.normalize_audio):
+    elif spec.has_audio and (segs or spec.denoise_audio or spec.normalize_audio or has_speed):
         parts.append(f"{voice_filters}[aout]")
         a_out = "[aout]"
 
@@ -247,7 +264,9 @@ def render(spec: RenderSpec, on_progress: Optional[Callable[[float], None]] = No
     cmd = build_command(spec)
     (spec.work_dir / "ffmpeg_cmd.txt").write_text(" ".join(f"'{c}'" if " " in c or ";" in c else c for c in cmd))
     segs = spec.keep_segments if spec.keep_segments and len(spec.keep_segments) > 1 else None
-    dur = sum(b - a for a, b in segs) if segs else (spec.end - spec.start)
+    base_dur = sum(b - a for a, b in segs) if segs else (spec.end - spec.start)
+    spd = max(0.75, min(1.5, float(spec.speed or 1.0)))
+    dur = base_dur / spd
     try:
         run_progress(cmd, dur, on_progress, timeout=max(600, dur * 40), cwd=spec.work_dir)
     except MediaError as e:

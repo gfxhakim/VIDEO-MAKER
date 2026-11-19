@@ -23,7 +23,8 @@ from .db import init_db
 from .jobs import register_all
 from .pipeline import llm
 from .pipeline.media import check_binaries
-from .presets import ASPECT_RATIOS, caption_styles, editing_styles
+from .presets import ASPECT_RATIOS, caption_styles, editing_styles, video_effects
+from .queue import Worker  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("autoclip")
@@ -154,6 +155,15 @@ def presets():
     return {
         "editing_styles": [{"key": k, **v} for k, v in editing_styles().items()],
         "caption_styles": [{"key": k, **v} for k, v in caption_styles().items()],
+        "video_effects": [{"key": k, **v} for k, v in video_effects().items()],
+        "playback_speeds": [
+            {"value": 0.9, "label": "0.9x Slow"},
+            {"value": 1.0, "label": "1.0x Normal"},
+            {"value": 1.05, "label": "1.05x Tight"},
+            {"value": 1.1, "label": "1.1x Viral"},
+            {"value": 1.15, "label": "1.15x Fast"},
+            {"value": 1.25, "label": "1.25x Rapid"},
+        ],
         "aspect_ratios": [{"key": k, "width": w, "height": h} for k, (w, h) in ASPECT_RATIOS.items()],
         "hook_card_styles": [
             {"key": "light", "name": "Light pill"},

@@ -85,11 +85,23 @@ def enhance_candidates(clips: list[Any]) -> None:
     """Optionally boost/rerank candidate clips and improve titles/hooks in one batched prompt."""
     if not is_configured() or not clips:
         return
-    items = [{"index": i, "text": c.text[:550], "heuristic_score": c.score} for i, c in enumerate(clips[:25])]
+    items = [
+        {
+            "index": i,
+            "duration": round(float(c.duration), 1),
+            "hook_line": str(c.hook)[:140],
+            "text": c.text[:600],
+            "heuristic_score": c.score,
+        }
+        for i, c in enumerate(clips[:25])
+    ]
     try:
         res = chat_json(
-            "You evaluate short video clips for retention & hooks. Reply ONLY in JSON: "
-            "{\"clips\": [{\"index\": int, \"boost\": float (-15 to +15), \"title\": str, \"hook\": str, \"hashtags\": [str]}]}.",
+            "You evaluate short video clips for viral retention on TikTok, Reels & Shorts. "
+            "Score higher when the first sentence creates curiosity/stakes, the middle builds tension or clear insight, "
+            "and the ending lands cleanly with a complete takeaway (never cut mid-thought). "
+            "Reply ONLY in JSON: "
+            "{\"clips\": [{\"index\": int, \"boost\": float (-18 to +18), \"title\": str, \"hook\": str, \"hashtags\": [str]}]}.",
             json.dumps({"clips": items}),
             timeout=30.0,
         )
@@ -97,7 +109,7 @@ def enhance_candidates(clips: list[Any]) -> None:
             idx = int(entry.get("index", -1))
             if 0 <= idx < len(clips):
                 c = clips[idx]
-                boost = max(-15.0, min(15.0, float(entry.get("boost", 0.0))))
+                boost = max(-18.0, min(18.0, float(entry.get("boost", 0.0))))
                 c.score = round(max(0.0, min(100.0, c.score + boost)), 1)
                 if entry.get("title"):
                     c.hook = str(entry["title"])[:90]

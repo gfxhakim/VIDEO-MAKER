@@ -396,7 +396,7 @@ def _analyze_audio(pid: int, created: str, stage: Callable[[str, float], None], 
 
 # =====================================================================  render
 def _emphasis_windows(words: list[dict], energy: np.ndarray, clip_start: float, gap: float = 3.0,
-                      beats: list[float] | None = None, music_offset: float = 0.0) -> list[tuple[float, float]]:
+                      beats: list[float] | None = None, music_offset: float = 0.0, speed: float = 1.0) -> list[tuple[float, float]]:
     out: list[tuple[float, float]] = []
     if len(energy):
         ref = energy[energy > -55]
@@ -412,7 +412,7 @@ def _emphasis_windows(words: list[dict], energy: np.ndarray, clip_start: float, 
     for w in words:
         loud = False
         if len(energy):
-            i = int((w["start"] + clip_start) / ENERGY_STEP)
+            i = int((w["start"] * speed + clip_start) / ENERGY_STEP)
             if 0 <= i < len(energy):
                 loud = (energy[i] - mu) / sd > 1.3
         if captions.is_keyword(w["word"]) or loud or w["word"].endswith("!"):
@@ -546,6 +546,9 @@ def _render(payload: dict) -> None:
         style = get_editing_style(settings.get("editing_style", "face_track_zoom"))
         cap_style = get_caption_style(settings.get("caption_style", "hormozi"))
         src_dur = end - start
+        speed = max(0.75, min(1.5, float(settings.get("playback_speed", 1.0) or 1.0)))
+        has_speed = abs(speed - 1.0) > 1e-3
+        video_effect = str(settings.get("video_effect", "none") or "none")
 
         tpath = pdir / "transcript.json"
         if words_override:
@@ -576,6 +579,12 @@ def _render(payload: dict) -> None:
             pdir, source, start, end, lambda: _clip_current(cid, created))
         _set_inflight(cid, pid, FACE_SHARE)
 
+        if has_speed:
+            words = [{**w, "start": round(w["start"] / speed, 3), "end": round(w["end"] / speed, 3)} for w in words]
+            track = reframe.FaceTrack(times=[t / speed for t in track.times], faces=track.faces)
+            scene_cuts = [c / speed for c in scene_cuts]
+            dur = dur / speed
+
         music_offset = 0.0
         beats_list: list[float] = []
         if music_info and music_info[0].exists():
@@ -588,6 +597,7 @@ def _render(payload: dict) -> None:
             words, energy, start,
             beats=beats_list if use_beats else None,
             music_offset=music_offset,
+            speed=speed,
         ) if (style.get("zoom_on_emphasis") or use_beats) else []
 
         lay = reframe.build_layout(
@@ -612,6 +622,8 @@ def _render(payload: dict) -> None:
             progress_bar=bool(settings.get("progress_bar", False)),
             watermark_text=str(wm_text or ""),
             watermark_position=str(wm_pos),
+            video_effect=video_effect,
+            speed=speed,
             fps=info.fps,
         )
 
