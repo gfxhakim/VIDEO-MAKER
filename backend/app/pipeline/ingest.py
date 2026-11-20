@@ -84,6 +84,30 @@ def resolve_local_path(path: str, dest_dir: Path) -> Path:
     return dest
 
 
+def _ydl_base_opts() -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    cookie_path = get_settings().effective_ytdlp_cookies_path()
+    if cookie_path is not None:
+        opts["cookiefile"] = str(cookie_path)
+    return opts
+
+
+def _friendly_download_error(prefix: str, exc: Exception) -> MediaError:
+    msg = str(exc)
+    low = msg.lower()
+    if "confirm you’re not a bot" in low or "confirm you're not a bot" in low or "use --cookies" in low:
+        return MediaError(
+            "YouTube blocked downloads from this cloud server IP and requires sign-in verification. "
+            "Upload the video file directly from your device using Upload Video, or ask the server admin "
+            "to add Netscape cookies.txt in Admin -> YouTube Cookies (or set YTDLP_COOKIES in Railway Variables)."
+        )
+    return MediaError(f"{prefix}: {msg}")
+
+
 def probe_url(url: str) -> dict[str, Any]:
     """Fetch metadata for a URL without downloading the video."""
     u = validate_url_reachable(url)
@@ -93,9 +117,7 @@ def probe_url(url: str) -> dict[str, Any]:
         raise MediaError("yt-dlp is not installed: pip install yt-dlp") from e
 
     opts = {
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
+        **_ydl_base_opts(),
         "skip_download": True,
         "socket_timeout": 20,
     }
@@ -103,7 +125,7 @@ def probe_url(url: str) -> dict[str, Any]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(u, download=False)
     except Exception as e:
-        raise MediaError(f"Could not inspect URL: {e}") from e
+        raise _friendly_download_error("Could not inspect URL", e) from e
     if not isinstance(info, dict):
         raise MediaError("Could not read metadata for this URL")
     return {
@@ -139,12 +161,10 @@ def download_url(
                 on_progress(min(0.99, d.get("downloaded_bytes", 0) / total))
 
     opts = {
+        **_ydl_base_opts(),
         "format": s.ytdlp_format,
         "outtmpl": str(dest_dir / "source.%(ext)s"),
         "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
         "progress_hooks": [hook],
         "retries": 5,
         "fragment_retries": 5,
@@ -159,7 +179,7 @@ def download_url(
     except DownloadCancelled:
         raise
     except Exception as e:
-        raise MediaError(f"Download failed: {e}") from e
+        raise _friendly_download_error("Download failed", e) from e
     if not filename.exists():
         candidates = sorted(dest_dir.glob("source.*"), key=lambda p: p.stat().st_size, reverse=True)
         if not candidates:

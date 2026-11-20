@@ -19,7 +19,7 @@ from .api import auth as auth_api
 from .api import broll, music, projects, system, uploads
 from .api.deps import current_user
 from .auth import request_user_id
-from .config import effective_cpus, get_settings, memory_limit_bytes, worker_count
+from .config import effective_cpus, get_settings, memory_limit_bytes, sync_ytdlp_cookies_from_env, worker_count
 from .db import init_db
 from .jobs import register_all
 from .pipeline import llm
@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     s = get_settings()
     init_db()
     auth_api.bootstrap_admin()
+    sync_ytdlp_cookies_from_env()
     register_all()
     uploads.recover_uploads()
     bins = check_binaries()

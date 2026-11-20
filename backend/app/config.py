@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     ytdlp_format: str = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"
     ytdlp_max_filesize_gb: float = 4.0
     ytdlp_timeout_seconds: int = 1800
+    ytdlp_cookies_file: str = ""
+    ytdlp_cookies: str = ""
     allow_local_paths: bool = True
     allow_private_urls: bool = False
 
@@ -110,6 +112,20 @@ class Settings(BaseSettings):
     @property
     def admin_credentials_path(self) -> Path:
         return self.data_dir / "admin_credentials.txt"
+
+    @property
+    def ytdlp_cookies_path(self) -> Path:
+        return self.data_dir / "ytdlp_cookies.txt"
+
+    def effective_ytdlp_cookies_path(self) -> Path | None:
+        if self.ytdlp_cookies_file:
+            p = Path(os.path.expanduser(self.ytdlp_cookies_file))
+            if p.is_file() and p.stat().st_size > 0:
+                return p
+        p = self.ytdlp_cookies_path
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+        return None
 
     @property
     def fonts_dir(self) -> Path:
@@ -167,6 +183,33 @@ def save_runtime_config(patch: dict[str, Any]) -> dict[str, Any]:
     tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
     os.replace(tmp, p)
     return cur
+
+
+def save_ytdlp_cookies(raw: str) -> bool:
+    """Persist Netscape cookies.txt under DATA_DIR (0600) or delete when empty."""
+    s = get_settings()
+    s.ensure_dirs()
+    p = s.ytdlp_cookies_path
+    cleaned = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in cleaned and "\\n" in cleaned:
+        cleaned = cleaned.replace("\\n", "\n")
+    if not cleaned.strip():
+        p.unlink(missing_ok=True)
+        return False
+    if not cleaned.endswith("\n"):
+        cleaned += "\n"
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(cleaned, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+    return True
+
+
+def sync_ytdlp_cookies_from_env() -> None:
+    """If YTDLP_COOKIES env var is set on Railway, sync it into DATA_DIR/ytdlp_cookies.txt."""
+    s = get_settings()
+    if s.ytdlp_cookies.strip():
+        save_ytdlp_cookies(s.ytdlp_cookies)
 
 
 @lru_cache

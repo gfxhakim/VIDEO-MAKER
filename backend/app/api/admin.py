@@ -13,7 +13,7 @@ from sqlmodel import Session, col, func, or_, select
 
 from ..activity import as_utc, log_activity
 from ..auth import hash_password
-from ..config import get_settings, is_signup_open, save_runtime_config
+from ..config import get_settings, is_signup_open, save_runtime_config, save_ytdlp_cookies
 from ..db import get_session
 from ..models import ActivityLog, BrollClip, Clip, Job, MusicTrack, Project, Upload, User, utcnow
 from ..pipeline.tasks import project_dir, same_clip, stamp
@@ -41,6 +41,7 @@ class AdminUserUpdate(BaseModel):
 
 class AdminSettingsUpdate(BaseModel):
     allow_signup: Optional[bool] = None
+    ytdlp_cookies: Optional[str] = Field(None, max_length=500_000)
 
 
 def _dir_bytes(path: Path) -> int:
@@ -129,6 +130,7 @@ def admin_overview(session: Session = Depends(get_session)):
             "data_dir_bytes": _dir_bytes(s.data_dir),
         },
         "signup_open": is_signup_open(),
+        "ytdlp_cookies_configured": bool(s.effective_ytdlp_cookies_path()),
     }
 
 
@@ -557,9 +559,30 @@ def list_all_jobs(limit: int = Query(60, ge=1, le=200), session: Session = Depen
     return out
 
 
+def _admin_settings_out() -> dict[str, Any]:
+    from datetime import datetime, timezone
+
+    s = get_settings()
+    cp = s.effective_ytdlp_cookies_path()
+    source = None
+    updated_at = None
+    if cp is not None:
+        source = "env_file" if (s.ytdlp_cookies_file and cp == Path(s.ytdlp_cookies_file).expanduser()) else "saved"
+        try:
+            updated_at = datetime.fromtimestamp(cp.stat().st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            pass
+    return {
+        "allow_signup": is_signup_open(),
+        "ytdlp_cookies_configured": cp is not None,
+        "ytdlp_cookies_source": source,
+        "ytdlp_cookies_updated_at": updated_at,
+    }
+
+
 @router.get("/settings")
 def get_admin_settings():
-    return {"allow_signup": is_signup_open()}
+    return _admin_settings_out()
 
 
 @router.put("/settings")
@@ -569,15 +592,20 @@ def update_admin_settings(
     admin: User = Depends(require_admin),
     session: Session = Depends(get_session),
 ):
-    patch = body.model_dump(exclude_none=True)
-    if patch:
-        save_runtime_config(patch)
+    notes: list[str] = []
+    if body.allow_signup is not None:
+        save_runtime_config({"allow_signup": body.allow_signup})
+        notes.append(f"allow_signup={body.allow_signup}")
+    if body.ytdlp_cookies is not None:
+        saved = save_ytdlp_cookies(body.ytdlp_cookies)
+        notes.append("ytdlp_cookies=saved" if saved else "ytdlp_cookies=cleared")
+    if notes:
         log_activity(
             session,
             user=admin,
             action="admin_settings_update",
             target_type="settings",
-            detail=", ".join(f"{k}={v}" for k, v in patch.items()),
+            detail=", ".join(notes),
             request=request,
         )
-    return {"allow_signup": is_signup_open()}
+    return _admin_settings_out()

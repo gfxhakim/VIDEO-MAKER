@@ -485,3 +485,46 @@ def test_admin_panel_activity_tracking_and_bootstrap(tmp_path, monkeypatch):
                 assert s.exec(select(ActivityLog).where(ActivityLog.action == "admin_user_delete")).first() is not None
 
 
+def test_ytdlp_cookies_and_friendly_bot_error(tmp_path, monkeypatch):
+    from app.config import sync_ytdlp_cookies_from_env
+    from app.pipeline import ingest as ingest_mod
+
+    init_db()
+    with _signed_in(TestClient(app), "me@example.com") as adm:
+        # Admin uploads Netscape cookies.txt (returned metadata only, never raw cookie string)
+        raw_cookies = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tdemo-value\n"
+        r = adm.put("/api/admin/settings", json={"ytdlp_cookies": raw_cookies})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ytdlp_cookies_configured"] is True
+        assert body["ytdlp_cookies_source"] == "saved"
+        assert "demo-value" not in r.text
+
+        opts = ingest_mod._ydl_base_opts()
+        assert opts.get("cookiefile") == str(get_settings().ytdlp_cookies_path)
+
+        # Friendly bot-verification error mapping
+        friendly = ingest_mod._friendly_download_error(
+            "Download failed",
+            RuntimeError("ERROR: [youtube] demo: Sign in to confirm you're not a bot. Use --cookies for the authentication"),
+        )
+        assert "Upload Video" in str(friendly) and "cookies.txt" in str(friendly)
+
+        # Admin can clear saved cookies cleanly
+        rc = adm.put("/api/admin/settings", json={"ytdlp_cookies": ""})
+        assert rc.status_code == 200 and rc.json()["ytdlp_cookies_configured"] is False
+        assert "cookiefile" not in ingest_mod._ydl_base_opts()
+
+    # Env var YTDLP_COOKIES sync works with single-line \n escapes too
+    monkeypatch.setenv("YTDLP_COOKIES", "# Netscape HTTP Cookie File\\n.youtube.com\tTRUE\t/\tTRUE\t0\tA\tB")
+    get_settings.cache_clear()
+    try:
+        sync_ytdlp_cookies_from_env()
+        assert get_settings().effective_ytdlp_cookies_path() == get_settings().ytdlp_cookies_path
+    finally:
+        monkeypatch.delenv("YTDLP_COOKIES", raising=False)
+        get_settings().ytdlp_cookies_path.unlink(missing_ok=True)
+        get_settings.cache_clear()
+
+
+

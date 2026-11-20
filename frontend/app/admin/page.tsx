@@ -8,6 +8,7 @@ import {
   Activity,
   Ban,
   CheckCircle2,
+  Cookie,
   FolderKanban,
   HardDrive,
   KeyRound,
@@ -20,6 +21,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Trash2,
+  Upload,
   UserCheck,
   UserPlus,
   Users,
@@ -37,6 +39,7 @@ import {
   type AdminJobRow,
   type AdminOverview,
   type AdminProjectRow,
+  type AdminSettings,
   type AdminUserRow,
 } from "@/lib/api";
 import { cn, fmtBytes, fmtDate, pctOf } from "@/lib/utils";
@@ -106,9 +109,15 @@ export default function AdminPage() {
   const [resetPass, setResetPass] = useState("");
   const [busyId, setBusyId] = useState<number | null>(null);
 
+  // YouTube / yt-dlp cookies drawer state
+  const [showCookies, setShowCookies] = useState(false);
+  const [cookiesText, setCookiesText] = useState("");
+  const [savingCookies, setSavingCookies] = useState(false);
+
   const pollMs = live ? 5000 : 0;
 
   const { data: overview, mutate: mutateOverview } = useSWR<AdminOverview>(isAdmin ? "/api/admin/overview" : null, fetcher, { refreshInterval: pollMs });
+  const { data: adminCfg, mutate: mutateAdminCfg } = useSWR<AdminSettings>(isAdmin ? "/api/admin/settings" : null, fetcher);
   const { data: users, mutate: mutateUsers } = useSWR<AdminUserRow[]>(
     isAdmin ? `/api/admin/users${userSearch.trim() ? `?q=${encodeURIComponent(userSearch.trim())}` : ""}` : null,
     fetcher,
@@ -140,7 +149,7 @@ export default function AdminPage() {
   );
 
   async function refreshAll() {
-    await Promise.all([mutateOverview(), mutateUsers(), mutateActivity(), mutateProjects(), mutateJobs()]);
+    await Promise.all([mutateOverview(), mutateAdminCfg(), mutateUsers(), mutateActivity(), mutateProjects(), mutateJobs()]);
   }
 
   async function toggleSignup() {
@@ -149,11 +158,56 @@ export default function AdminPage() {
     try {
       await api.adminUpdateSettings({ allow_signup: next });
       await mutateOverview();
+      await mutateAdminCfg();
       await mutateActivity();
       toast.success(next ? "Public visitor sign-ups opened" : "Public visitor sign-ups paused");
     } catch (err) {
       toast.error((err as Error).message);
     }
+  }
+
+  async function saveCookies(e: React.FormEvent) {
+    e.preventDefault();
+    if (!cookiesText.trim()) return;
+    setSavingCookies(true);
+    try {
+      await api.adminUpdateSettings({ ytdlp_cookies: cookiesText });
+      setCookiesText("");
+      setShowCookies(false);
+      await mutateOverview();
+      await mutateAdminCfg();
+      await mutateActivity();
+      toast.success("YouTube cookies saved for URL downloads");
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSavingCookies(false);
+    }
+  }
+
+  async function clearCookies() {
+    if (!window.confirm("Remove saved YouTube cookies.txt from server?")) return;
+    setSavingCookies(true);
+    try {
+      await api.adminUpdateSettings({ ytdlp_cookies: "" });
+      setCookiesText("");
+      await mutateOverview();
+      await mutateAdminCfg();
+      await mutateActivity();
+      toast.success("Saved cookies cleared");
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setSavingCookies(false);
+    }
+  }
+
+  async function onCookieFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const txt = await f.text();
+    setCookiesText(txt);
+    e.target.value = "";
   }
 
   async function createUser(e: React.FormEvent) {
@@ -280,6 +334,15 @@ export default function AdminPage() {
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Button
+              variant={overview?.ytdlp_cookies_configured ? "secondary" : "outline"}
+              size="sm"
+              onClick={() => setShowCookies((v) => !v)}
+              title="Configure Netscape cookies.txt for URL downloads"
+            >
+              <Cookie className={cn("size-3.5", overview?.ytdlp_cookies_configured ? "text-emerald-400" : "text-amber-400")} />
+              YouTube Cookies: {overview?.ytdlp_cookies_configured ? "Ready" : "Not set"}
+            </Button>
+            <Button
               variant={overview?.signup_open ? "default" : "outline"}
               size="sm"
               onClick={toggleSignup}
@@ -307,6 +370,52 @@ export default function AdminPage() {
           </div>
         }
       />
+
+      {showCookies && (
+        <form onSubmit={saveCookies} className="glass flex flex-col gap-3 rounded-2xl border border-amber-500/30 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="flex items-center gap-2 text-sm font-semibold">
+                <Cookie className="size-4 text-amber-400" /> YouTube &amp; URL Ingestion Cookies (`cookies.txt`)
+              </h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Cloud hosts (like Railway) often see YouTube&apos;s sign-in verification gate. Export a signed-in Netscape <code className="text-foreground">cookies.txt</code> file from your browser and upload or paste it here (or set <code className="text-foreground">YTDLP_COOKIES</code> in Railway Variables).
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className={cn("rounded-full border px-2 py-0.5 text-[11px]", adminCfg?.ytdlp_cookies_configured ? "border-emerald-500/30 bg-emerald-500/15 text-emerald-300" : "border-white/15 bg-white/5 text-muted-foreground")}>
+                {adminCfg?.ytdlp_cookies_configured
+                  ? `Active (${adminCfg.ytdlp_cookies_source === "env_file" ? "env file" : "saved"}${adminCfg.ytdlp_cookies_updated_at ? ` · ${relativeTime(adminCfg.ytdlp_cookies_updated_at)}` : ""})`
+                  : "Not configured"}
+              </span>
+              <Button type="button" variant="ghost" size="icon" onClick={() => setShowCookies(false)}>
+                <X className="size-4" />
+              </Button>
+            </div>
+          </div>
+          <textarea
+            rows={4}
+            value={cookiesText}
+            onChange={(e) => setCookiesText(e.target.value)}
+            placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;... (paste cookies.txt contents or choose a .txt file below)"
+            className="w-full rounded-xl border border-input bg-zinc-950/80 p-3 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-md border border-input bg-white/[.04] px-3 text-xs font-medium hover:bg-white/[.08]">
+              <Upload className="size-3.5" /> Choose cookies.txt file
+              <input type="file" accept=".txt,text/plain" onChange={onCookieFile} className="sr-only" />
+            </label>
+            <Button type="submit" size="sm" disabled={savingCookies || !cookiesText.trim()}>
+              {savingCookies ? <Loader2 className="size-3.5 animate-spin" /> : <CheckCircle2 className="size-3.5" />} Save cookies
+            </Button>
+            {adminCfg?.ytdlp_cookies_configured && adminCfg.ytdlp_cookies_source !== "env_file" && (
+              <Button type="button" variant="ghost" size="sm" disabled={savingCookies} onClick={clearCookies} className="text-rose-400 hover:bg-rose-500/15 hover:text-rose-300">
+                <Trash2 className="size-3.5" /> Remove saved cookies
+              </Button>
+            )}
+          </div>
+        </form>
+      )}
 
       {showCreate && (
         <form onSubmit={createUser} className="glass grid gap-3 rounded-2xl border border-fuchsia-500/30 p-4 sm:grid-cols-5">

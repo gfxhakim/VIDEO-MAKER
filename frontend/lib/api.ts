@@ -256,6 +256,14 @@ export type AdminOverview = {
   activity_24h: number;
   storage: { disk_total: number; disk_used: number; disk_free: number; data_dir_bytes: number };
   signup_open: boolean;
+  ytdlp_cookies_configured: boolean;
+};
+
+export type AdminSettings = {
+  allow_signup: boolean;
+  ytdlp_cookies_configured: boolean;
+  ytdlp_cookies_source: "env_file" | "saved" | null;
+  ytdlp_cookies_updated_at: string | null;
 };
 
 export type AdminUserRow = {
@@ -506,6 +514,7 @@ export const api = {
   },
   adminDeleteProject: (id: number) => request<{ ok: boolean }>(`/api/admin/projects/${id}`, { method: "DELETE" }),
   adminJobs: (limit = 60) => request<AdminJobRow[]>(`/api/admin/jobs?limit=${limit}`),
-  adminSettings: () => request<{ allow_signup: boolean }>("/api/admin/settings"),
-  adminUpdateSettings: (body: { allow_signup: boolean }) => request<{ allow_signup: boolean }>("/api/admin/settings", json("PUT", body)),
+  adminSettings: () => request<AdminSettings>("/api/admin/settings"),
+  adminUpdateSettings: (body: { allow_signup?: boolean; ytdlp_cookies?: string }) =>
+    request<AdminSettings>("/api/admin/settings", json("PUT", body)),
 };
