@@ -36,6 +36,7 @@ from sqlalchemy import delete, inspect, update
 from sqlmodel import Session, col, select
 from starlette.requests import ClientDisconnect
 
+from ..activity import log_activity
 from ..auth import request_user_id
 from ..config import get_settings
 from ..db import get_session, session_scope
@@ -307,7 +308,7 @@ def recover_uploads() -> None:
 
 # ------------------------------------------------------------------ endpoints
 @router.post("", response_model=UploadOut)
-def init_upload(body: UploadInit, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def init_upload(body: UploadInit, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     s = get_settings()
     purge_stale_uploads()
     name = _clean_name(body.filename)
@@ -363,6 +364,7 @@ def init_upload(body: UploadInit, user: User = Depends(current_user), session: S
     session.add(u)
     session.commit()
     session.refresh(u)
+    log_activity(session, user=user, action="upload_start", target_type="upload", detail=f"Started upload '{name}' ({body.size / 1024**2:.1f} MB)", request=request)
     return upload_out(u)
 
 
@@ -451,7 +453,7 @@ def _gone_or_finished(upload_id: str, user_id: int) -> None:
 
 
 @router.post("/{upload_id}/complete", response_model=ProjectOut)
-def complete_upload(body: UploadComplete, upload_id: str = UPLOAD_ID, user: User = Depends(current_user),
+def complete_upload(body: UploadComplete, request: Request, upload_id: str = UPLOAD_ID, user: User = Depends(current_user),
                     session: Session = Depends(get_session)):
     u = _mine(session, upload_id, user.id)
     if u.status == "completed":  # the client retried after a lost response: same answer, no second project
@@ -468,12 +470,13 @@ def complete_upload(body: UploadComplete, upload_id: str = UPLOAD_ID, user: User
     if not _claim(upload_id):
         raise HTTPException(409, "This upload is already being finished")
     try:
-        return _complete(session, u, upload_id, gs, body)
+        return _complete(session, u, upload_id, gs, body, user=user, request=request)
     finally:
         _release(upload_id)
 
 
-def _complete(session: Session, u: Upload, upload_id: str, gs: GenerationSettings, body: UploadComplete) -> ProjectOut:
+def _complete(session: Session, u: Upload, upload_id: str, gs: GenerationSettings, body: UploadComplete, *,
+              user: Optional[User] = None, request: Optional[Request] = None) -> ProjectOut:
     claimed = session.exec(update(Upload).where(col(Upload.id) == u.id, col(Upload.status) == "uploading").values(status="completing"))
     session.commit()
     if claimed.rowcount != 1:
@@ -520,14 +523,16 @@ def _complete(session: Session, u: Upload, upload_id: str, gs: GenerationSetting
     shutil.rmtree(_dir(upload_id), ignore_errors=True)
     if body.start:
         _start(session, p)
+    log_activity(session, user=user, user_id=u.user_id, action="upload_complete", target_type="project", target_id=p.id, detail=f"Completed upload '{u.filename}' -> project '{p.name}'", request=request)
     return project_out(session, p)
 
 
 @router.delete("/{upload_id}")
-def abort_upload(upload_id: str = UPLOAD_ID, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def abort_upload(request: Request, upload_id: str = UPLOAD_ID, user: User = Depends(current_user), session: Session = Depends(get_session)):
     u = session.get(Upload, upload_id)
     if u and u.user_id == user.id:
         was = u.status
+        fname = u.filename
         try:
             _settle(session, u)
         except Exception:  # noqa: BLE001  (the repair removed it: nothing left to do)
@@ -537,4 +542,5 @@ def abort_upload(upload_id: str = UPLOAD_ID, user: User = Depends(current_user),
         # being turned into a project right now: left alone. A completed upload only loses its
         # bookkeeping row; the project stays.
         _discard(session, u, only=("uploading", "completed"))
+        log_activity(session, user=user, action="upload_cancel", target_type="upload", detail=f"Cancelled upload '{fname}'", request=request)
     return {"ok": True}

@@ -124,10 +124,30 @@ class Job(SQLModel, table=True):
 
 
 class User(SQLModel, table=True):
-    """Self-hosted login. The first person to open the app creates the owner account."""
+    """Account login. First registered user or ADMIN_EMAIL bootstrap gets the admin role."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(index=True, unique=True)
     name: str = ""
     password_hash: str
+    role: str = Field(default="user", index=True)  # admin | user
+    is_active: bool = Field(default=True)
+    last_login_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+    last_ip: str = ""
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class ActivityLog(SQLModel, table=True):
+    """Per-user audit & live activity trail surfaced in the Admin Panel."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: Optional[int] = Field(default=None, index=True)
+    user_email: str = Field(default="", index=True)
+    action: str = Field(index=True)
+    target_type: str = ""
+    target_id: Optional[int] = None
+    detail: str = ""
+    ip: str = ""
+    user_agent: str = ""
+    created_at: datetime = Field(default_factory=utcnow, index=True)

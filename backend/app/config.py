@@ -28,8 +28,11 @@ class Settings(BaseSettings):
     static_dir: Path = BACKEND_DIR.parent / "frontend" / "out"
 
     # auth
-    allow_signup: bool = False  # after the first (owner) account, allow more sign-ups?
+    allow_signup: bool = True  # allow new visitors to create accounts (toggleable live in Admin Panel)
     session_days: int = 30
+    admin_email: str = ""
+    admin_password: str = ""
+    admin_name: str = "Admin"
 
     # worker
     embedded_worker: bool = True
@@ -105,6 +108,10 @@ class Settings(BaseSettings):
         return self.data_dir / "app_settings.json"
 
     @property
+    def admin_credentials_path(self) -> Path:
+        return self.data_dir / "admin_credentials.txt"
+
+    @property
     def fonts_dir(self) -> Path:
         return BACKEND_DIR / "fonts"
 
@@ -126,6 +133,7 @@ def load_runtime_config() -> dict[str, Any]:
         "llm_base_url": s.llm_base_url,
         "llm_api_key": s.llm_api_key,
         "llm_model": s.llm_model,
+        "allow_signup": s.allow_signup,
     }
     p = s.app_settings_path
     if p.exists():
@@ -138,6 +146,15 @@ def load_runtime_config() -> dict[str, Any]:
         except (OSError, ValueError):
             pass
     return defaults
+
+
+def is_signup_open() -> bool:
+    """Whether new visitor self-registration is currently open."""
+    cfg = load_runtime_config()
+    val = cfg.get("allow_signup")
+    if isinstance(val, bool):
+        return val
+    return bool(get_settings().allow_signup)
 
 
 def save_runtime_config(patch: dict[str, Any]) -> dict[str, Any]:

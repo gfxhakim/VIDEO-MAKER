@@ -19,10 +19,19 @@ def test_auth_flow_and_publish_kit(tmp_path):
         assert st["needs_setup"] and st["user"] is None
 
         r = c.post("/api/auth/signup", json={"email": "Me@Example.com", "password": "supersecret", "name": "Me"})
-        assert r.status_code == 200
+        assert r.status_code == 200 and r.json()["role"] == "admin"
         assert c.get("/api/auth/me").json()["email"] == "me@example.com"
-        # second sign-up is closed by default
+
+        # second visitor sign-up succeeds by default as a regular user (and cannot touch /api/admin)
+        r2 = c.post("/api/auth/signup", json={"email": "visitor@y.co", "password": "supersecret"})
+        assert r2.status_code == 200 and r2.json()["role"] == "user"
+        assert c.get("/api/admin/overview").status_code == 403
+
+        # admin can pause & reopen visitor sign-up live
+        assert c.post("/api/auth/signin", json={"email": "me@example.com", "password": "supersecret"}).status_code == 200
+        assert c.put("/api/admin/settings", json={"allow_signup": False}).json()["allow_signup"] is False
         assert c.post("/api/auth/signup", json={"email": "x@y.co", "password": "supersecret"}).status_code == 403
+        assert c.put("/api/admin/settings", json={"allow_signup": True}).json()["allow_signup"] is True
 
         c.post("/api/auth/signout")
         assert c.get("/api/presets").status_code == 401

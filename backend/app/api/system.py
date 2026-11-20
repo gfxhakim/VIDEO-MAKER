@@ -4,9 +4,10 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session, col, or_, select
 
+from ..activity import log_activity
 from ..config import get_settings, load_runtime_config, save_runtime_config
 from ..db import get_session
 from ..models import Job, Project, User, utcnow
@@ -83,12 +84,18 @@ def get_runtime_settings():
 
 
 @router.put("/settings")
-def update_runtime_settings(body: RuntimeConfigUpdate):
+def update_runtime_settings(
+    body: RuntimeConfigUpdate,
+    request: Request,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_session),
+):
     patch = body.model_dump(exclude_none=True)
     # Keep existing API key if UI sends empty placeholder unless explicitly clearing base_url
     if patch.get("llm_api_key") == "" and patch.get("llm_base_url", "x") != "":
         patch.pop("llm_api_key", None)
     save_runtime_config(patch)
+    log_activity(session, user=user, action="settings_update", target_type="settings", detail="Updated Brand / AI settings", request=request)
     return get_runtime_settings()
 
 
@@ -101,7 +108,7 @@ def test_llm_connection():
 
 
 @router.post("/jobs/{jid}/retry")
-def retry_job(jid: int, session: Session = Depends(get_session)):
+def retry_job(jid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     j = session.get(Job, jid)
     if not j:
         raise HTTPException(404, "Job not found")
@@ -114,11 +121,12 @@ def retry_job(jid: int, session: Session = Depends(get_session)):
     j.finished_at = None
     session.add(j)
     session.commit()
+    log_activity(session, user=user, action="job_retry", target_type="job", target_id=j.id, detail=f"Retried job #{j.id} ({j.kind})", request=request)
     return j.model_dump()
 
 
 @router.post("/jobs/{jid}/cancel")
-def cancel_job(jid: int, session: Session = Depends(get_session)):
+def cancel_job(jid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     j = session.get(Job, jid)
     if not j:
         raise HTTPException(404, "Job not found")
@@ -128,4 +136,5 @@ def cancel_job(jid: int, session: Session = Depends(get_session)):
         j.error = "Cancelled by user"
         session.add(j)
         session.commit()
+        log_activity(session, user=user, action="job_cancel", target_type="job", target_id=j.id, detail=f"Cancelled job #{j.id} ({j.kind})", request=request)
     return j.model_dump()

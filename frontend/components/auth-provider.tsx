@@ -35,18 +35,21 @@ type EarlyWindow = Window & {
 function readHint(): User | null {
   try {
     const u = JSON.parse(localStorage.getItem(HINT_KEY) || "null");
-    return u && typeof u.id === "number" && typeof u.email === "string" ? { id: u.id, email: u.email, name: typeof u.name === "string" ? u.name : "" } : null;
+    if (!(u && typeof u.id === "number" && typeof u.email === "string")) return null;
+    const role = u.role === "admin" ? "admin" : "user";
+    return { id: u.id, email: u.email, name: typeof u.name === "string" ? u.name : "", role };
   } catch {
     return null;
   }
 }
 function remember(u: User | null) {
   try {
-    if (u) localStorage.setItem(HINT_KEY, JSON.stringify({ id: u.id, email: u.email, name: u.name }));
+    if (u) localStorage.setItem(HINT_KEY, JSON.stringify({ id: u.id, email: u.email, name: u.name, role: u.role || "user" }));
     else localStorage.removeItem(HINT_KEY);
   } catch {}
 }
-const sameUser = (a: User | null, b: User | null) => a === b || (!!a && !!b && a.id === b.id && a.email === b.email && a.name === b.name);
+const sameUser = (a: User | null, b: User | null) =>
+  a === b || (!!a && !!b && a.id === b.id && a.email === b.email && a.name === b.name && (a.role || "user") === (b.role || "user"));
 
 /** Client-side guard: every page except /signin needs a session. */
 export function AuthProvider({ children }: { children: React.ReactNode }) {

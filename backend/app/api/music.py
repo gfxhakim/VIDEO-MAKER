@@ -6,9 +6,10 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlmodel import Session, col, or_, select
 
+from ..activity import log_activity
 from ..config import get_settings
 from ..db import get_session
 from ..models import Clip, MusicTrack, User
@@ -44,7 +45,8 @@ def list_music(user: User = Depends(current_user), session: Session = Depends(ge
 
 
 @router.post("", response_model=list[MusicOut])
-def upload_music(files: list[UploadFile] = File(...), user: User = Depends(current_user), session: Session = Depends(get_session)):
+def upload_music(request: Request, files: list[UploadFile] = File(...), user: User = Depends(current_user),
+                 session: Session = Depends(get_session)):
     out = []
     for f in files:
         name = f.filename or "track.mp3"
@@ -60,6 +62,7 @@ def upload_music(files: list[UploadFile] = File(...), user: User = Depends(curre
         session.commit()
         session.refresh(t)
         enqueue("analyze_music", {"track_id": t.id}, priority=20)
+        log_activity(session, user=user, action="music_upload", target_type="music", target_id=t.id, detail=f"Uploaded track '{t.name}'", request=request)
         out.append(music_out(t))
     return out
 
@@ -95,10 +98,11 @@ def reanalyze_music(tid: int, user: User = Depends(current_user), session: Sessi
 
 
 @router.delete("/{tid}")
-def delete_music(tid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def delete_music(tid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     t = session.get(MusicTrack, tid)
     if not t or not owns(t, user):
         raise HTTPException(404, "Track not found")
+    tname = t.name
     for c in session.exec(select(Clip).where(Clip.music_track_id == tid)).all():
         c.music_track_id = None
         session.add(c)
@@ -107,4 +111,5 @@ def delete_music(tid: int, user: User = Depends(current_user), session: Session 
     finally:
         session.delete(t)
         session.commit()
+    log_activity(session, user=user, action="music_delete", target_type="music", target_id=tid, detail=f"Deleted track '{tname}'", request=request)
     return {"ok": True}

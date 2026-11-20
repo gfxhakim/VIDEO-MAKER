@@ -363,3 +363,125 @@ def test_post_gen_overrides_reset_batch_apply_and_presets_api(tmp_path):
         mc = c.post(f"/api/projects/{pid}/clips", json={"start": 2.0, "end": 4.3, "snap_speech": True})
         assert mc.status_code == 200 and mc.json()["end"] >= 4.5
 
+
+def test_admin_panel_activity_tracking_and_bootstrap(tmp_path, monkeypatch):
+    from app.api import auth as auth_api
+    from app.auth import hash_password
+    from app.models import ActivityLog
+
+    init_db()
+
+    # 1. Existing DB upgrade path: if zero admins exist, earliest user gets promoted to admin
+    with session_scope() as s:
+        prev_roles = [(row.id, row.role) for row in s.exec(select(User)).all()]
+        for row in s.exec(select(User)).all():
+            row.role = "user"
+            s.add(row)
+        legacy = User(email="legacyowner@example.com", name="Legacy Owner", password_hash=hash_password("pass1234"), role="user")
+        s.add(legacy)
+        s.commit()
+        earliest = s.exec(select(User).order_by(User.id)).first()
+        earliest_id = earliest.id
+    try:
+        auth_api.bootstrap_admin()
+        with session_scope() as s:
+            u = s.get(User, earliest_id)
+            assert u is not None and u.role == "admin"
+    finally:
+        with session_scope() as s:
+            for uid_, role_ in prev_roles:
+                row = s.get(User, uid_)
+                if row:
+                    row.role = role_
+                    s.add(row)
+            s.commit()
+
+    # 2. ADMIN_EMAIL / ADMIN_PASSWORD bootstrap creates/syncs exact admin credentials
+    monkeypatch.setenv("ADMIN_EMAIL", "BossAdmin@Example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "RailWayPass99")
+    get_settings.cache_clear()
+    try:
+        auth_api.bootstrap_admin()
+    finally:
+        monkeypatch.delenv("ADMIN_EMAIL", raising=False)
+        monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+        get_settings.cache_clear()
+
+    with session_scope() as s:
+        boss = s.exec(select(User).where(User.email == "bossadmin@example.com")).first()
+        assert boss is not None and boss.role == "admin" and boss.is_active is True
+
+    # 3. Visitor self-registers via public signup, creates a project, admin tracks everything
+    visitor_client = TestClient(app)
+    with visitor_client as v:
+        st = v.get("/api/auth/status").json()
+        assert st["signup_open"] is True
+        rv = v.post("/api/auth/signup", json={"email": "newvisitor@example.com", "password": "visitorpass", "name": "Visitor"})
+        assert rv.status_code == 200 and rv.json()["role"] == "user"
+        vid = rv.json()["id"]
+
+        # Standard user is blocked from admin routes
+        assert v.get("/api/admin/overview").status_code == 403
+        assert v.get("/api/admin/users").status_code == 403
+        assert v.get("/api/admin/activity").status_code == 403
+
+        # Visitor performs tracked actions
+        rp = v.post("/api/projects?start=false", json={"url": "https://example.com/demo.mp4", "name": "Visitor Podcast"})
+        assert rp.status_code == 200
+        v_pid = rp.json()["id"]
+        assert v.put("/api/settings", json={"default_watermark_text": "@visitor"}).status_code == 200
+
+        # Sign in as boss admin on a second client
+        with TestClient(app) as adm:
+            assert adm.post("/api/auth/signin", json={"email": "bossadmin@example.com", "password": "RailWayPass99"}).status_code == 200
+            me = adm.get("/api/auth/me").json()
+            assert me["role"] == "admin"
+
+            ov = adm.get("/api/admin/overview").json()
+            assert ov["users"]["total"] >= 3
+            assert ov["users"]["online_now"] >= 1
+            assert ov["activity_24h"] >= 4
+            assert ov["projects"]["total"] >= 1
+
+            # Check per-user summary & last_action
+            users_list = adm.get("/api/admin/users").json()
+            vis_row = next(row for row in users_list if row["email"] == "newvisitor@example.com")
+            assert vis_row["project_count"] == 1
+            assert vis_row["online"] is True
+            assert vis_row["activity_count"] >= 3
+            assert vis_row["last_action"] is not None
+
+            # Activity stream shows exact actions filtered by user & action
+            act = adm.get(f"/api/admin/activity?user_id={vid}&action=project_create").json()
+            assert act["total"] == 1 and "Visitor Podcast" in act["items"][0]["detail"]
+
+            # All projects view
+            projs = adm.get("/api/admin/projects").json()
+            assert any(pr["id"] == v_pid and pr["owner"]["email"] == "newvisitor@example.com" for pr in projs)
+
+            # Guardrails: cannot demote or suspend self
+            assert adm.patch(f"/api/admin/users/{me['id']}", json={"role": "user"}).status_code == 400
+            assert adm.patch(f"/api/admin/users/{me['id']}", json={"is_active": False}).status_code == 400
+            assert adm.delete(f"/api/admin/users/{me['id']}").status_code == 400
+
+            # Suspend visitor -> existing cookie returns 403 and signin returns 403
+            assert adm.patch(f"/api/admin/users/{vid}", json={"is_active": False}).status_code == 200
+            assert v.get("/api/projects").status_code == 403
+            assert v.post("/api/auth/signin", json={"email": "newvisitor@example.com", "password": "visitorpass"}).status_code == 403
+
+            # Blocked attempt is audited in activity log
+            blocked = adm.get("/api/admin/activity?action=signin_blocked").json()
+            assert blocked["total"] >= 1
+
+            # Reactivate + reset password
+            assert adm.patch(f"/api/admin/users/{vid}", json={"is_active": True, "new_password": "newpass999"}).status_code == 200
+            assert v.post("/api/auth/signin", json={"email": "newvisitor@example.com", "password": "newpass999"}).status_code == 200
+
+            # Delete user cleans up user & owned project cleanly
+            assert adm.delete(f"/api/admin/users/{vid}").json() == {"ok": True}
+            with session_scope() as s:
+                assert s.get(User, vid) is None
+                assert s.get(Project, v_pid) is None
+                assert s.exec(select(ActivityLog).where(ActivityLog.action == "admin_user_delete")).first() is not None
+
+

@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.gzip import GZipMiddleware
 
+from .api import admin as admin_api
 from .api import auth as auth_api
 from .api import broll, music, projects, system, uploads
 from .api.deps import current_user
@@ -34,6 +35,7 @@ log = logging.getLogger("autoclip")
 async def lifespan(app: FastAPI):
     s = get_settings()
     init_db()
+    auth_api.bootstrap_admin()
     register_all()
     uploads.recover_uploads()
     bins = check_binaries()
@@ -124,6 +126,7 @@ async def protect_media(request: Request, call_next):
 
 
 app.include_router(auth_api.router)
+app.include_router(admin_api.router)
 app.include_router(projects.router)
 app.include_router(uploads.router)
 app.include_router(music.router)

@@ -39,6 +39,13 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "musictrack": [
         ("user_id", "INTEGER"),
     ],
+    "user": [
+        ("role", "TEXT NOT NULL DEFAULT 'user'"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+        ("last_login_at", "TIMESTAMP"),
+        ("last_seen_at", "TIMESTAMP"),
+        ("last_ip", "TEXT NOT NULL DEFAULT ''"),
+    ],
 }
 
 
@@ -46,12 +53,12 @@ def _migrate_sqlite() -> None:
     """Safely add new columns to pre-existing SQLite databases on startup."""
     with engine.begin() as conn:
         for table, cols in _MIGRATIONS.items():
-            existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})")).all()}
+            existing = {row[1] for row in conn.execute(text(f'PRAGMA table_info("{table}")')).all()}
             if not existing:
                 continue
             for name, ddl in cols:
                 if name not in existing:
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN {name} {ddl}'))
 
 
 def init_db() -> None:

@@ -3,16 +3,18 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "motion/react";
-import { Film, LayoutGrid, LogOut, Music2, Plus, Settings, Sparkles } from "lucide-react";
+import { Film, LayoutGrid, LogOut, Music2, Plus, Settings, Shield, Sparkles } from "lucide-react";
 import { useAuth } from "@/components/auth-provider";
 import { cn } from "@/lib/utils";
 
-const NAV = [
+const BASE_NAV = [
   { href: "/", label: "Studio", icon: LayoutGrid },
   { href: "/library", label: "Clips", icon: Film },
   { href: "/music", label: "Music", icon: Music2 },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
+
+const ADMIN_ITEM = { href: "/admin", label: "Admin", icon: Shield };
 
 const PILL = { type: "spring", stiffness: 500, damping: 40 } as const;
 
@@ -66,6 +68,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (bare) return <>{children}<div className="aurora" /></>;
 
   const initial = user ? user.name?.trim().slice(0, 1) || user.email?.slice(0, 1) || "?" : "";
+  const nav = user?.role === "admin" ? [...BASE_NAV, ADMIN_ITEM] : BASE_NAV;
 
   return (
     <div className="flex min-h-dvh">
@@ -85,7 +88,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <Plus className="size-5 xl:size-4" /> <span className="hidden xl:inline">New project</span>
         </Link>
         <nav aria-label="Main" className="flex w-full flex-col gap-1">
-          {NAV.map(({ href, label, icon: Icon }) => (
+          {nav.map(({ href, label, icon: Icon }) => (
             <Link
               key={href}
               href={href}
@@ -106,7 +109,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <>
               <span title={`${user.name} (${user.email})`} className="bg-brand grid size-9 shrink-0 place-items-center rounded-full text-sm font-semibold text-white uppercase">{initial}</span>
               <div className="hidden min-w-0 flex-1 xl:block">
-                <div className="truncate text-sm font-medium">{user.name}</div>
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-sm font-medium">{user.name}</span>
+                  {user.role === "admin" && (
+                    <span className="shrink-0 rounded bg-fuchsia-500/20 px-1.5 py-0.5 text-[10px] font-medium text-fuchsia-300">Admin</span>
+                  )}
+                </div>
                 <div className="truncate text-xs text-muted-foreground">{user.email}</div>
               </div>
               <button type="button" onClick={signOut} title="Sign out" aria-label="Sign out" className="grid size-9 shrink-0 place-items-center rounded-md text-muted-foreground transition hover:bg-white/5 hover:text-foreground">
@@ -140,7 +148,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
       {/* phone and tablet tab bar: floats, never wider than a phone, clear of the home indicator */}
       <nav aria-label="Main" className="glass-chrome fixed inset-x-3 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-40 mx-auto flex max-w-md justify-around rounded-2xl border p-1.5 shadow-2xl shadow-black/50 lg:hidden short:hidden">
-        {NAV.map(({ href, label, icon: Icon }) => (
+        {nav.map(({ href, label, icon: Icon }) => (
           <Link
             key={href}
             href={href}

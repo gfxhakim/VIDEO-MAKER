@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, Request
 from sqlmodel import Session
 
+from ..activity import touch_user_seen
 from ..auth import request_user_id
 from ..config import get_settings
 from ..db import get_session
@@ -30,6 +31,15 @@ def current_user(request: Request, session: Session = Depends(get_session)) -> U
     user = session.get(User, uid) if uid else None
     if not user:
         raise HTTPException(401, "Not signed in")
+    if not user.is_active:
+        raise HTTPException(403, "Account suspended. Contact the administrator.")
+    touch_user_seen(session, user, request)
+    return user
+
+
+def require_admin(user: User = Depends(current_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(403, "Admin access required")
     return user
 
 

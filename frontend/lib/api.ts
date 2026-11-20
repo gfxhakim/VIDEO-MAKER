@@ -236,8 +236,96 @@ export type Platform = "tiktok" | "instagram" | "youtube" | "facebook";
 export type KitEntry = { label: string; title: string; caption: string; hashtags: string[] };
 export type PublishKit = Record<Platform, KitEntry>;
 
-export type User = { id: number; email: string; name: string };
+export type User = {
+  id: number;
+  email: string;
+  name: string;
+  role?: "admin" | "user";
+  is_active?: boolean;
+  created_at?: string;
+  last_login_at?: string | null;
+  last_seen_at?: string | null;
+};
 export type AuthStatus = { needs_setup: boolean; signup_open: boolean; user: User | null };
+
+export type AdminOverview = {
+  users: { total: number; active: number; suspended: number; admins: number; online_now: number };
+  projects: { total: number; processing: number; queued: number; done: number; failed: number };
+  clips: { total: number; ready: number; approved: number };
+  jobs: { queued: number; running: number; failed: number };
+  activity_24h: number;
+  storage: { disk_total: number; disk_used: number; disk_free: number; data_dir_bytes: number };
+  signup_open: boolean;
+};
+
+export type AdminUserRow = {
+  id: number;
+  email: string;
+  name: string;
+  role: "admin" | "user";
+  is_active: boolean;
+  online: boolean;
+  created_at: string;
+  last_login_at: string | null;
+  last_seen_at: string | null;
+  last_ip: string;
+  project_count: number;
+  clip_count: number;
+  music_count: number;
+  broll_count: number;
+  storage_bytes: number;
+  activity_count: number;
+  last_action: { action: string; detail: string; target_type: string; target_id: number | null; created_at: string } | null;
+};
+
+export type AdminActivityItem = {
+  id: number;
+  user_id: number | null;
+  user_email: string;
+  user_name: string;
+  user_role: string | null;
+  action: string;
+  target_type: string;
+  target_id: number | null;
+  detail: string;
+  ip: string;
+  user_agent: string;
+  created_at: string;
+};
+
+export type AdminActivityResponse = { items: AdminActivityItem[]; total: number; actions: string[] };
+
+export type AdminProjectRow = {
+  id: number;
+  name: string;
+  owner: { id: number; email: string; name: string } | null;
+  source_type: string;
+  source: string;
+  status: string;
+  stage: string;
+  progress: number;
+  duration: number | null;
+  clip_count: number;
+  ready_count: number;
+  storage_bytes: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AdminJobRow = {
+  id: number;
+  kind: string;
+  status: string;
+  attempts: number;
+  max_attempts: number;
+  error: string | null;
+  project_id: number | null;
+  project_name: string | null;
+  owner_email: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+};
 
 export class ApiError extends Error {
   status: number;
@@ -390,4 +478,34 @@ export const api = {
   signout: () => request("/api/auth/signout", json("POST")),
   changePassword: (current_password: string, new_password: string) =>
     request("/api/auth/password", json("POST", { current_password, new_password })),
+
+  adminOverview: () => request<AdminOverview>("/api/admin/overview"),
+  adminUsers: (q = "") => request<AdminUserRow[]>(`/api/admin/users${q ? `?q=${encodeURIComponent(q)}` : ""}`),
+  adminCreateUser: (body: { email: string; name: string; password: string; role: "user" | "admin" }) =>
+    request<AdminUserRow>("/api/admin/users", json("POST", body)),
+  adminUpdateUser: (id: number, body: { name?: string; role?: "user" | "admin"; is_active?: boolean; new_password?: string }) =>
+    request<AdminUserRow>(`/api/admin/users/${id}`, json("PATCH", body)),
+  adminDeleteUser: (id: number) => request<{ ok: boolean }>(`/api/admin/users/${id}`, { method: "DELETE" }),
+  adminActivity: (params?: { user_id?: number; action?: string; q?: string; limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (params?.user_id !== undefined) p.set("user_id", String(params.user_id));
+    if (params?.action) p.set("action", params.action);
+    if (params?.q) p.set("q", params.q);
+    if (params?.limit !== undefined) p.set("limit", String(params.limit));
+    if (params?.offset !== undefined) p.set("offset", String(params.offset));
+    const qs = p.toString();
+    return request<AdminActivityResponse>(`/api/admin/activity${qs ? `?${qs}` : ""}`);
+  },
+  adminProjects: (params?: { user_id?: number; status?: string; limit?: number }) => {
+    const p = new URLSearchParams();
+    if (params?.user_id !== undefined) p.set("user_id", String(params.user_id));
+    if (params?.status) p.set("status", params.status);
+    if (params?.limit !== undefined) p.set("limit", String(params.limit));
+    const qs = p.toString();
+    return request<AdminProjectRow[]>(`/api/admin/projects${qs ? `?${qs}` : ""}`);
+  },
+  adminDeleteProject: (id: number) => request<{ ok: boolean }>(`/api/admin/projects/${id}`, { method: "DELETE" }),
+  adminJobs: (limit = 60) => request<AdminJobRow[]>(`/api/admin/jobs?limit=${limit}`),
+  adminSettings: () => request<{ allow_signup: boolean }>("/api/admin/settings"),
+  adminUpdateSettings: (body: { allow_signup: boolean }) => request<{ allow_signup: boolean }>("/api/admin/settings", json("PUT", body)),
 };

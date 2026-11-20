@@ -6,9 +6,10 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlmodel import Session, col, or_, select
 
+from ..activity import log_activity
 from ..config import get_settings
 from ..db import get_session
 from ..models import BrollClip, User
@@ -42,7 +43,8 @@ def list_broll(user: User = Depends(current_user), session: Session = Depends(ge
 
 
 @router.post("", response_model=list[BrollOut])
-def upload_broll(files: list[UploadFile] = File(...), user: User = Depends(current_user), session: Session = Depends(get_session)):
+def upload_broll(request: Request, files: list[UploadFile] = File(...), user: User = Depends(current_user),
+                 session: Session = Depends(get_session)):
     out = []
     for f in files:
         name = f.filename or "broll.mp4"
@@ -69,18 +71,21 @@ def upload_broll(files: list[UploadFile] = File(...), user: User = Depends(curre
         session.add(b)
         session.commit()
         session.refresh(b)
+        log_activity(session, user=user, action="broll_upload", target_type="broll", target_id=b.id, detail=f"Uploaded B-roll '{b.name}'", request=request)
         out.append(broll_out(b))
     return out
 
 
 @router.delete("/{bid}")
-def delete_broll(bid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def delete_broll(bid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     b = session.get(BrollClip, bid)
     if not b or not owns(b, user):
         raise HTTPException(404, "B-roll clip not found")
+    bname = b.name
     try:
         Path(b.path).unlink(missing_ok=True)
     finally:
         session.delete(b)
         session.commit()
+    log_activity(session, user=user, action="broll_delete", target_type="broll", target_id=bid, detail=f"Deleted B-roll '{bname}'", request=request)
     return {"ok": True}

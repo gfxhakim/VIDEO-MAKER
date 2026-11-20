@@ -8,10 +8,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from sqlmodel import Session, col, or_, select
 
+from ..activity import log_activity
 from ..config import get_settings
 from ..db import get_session
 from ..models import Clip, Job, MusicTrack, Project, User, utcnow
@@ -163,7 +164,7 @@ def probe_link(body: URLProbeRequest):
 
 
 @router.post("/projects", response_model=ProjectOut)
-def create_from_link(body: ProjectCreateURL, start: bool = True, user: User = Depends(current_user),
+def create_from_link(body: ProjectCreateURL, request: Request, start: bool = True, user: User = Depends(current_user),
                      session: Session = Depends(get_session)):
     if not body.url and not body.path:
         raise HTTPException(400, "Provide a url or a local path")
@@ -192,12 +193,14 @@ def create_from_link(body: ProjectCreateURL, start: bool = True, user: User = De
     session.refresh(p)
     if start:
         _start(session, p)
+    log_activity(session, user=user, action="project_create", target_type="project", target_id=p.id, detail=f"Created {src_type} project '{p.name}'", request=request)
     return project_out(session, p)
 
 
 @router.post("/projects/upload", response_model=ProjectOut)
-def create_from_upload(file: UploadFile = File(...), settings: Optional[str] = Form(None), name: Optional[str] = Form(None),
-                       start: bool = Form(True), user: User = Depends(current_user), session: Session = Depends(get_session)):
+def create_from_upload(request: Request, file: UploadFile = File(...), settings: Optional[str] = Form(None),
+                       name: Optional[str] = Form(None), start: bool = Form(True),
+                       user: User = Depends(current_user), session: Session = Depends(get_session)):
     try:
         gs = _validate(GenerationSettings(**json.loads(settings)) if settings else GenerationSettings())
     except (ValueError, TypeError) as e:
@@ -227,6 +230,7 @@ def create_from_upload(file: UploadFile = File(...), settings: Optional[str] = F
     session.commit()
     if start:
         _start(session, p)
+    log_activity(session, user=user, action="project_create", target_type="project", target_id=p.id, detail=f"Uploaded video '{p.name}'", request=request)
     return project_out(session, p)
 
 
@@ -237,8 +241,8 @@ def get_project(pid: int, user: User = Depends(current_user), session: Session =
 
 
 @router.post("/projects/{pid}/generate", response_model=ProjectOut)
-def generate(pid: int, body: Optional[dict[str, Any]] = Body(default=None), user: User = Depends(current_user),
-             session: Session = Depends(get_session)):
+def generate(pid: int, request: Request, body: Optional[dict[str, Any]] = Body(default=None),
+             user: User = Depends(current_user), session: Session = Depends(get_session)):
     """(Re)run generation. Accepts either {settings, mode: 'rescore'|'restyle'} or bare GenerationSettings."""
     p = _require_project(session, pid, user)
     if p.status == "processing" or (p.status == "queued" and not needs_start(session, p)):
@@ -259,11 +263,12 @@ def generate(pid: int, body: Optional[dict[str, Any]] = Body(default=None), user
     if mode == "restyle" and p.source_deleted:
         raise HTTPException(400, "Raw source video was deleted; cannot re-render clips")
     _start(session, p, mode=mode)
+    log_activity(session, user=user, action="project_generate", target_type="project", target_id=p.id, detail=f"Started generation ({mode}) on '{p.name}'", request=request)
     return project_out(session, p)
 
 
 @router.post("/projects/{pid}/prune-source")
-def prune_source(pid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def prune_source(pid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     """Delete the large raw source file while keeping rendered clips and cached transcript."""
     p = _require_project(session, pid, user)
     if p.status in ("queued", "processing"):
@@ -278,12 +283,14 @@ def prune_source(pid: int, user: User = Depends(current_user), session: Session 
     p.updated_at = utcnow()
     session.add(p)
     session.commit()
+    log_activity(session, user=user, action="project_prune", target_type="project", target_id=p.id, detail=f"Removed source video for '{p.name}' ({freed // (1024 * 1024)} MB)", request=request)
     return {"ok": True, "freed_bytes": freed}
 
 
 @router.delete("/projects/{pid}")
-def delete_project(pid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def delete_project(pid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     p = _require_project(session, pid, user)
+    pname = p.name
     clips: dict[int, str] = {}
     for c in session.exec(select(Clip).where(Clip.project_id == pid)).all():
         clips[c.id] = stamp(c.created_at)
@@ -294,6 +301,7 @@ def delete_project(pid: int, user: User = Depends(current_user), session: Sessio
     cancel_queued("analyze_project", lambda pl: pl.get("project_id") == pid and pl.get("created", created) == created)
     cancel_queued("render_clip", lambda pl: same_clip(pl, clips))
     shutil.rmtree(project_dir(pid), ignore_errors=True)
+    log_activity(session, user=user, action="project_delete", target_type="project", target_id=pid, detail=f"Deleted project '{pname}'", request=request)
     return {"ok": True}
 
 
@@ -317,7 +325,7 @@ def get_transcript(pid: int, user: User = Depends(current_user), session: Sessio
 
 
 @router.post("/projects/{pid}/clips", response_model=ClipOut)
-def create_manual_clip(pid: int, body: ManualClipCreate, user: User = Depends(current_user),
+def create_manual_clip(pid: int, body: ManualClipCreate, request: Request, user: User = Depends(current_user),
                        session: Session = Depends(get_session)):
     """Create a custom clip at [start, end] and queue it for rendering."""
     p = _require_project(session, pid, user)
@@ -364,6 +372,7 @@ def create_manual_clip(pid: int, body: ManualClipCreate, user: User = Depends(cu
     session.commit()
     session.refresh(clip)
     enqueue("render_clip", {"clip_id": clip.id, "created": stamp(clip.created_at)}, priority=8)
+    log_activity(session, user=user, action="clip_create", target_type="clip", target_id=clip.id, detail=f"Created manual clip ({start_t:.1f}s–{end_t:.1f}s) in '{p.name}'", request=request)
     return clip_out(clip)
 
 
@@ -407,7 +416,7 @@ def all_ready_clips(
 
 
 @router.post("/clips/bulk")
-def bulk_clips(body: BulkClipAction, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def bulk_clips(body: BulkClipAction, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     """Bulk approve / reject / reset / delete / rerender / apply overrides+music across clips."""
     if body.action == "apply":
         if body.overrides:
@@ -462,6 +471,7 @@ def bulk_clips(body: BulkClipAction, user: User = Depends(current_user), session
             session.add(c)
             updated += 1
     session.commit()
+    log_activity(session, user=user, action="clip_bulk", target_type="clip", detail=f"Bulk '{body.action}' on {updated} clip(s)", request=request)
     return {"ok": True, "count": updated}
 
 
@@ -472,7 +482,7 @@ def get_clip_words(cid: int, user: User = Depends(current_user), session: Sessio
 
 
 @router.patch("/clips/{cid}", response_model=ClipOut)
-def update_clip(cid: int, body: ClipUpdate, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def update_clip(cid: int, body: ClipUpdate, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     c, p = _require_clip(session, cid, user)
     data = body.model_dump(exclude_none=True)
     if "review_status" in data and data["review_status"] not in ("pending", "approved", "rejected"):
@@ -527,22 +537,25 @@ def update_clip(cid: int, body: ClipUpdate, user: User = Depends(current_user), 
     session.add(c)
     session.commit()
     session.refresh(c)
+    log_activity(session, user=user, action="clip_edit", target_type="clip", target_id=c.id, detail=f"Edited clip '{c.title[:60]}'", request=request)
     return clip_out(c)
 
 
 @router.delete("/clips/{cid}")
-def delete_clip(cid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def delete_clip(cid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     c, p = _require_clip(session, cid, user)
+    ctitle = c.title
     cstamp = stamp(c.created_at)
     session.delete(c)
     session.commit()
     cancel_queued("render_clip", lambda pl: pl.get("clip_id") == cid and pl.get("created", cstamp) == cstamp)
     shutil.rmtree(project_dir(p.id) / "clips" / str(cid), ignore_errors=True)
+    log_activity(session, user=user, action="clip_delete", target_type="clip", target_id=cid, detail=f"Deleted clip '{ctitle[:60]}'", request=request)
     return {"ok": True}
 
 
 @router.post("/clips/{cid}/rerender", response_model=ClipOut)
-def rerender_clip(cid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def rerender_clip(cid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     c, p = _require_clip(session, cid, user)
     if p.source_deleted:
         raise HTTPException(400, "Raw source video was deleted; cannot re-render this clip")
@@ -554,11 +567,12 @@ def rerender_clip(cid: int, user: User = Depends(current_user), session: Session
     session.commit()
     cancel_queued("render_clip", lambda pl: pl.get("clip_id") == cid)
     enqueue("render_clip", {"clip_id": c.id, "created": stamp(c.created_at)}, priority=8)
+    log_activity(session, user=user, action="clip_rerender", target_type="clip", target_id=c.id, detail=f"Queued re-render for '{c.title[:60]}'", request=request)
     return clip_out(c)
 
 
 @router.post("/clips/{cid}/ai-copy", response_model=ClipOut)
-def ai_rewrite_clip(cid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def ai_rewrite_clip(cid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     c, _ = _require_clip(session, cid, user)
     try:
         res = llm.rewrite_clip_copy(c.transcript, c.title)
@@ -576,6 +590,7 @@ def ai_rewrite_clip(cid: int, user: User = Depends(current_user), session: Sessi
     session.add(c)
     session.commit()
     session.refresh(c)
+    log_activity(session, user=user, action="clip_ai_copy", target_type="clip", target_id=c.id, detail=f"AI rewrote copy for '{c.title[:60]}'", request=request)
     return clip_out(c)
 
 
@@ -627,11 +642,12 @@ def download_subtitles(cid: int, fmt: str, user: User = Depends(current_user), s
 
 
 @router.get("/clips/{cid}/download")
-def download_clip(cid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def download_clip(cid: int, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     c, _ = _require_clip(session, cid, user)
     if not c.video_path or not Path(c.video_path).exists():
         raise HTTPException(404, "Clip not rendered")
     safe = re.sub(r"[^A-Za-z0-9 _-]", "", c.title)[:60].strip() or f"clip-{cid}"
+    log_activity(session, user=user, action="clip_download", target_type="clip", target_id=c.id, detail=f"Downloaded clip '{c.title[:60]}'", request=request)
     return FileResponse(c.video_path, media_type="video/mp4", filename=f"{safe}.mp4")
 
 
@@ -643,7 +659,7 @@ def clip_kit(cid: int, user: User = Depends(current_user), session: Session = De
 
 
 @router.post("/clips/{cid}/posted", response_model=ClipOut)
-def mark_posted(cid: int, body: PostedUpdate, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def mark_posted(cid: int, body: PostedUpdate, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     if body.platform not in PLATFORMS:
         raise HTTPException(400, f"platform must be one of {', '.join(PLATFORMS)}")
     c, _ = _require_clip(session, cid, user)
@@ -659,11 +675,12 @@ def mark_posted(cid: int, body: PostedUpdate, user: User = Depends(current_user)
     session.add(c)
     session.commit()
     session.refresh(c)
+    log_activity(session, user=user, action="clip_posted", target_type="clip", target_id=c.id, detail=f"Marked '{c.title[:45]}' on {body.platform} ({'posted' if body.posted else 'unmarked'})", request=request)
     return clip_out(c)
 
 
 @router.get("/projects/{pid}/export.zip")
-def export_zip(pid: int, background: BackgroundTasks, scope: str = "approved", subtitles: bool = True,
+def export_zip(pid: int, background: BackgroundTasks, request: Request, scope: str = "approved", subtitles: bool = True,
                user: User = Depends(current_user), session: Session = Depends(get_session)):
     p = _require_project(session, pid, user)
     q = select(Clip).where(Clip.project_id == pid, Clip.status == "ready")
@@ -682,6 +699,7 @@ def export_zip(pid: int, background: BackgroundTasks, scope: str = "approved", s
     )
     background.add_task(dest.unlink, missing_ok=True)
     name = re.sub(r"[^A-Za-z0-9 _-]", "", p.name)[:50].strip() or f"project-{pid}"
+    log_activity(session, user=user, action="project_export", target_type="project", target_id=p.id, detail=f"Exported ZIP ({len(clips)} clips) from '{p.name}'", request=request)
     return FileResponse(dest, media_type="application/zip", filename=f"{name} - clips.zip")
 
 

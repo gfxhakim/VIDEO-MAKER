@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowRight, Eye, EyeOff, Loader2, Lock, Mail, RotateCw, User as UserIcon } from "lucide-react";
+import { ArrowRight, CheckCircle2, Eye, EyeOff, Loader2, Lock, Mail, RotateCw, ShieldCheck, User as UserIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Logo } from "@/components/app-shell";
 import { useAuth } from "@/components/auth-provider";
@@ -58,6 +58,7 @@ export default function SignInPage() {
       setStatus(s);
       setOffline(false);
       if (s.needs_setup) setMode("signup");
+      else if (!s.signup_open) setMode("signin");
     } catch {
       setOffline(true);
       setTries((n) => n + 1);
@@ -81,14 +82,19 @@ export default function SignInPage() {
     };
   }, [offline, tries, loadStatus]);
 
+  function switchMode(nextMode: "signin" | "signup") {
+    setMode(nextMode);
+    setError("");
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError("");
     try {
-      if (mode === "signup") await api.signup(email, password, name);
-      else await api.signin(email, password);
-      toast.success(mode === "signup" ? "Welcome to AutoClip Studio" : "Welcome back");
+      if (mode === "signup") await api.signup(email.trim(), password, name.trim());
+      else await api.signin(email.trim(), password);
+      toast.success(mode === "signup" ? "Account created! Welcome to AutoClip Studio." : "Welcome back!");
       await refresh();
     } catch (err) {
       setError((err as Error).message);
@@ -97,7 +103,9 @@ export default function SignInPage() {
     }
   }
 
-  const setup = status?.needs_setup;
+  const setup = !!status?.needs_setup;
+  const canSignup = status ? status.signup_open || setup : true;
+
   // The showcase needs a wide and not too flat window; these two class sets must stay opposites.
   return (
     <div className="grid min-h-dvh lg:[@media(min-height:521px)]:grid-cols-[1.1fr_1fr]">
@@ -115,7 +123,7 @@ export default function SignInPage() {
             >
               One long video in.<br /><span className="text-gradient">Fifty viral clips</span> out.
             </motion.h2>
-            <p className="mt-4 max-w-md text-muted-foreground min-[1800px]:max-w-xl min-[1800px]:text-lg">Auto-detected hooks, face-tracking reframes, kinetic captions and beat-synced music. All rendered on your own server.</p>
+            <p className="mt-4 max-w-md text-muted-foreground min-[1800px]:max-w-xl min-[1800px]:text-lg">Auto-detected hooks, face-tracking reframes, kinetic captions, trending visual effects and beat-synced music.</p>
           </div>
           {/* The phone stage takes whatever height is left. The fan inside keeps its shape and is as big
               as fits both ways, and the phones are percentages of it, so nothing can overlap the copy or the stats. */}
@@ -129,7 +137,7 @@ export default function SignInPage() {
           <div className="flex gap-8 text-sm text-muted-foreground">
             <div><div className="text-2xl font-semibold text-foreground">9:16</div>ready to post</div>
             <div><div className="text-2xl font-semibold text-foreground">1 to 50</div>clips per run</div>
-            <div><div className="text-2xl font-semibold text-foreground">0</div>API keys</div>
+            <div><div className="text-2xl font-semibold text-foreground">Instant</div>account setup</div>
           </div>
         </div>
       </div>
@@ -143,28 +151,60 @@ export default function SignInPage() {
         >
           <div className="short:col-start-1 short:row-start-1 short:self-end">
             <div className="mb-8 short:mb-5 lg:[@media(min-height:521px)]:hidden"><Logo /></div>
+            {canSignup && !setup && (
+              <div role="tablist" aria-label="Authentication mode" className="mb-5 grid grid-cols-2 rounded-xl border border-white/10 bg-white/[.03] p-1">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "signin"}
+                  onClick={() => switchMode("signin")}
+                  className={cn(
+                    "h-9 rounded-lg text-sm font-medium transition",
+                    mode === "signin" ? "bg-brand text-white shadow-sm shadow-fuchsia-500/20" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  Sign In
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "signup"}
+                  onClick={() => switchMode("signup")}
+                  className={cn(
+                    "h-9 rounded-lg text-sm font-medium transition",
+                    mode === "signup" ? "bg-brand text-white shadow-sm shadow-fuchsia-500/20" : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  Create Account
+                </button>
+              </div>
+            )}
             <AnimatePresence mode="wait">
-              <motion.div key={mode} initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.18 }}>
+              <motion.div key={mode} initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.16 }}>
                 <h1 className="text-3xl font-semibold tracking-tight">
-                  {setup ? "Set up your studio" : mode === "signup" ? "Create an account" : "Welcome back"}
+                  {setup ? "Set up admin studio" : mode === "signup" ? "Create your account" : "Welcome back"}
                 </h1>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  {setup ? "You're the first one here. This account becomes the owner." : mode === "signup" ? "Join this AutoClip Studio." : "Sign in to keep clipping."}
+                  {setup
+                    ? "You're the first one here. This account becomes the server administrator."
+                    : mode === "signup"
+                      ? "Get started in seconds. Your projects and clips are private to your account."
+                      : "Sign in with your email and password to open your studio."}
                 </p>
               </motion.div>
             </AnimatePresence>
           </div>
 
-          <form onSubmit={submit} className="mt-8 flex flex-col gap-4 short:col-start-2 short:row-span-2 short:row-start-1 short:mt-0 short:gap-2.5 short:self-center">
+          <form onSubmit={submit} className="mt-6 flex flex-col gap-4 short:col-start-2 short:row-span-2 short:row-start-1 short:mt-0 short:gap-2.5 short:self-center">
             {mode === "signup" && (
-              <Field icon={UserIcon} label="Name">
-                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" autoComplete="name" className="h-full w-full min-w-0 bg-transparent outline-none" />
+              <Field icon={UserIcon} label="Display Name (optional)">
+                <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Alex Rivera" autoComplete="name" className="h-full w-full min-w-0 bg-transparent outline-none" />
               </Field>
             )}
-            <Field icon={Mail} label="Email">
+            <Field icon={Mail} label="Email Address">
               <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" inputMode="email" autoCapitalize="none" className="h-full w-full min-w-0 bg-transparent outline-none" />
             </Field>
-            <Field icon={Lock} label="Password" trailing={
+            <Field icon={Lock} label={mode === "signup" ? "Create Password (6+ chars)" : "Password"} trailing={
               <button
                 type="button" onClick={() => setShow(!show)} aria-label={show ? "Hide password" : "Show password"} aria-pressed={show}
                 className="-mr-2.5 grid size-10 shrink-0 place-items-center rounded-lg text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
@@ -172,7 +212,16 @@ export default function SignInPage() {
                 {show ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
               </button>
             }>
-              <input type={show ? "text" : "password"} required minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : "••••••••"} autoComplete={mode === "signup" ? "new-password" : "current-password"} className="h-full w-full min-w-0 bg-transparent outline-none" />
+              <input
+                type={show ? "text" : "password"}
+                required
+                minLength={mode === "signup" ? 6 : 1}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder={mode === "signup" ? "At least 6 characters" : "••••••••"}
+                autoComplete={mode === "signup" ? "new-password" : "current-password"}
+                className="h-full w-full min-w-0 bg-transparent outline-none"
+              />
             </Field>
 
             <AnimatePresence>
@@ -197,21 +246,27 @@ export default function SignInPage() {
             {/* never locked by the status check: on a bad connection the user can still try, and gets a clear message */}
             <motion.button whileTap={{ scale: 0.98 }} disabled={busy} className="bg-brand group mt-2 flex h-12 shrink-0 items-center justify-center gap-2 rounded-xl font-semibold text-white shadow-lg shadow-fuchsia-500/25 transition outline-none hover:brightness-110 focus-visible:ring-4 focus-visible:ring-primary/40 disabled:opacity-60 short:mt-1">
               {busy ? <Loader2 className="size-4 animate-spin" /> : null}
-              {mode === "signup" ? "Create account" : "Sign in"}
+              {setup ? "Create admin account" : mode === "signup" ? "Create free account" : "Sign in to studio"}
               {!busy && <ArrowRight className="size-4 transition group-hover:translate-x-0.5" />}
             </motion.button>
+
+            {mode === "signup" && !setup && (
+              <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span className="inline-flex items-center gap-1"><CheckCircle2 className="size-3.5 text-emerald-400" /> Instant access</span>
+                <span className="inline-flex items-center gap-1"><ShieldCheck className="size-3.5 text-primary" /> Private workspace</span>
+              </div>
+            )}
           </form>
 
           <div className="short:col-start-1 short:row-start-2 short:self-start">
-            {status && !setup && status.signup_open && (
-              <p className="mt-6 text-center text-sm text-muted-foreground short:mt-4 short:text-left">
-                {mode === "signin" ? "New here? " : "Already have an account? "}
-                <button type="button" onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setError(""); }} className="-my-2.5 py-2.5 font-medium text-primary hover:underline">
-                  {mode === "signin" ? "Create an account" : "Sign in"}
-                </button>
+            {status && !setup && !status.signup_open && (
+              <p className="mt-5 rounded-xl border border-white/10 bg-white/[.03] px-3 py-2 text-center text-xs text-muted-foreground short:mt-3 short:text-left">
+                New sign-ups are currently paused by the administrator.
               </p>
             )}
-            <p className="mt-10 text-center text-xs text-muted-foreground short:mt-3 short:text-left">Self-hosted. Your videos never leave your server.</p>
+            <p className="mt-8 text-center text-xs text-muted-foreground short:mt-3 short:text-left">
+              Private workspace · Encrypted sessions · All projects saved on server.
+            </p>
           </div>
         </motion.div>
       </div>

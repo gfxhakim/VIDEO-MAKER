@@ -1,9 +1,10 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import useSWR from "swr";
 import { toast } from "sonner";
-import { Activity, Cpu, HardDrive, KeyRound, Loader2, LogOut, RotateCw, Save, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
+import { Activity, Cpu, HardDrive, KeyRound, Loader2, LogOut, RotateCw, Save, Shield, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
 import { PageHeader } from "@/components/app-shell";
 import { useAuth } from "@/components/auth-provider";
 import { StatusBadge } from "@/components/status-badge";
@@ -108,10 +109,24 @@ export default function SettingsPage() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
             <span aria-hidden className="bg-brand grid size-12 shrink-0 place-items-center rounded-full text-lg font-semibold text-white uppercase">{user?.name?.trim().slice(0, 1) || "?"}</span>
             <div className="min-w-0 flex-1 basis-36">
-              <div className="font-medium wrap-anywhere">{user?.name}</div>
+              <div className="flex flex-wrap items-center gap-2 font-medium wrap-anywhere">
+                <span>{user?.name}</span>
+                {user?.role === "admin" && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-fuchsia-400/30 bg-fuchsia-500/15 px-2 py-0.5 text-[11px] font-medium text-fuchsia-300">
+                    <Shield className="size-3" /> Admin
+                  </span>
+                )}
+              </div>
               <div className="text-sm wrap-anywhere text-muted-foreground">{user?.email}</div>
             </div>
-            <Button variant="outline" onClick={signOut} className="shrink-0 max-sm:grow pointer-coarse:h-11"><LogOut /> Sign out</Button>
+            <div className="flex flex-wrap gap-2 max-sm:w-full">
+              {user?.role === "admin" && (
+                <Link href="/admin" className="inline-flex h-10 items-center gap-1.5 rounded-md border border-fuchsia-400/30 bg-fuchsia-500/15 px-3.5 text-sm font-medium text-fuchsia-200 transition hover:bg-fuchsia-500/25 max-sm:flex-1 max-sm:justify-center">
+                  <Shield className="size-4" /> Admin Panel
+                </Link>
+              )}
+              <Button variant="outline" onClick={signOut} className="shrink-0 max-sm:flex-1 pointer-coarse:h-11"><LogOut /> Sign out</Button>
+            </div>
           </div>
         </Panel>
 

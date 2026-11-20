@@ -37,7 +37,7 @@ const SIGNIN_PATH = process.env.NODE_ENV === "production" ? "/signin/" : "/signi
  * go straight to the sign-in page, signed-in ones skip it. components/auth-provider.tsx picks up
  * `__acAuth` and sets `__acReady`; the storage key and its JSON shape must match that file.
  */
-const EARLY_AUTH = `(function(){try{var w=window,K="autoclip:user",S=${JSON.stringify(SIGNIN_PATH)},on=/^\\/signin\\/?$/.test(location.pathname);var p=fetch("/api/auth/status",{credentials:"include",headers:{Accept:"application/json"}}).then(function(r){if(!r.ok)throw new Error("status "+r.status);return r.json()}).then(function(s){var u=s&&s.user;try{u?localStorage.setItem(K,JSON.stringify({id:u.id,email:u.email,name:u.name})):localStorage.removeItem(K)}catch(e){}if(!w.__acReady){if(!u&&!on)location.replace(S);else if(u&&on)location.replace("/")}return s});p.catch(function(){});w.__acAuth=p}catch(e){}})();`;
+const EARLY_AUTH = `(function(){try{var w=window,K="autoclip:user",S=${JSON.stringify(SIGNIN_PATH)},on=/^\\/signin\\/?$/.test(location.pathname);var p=fetch("/api/auth/status",{credentials:"include",headers:{Accept:"application/json"}}).then(function(r){if(!r.ok)throw new Error("status "+r.status);return r.json()}).then(function(s){var u=s&&s.user;try{u?localStorage.setItem(K,JSON.stringify({id:u.id,email:u.email,name:u.name,role:u.role||"user"})):localStorage.removeItem(K)}catch(e){}if(!w.__acReady){if(!u&&!on)location.replace(S);else if(u&&on)location.replace("/")}return s});p.catch(function(){});w.__acAuth=p}catch(e){}})();`;
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
