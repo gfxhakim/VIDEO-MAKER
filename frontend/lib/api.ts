@@ -1,7 +1,7 @@
 // Typed client for the FastAPI backend. Same origin in production and in dev (via rewrites).
 export const API_URL = "";
 
-export type HookCardStyle = "light" | "dark" | "accent" | "glass";
+export type HookCardStyle = "light" | "dark" | "accent" | "glass" | "viral_yellow" | "breaking_red";
 export type WatermarkPosition = "top_left" | "top_right" | "bottom_left" | "bottom_right";
 
 export type GenerationSettings = {
@@ -32,6 +32,7 @@ export type GenerationSettings = {
   use_ai?: boolean;
   language?: string | null;
   caption_position?: number | null;
+  caption_color?: string | null;
 };
 
 export const DEFAULT_SETTINGS: GenerationSettings = {
@@ -62,6 +63,7 @@ export const DEFAULT_SETTINGS: GenerationSettings = {
   use_ai: false,
   language: null,
   caption_position: null,
+  caption_color: null,
 };
 
 export type EditingStyle = { key: string; name: string; description: string; layout: string; hook_card?: boolean };
@@ -103,6 +105,7 @@ export type Presets = {
   playback_speeds?: { value: number; label: string }[];
   aspect_ratios: { key: string; width: number; height: number }[];
   hook_card_styles?: { key: HookCardStyle; name: string }[];
+  caption_colors?: { key: string; name: string }[];
   clip_count: { min: number; max: number; default: number };
   llm_configured?: boolean;
 };

@@ -95,12 +95,12 @@ def test_scene_cut_camera_path_gaming_zoom_and_broll_layout():
     # With scene_cuts, index 8 immediately snaps to 0.8 instead of lagging behind near 0.25
     assert cx_cut[8] > 0.75 and cx_smooth[8] < 0.4
 
-    # gaming_fast zoom fix
+    # gaming_fast single-pass dynamic zoom
     g_lay = reframe.build_layout(
         "gameplay_facecam", src_w=1920, src_h=1080, out_w=1080, out_h=1920,
         track=tr, style={"zoom_on_emphasis": True, "zoom_amount": 1.12}, zoom_windows=[(1.0, 2.0)],
     )
-    assert "overlay=0:0:enable='gt(between(t,1.00,2.00),0)'" in g_lay.filter
+    assert "gt(between(t,1.00,2.00),0)" in g_lay.filter and "flags=bicubic:eval=frame" in g_lay.filter
 
     # broll_split with & without B-roll
     b_lay = reframe.build_layout("broll_split", src_w=1920, src_h=1080, out_w=1080, out_h=1920, track=tr, style={}, has_broll=True)
@@ -525,6 +525,131 @@ def test_ytdlp_cookies_and_friendly_bot_error(tmp_path, monkeypatch):
         monkeypatch.delenv("YTDLP_COOKIES", raising=False)
         get_settings().ytdlp_cookies_path.unlink(missing_ok=True)
         get_settings.cache_clear()
+
+
+def test_emoji_patterns_and_expanded_ios_map():
+    from app.pipeline import captions
+    from app.presets import emoji_map
+
+    assert captions.emoji_for("$10,000") == "💸"
+    assert captions.emoji_for("50k") == "💸"
+    assert captions.emoji_for("99%") == "📈"
+    assert captions.emoji_for("10x") == "🚀"
+    assert captions.emoji_for("what?!") == "🤯"
+    assert (captions.emoji_for("podcast") or "").rstrip("\ufe0f") == "🎙"
+    assert (captions.emoji_for("coffee") or "").rstrip("\ufe0f") == "☕"
+
+    # Every mapped emoji resolves to an actual iOS PNG asset on disk
+    for kw, em in emoji_map().items():
+        assert captions._emoji_png(em) is not None, f"Missing iOS PNG for keyword {kw!r} -> {em!r}"
+
+
+def test_caption_color_override_and_readable_emoji_timing():
+    from app.pipeline import captions
+    from app.presets import get_caption_style
+
+    words = [
+        {"word": "We", "start": 0.0, "end": 0.15},
+        {"word": "made", "start": 0.15, "end": 0.30},
+        {"word": "$10,000", "start": 0.30, "end": 0.45},
+    ]
+    style = get_caption_style("hormozi")
+    ass, cues = captions.build_ass(
+        words, style, out_w=1080, out_h=1920, caption_y=0.62, clip_duration=4.0,
+        auto_emoji=True, caption_color="#00F57A",
+    )
+    # #00F57A -> ASS BGR &H007AF500
+    assert "&H007AF500" in ass
+    assert "&H44000000" in ass
+    assert "\\fscx122\\fscy122\\t(0,95,\\fscx100\\fscy100)" in ass
+    assert len(cues) == 1
+    assert cues[0].end - cues[0].start >= 0.84
+
+    # stack and word modes also pick up caption_color override
+    for key in ("netflix_kinetic", "single_word_pop"):
+        ass_m, _ = captions.build_ass(
+            words, get_caption_style(key), out_w=1080, out_h=1920,
+            caption_y=0.62, clip_duration=4.0, auto_emoji=False, caption_color="#22D3EE",
+        )
+        assert "&H00EED322" in ass_m
+
+
+def test_make_hook_text_and_new_hook_themes(tmp_path):
+    from app.pipeline import highlights, hook_card
+
+    hook = highlights.make_hook_text("So basically we built a million dollar business in 30 days", "built business")
+    assert not hook.lower().startswith("so ")
+    assert len(hook) <= 60
+    assert any(ord(c) >= 0x1F000 or 0x2600 <= ord(c) <= 0x27BF for c in hook)
+
+    for theme in ("light", "dark", "accent", "glass", "viral_yellow", "breaking_red"):
+        out = tmp_path / f"hook_{theme}.png"
+        png, w, h = hook_card.render_hook_card("Made $10,000 in 7 days 🚀", out, out_w=1080, card_style=theme)
+        assert png.exists() and w > 200 and h > 60
+
+
+def test_fast_render_dynamics_and_single_pass_reframe(tmp_path):
+    from app.pipeline import captions, reframe, render
+    from app.presets import get_editing_style
+
+    track = reframe.FaceTrack(times=[0.0, 1.0, 2.0], faces=[[(0.5, 0.4, 0.2, 0.2)]] * 3)
+    res = reframe.build_layout(
+        "face_track_zoom",
+        src_w=1920, src_h=1080, out_w=1080, out_h=1920,
+        track=track, style=get_editing_style("face_track_zoom"),
+        zoom_windows=[(0.4, 1.8)],
+    )
+    assert "flags=bicubic" in res.filter
+    assert "eval=frame" in res.filter
+    assert "overlay=" not in res.filter
+
+    hook_png = tmp_path / "hook.png"
+    from PIL import Image
+    Image.new("RGBA", (400, 100), (255, 230, 0, 255)).save(hook_png)
+    money_png = captions._emoji_png("💸")
+    assert money_png is not None
+
+    spec = render.RenderSpec(
+        source=tmp_path / "src.mp4",
+        start=0.0,
+        end=5.0,
+        out_path=tmp_path / "out.mp4",
+        work_dir=tmp_path,
+        video_filter=res.filter,
+        out_w=1080,
+        out_h=1920,
+        normalize_audio=True,
+        hook_png=hook_png,
+        hook_xy=(100, 120),
+        hook_duration=3.5,
+        emoji=[captions.EmojiCue(0.5, 1.6, money_png)],
+        emoji_y=400,
+    )
+    cmd = " ".join(render.build_command(spec))
+    assert "acompressor=" in cmd and "alimiter=" in cmd
+    assert "loudnorm=" not in cmd
+    assert "fade=t=out:" in cmd
+    assert "emoji_cache" in cmd or money_png.name in cmd
+
+
+def test_upload_meta_cache_lifecycle(tmp_path):
+    from app.api import uploads as up_mod
+
+    init_db()
+    with _signed_in(TestClient(app), "me@example.com") as c:
+        me = c.get("/api/auth/me").json()
+        r = c.post("/api/uploads", json={"filename": "fast.mp4", "size": 1024})
+        assert r.status_code == 200
+        uid = r.json()["id"]
+        assert up_mod._cached_meta(uid, me["id"]) is not None
+
+        put = c.put(f"/api/uploads/{uid}/chunks/0", content=b"\x00" * 1024)
+        assert put.status_code == 200
+
+        d = c.delete(f"/api/uploads/{uid}")
+        assert d.status_code == 200
+        assert up_mod._cached_meta(uid, me["id"]) is None
+
 
 
 

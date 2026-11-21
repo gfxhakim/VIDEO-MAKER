@@ -29,6 +29,7 @@ INTERRUPTED_ERROR = ("The server restarted while this was running, several times
                      "It may have run out of memory: try a shorter video or fewer clips.")
 _handlers: dict[str, Handler] = {}
 _failure_hooks: dict[str, Callable[[dict, str], None]] = {}
+_wake = threading.Event()
 
 
 def register(kind: str, handler: Handler, on_final_failure: Callable[[dict, str], None] | None = None) -> None:
@@ -46,11 +47,15 @@ def enqueue(kind: str, payload: dict[str, Any], *, priority: int = 0, delay_seco
               run_after=utcnow() + timedelta(seconds=delay_seconds))
     if session is not None:
         session.add(job)
+        if delay_seconds <= 0:
+            _wake.set()
         return None
     with session_scope() as s:
         s.add(job)
         s.commit()
         s.refresh(job)
+        if delay_seconds <= 0:
+            _wake.set()
         return job.id
 
 
@@ -183,7 +188,8 @@ class Worker:
                 log.exception("claim failed")
                 job = None
             if job is None:
-                self._stop.wait(poll)
+                _wake.wait(poll)
+                _wake.clear()
                 continue
             log.info("[%s] running job %s %s", wid, job.id, job.kind)
             _run_one(job)
@@ -199,6 +205,7 @@ class Worker:
 
     def stop(self) -> None:
         self._stop.set()
+        _wake.set()
 
     def run_forever(self) -> None:
         self.start()

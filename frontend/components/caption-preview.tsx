@@ -13,6 +13,7 @@ const FONT_VARS: Record<string, string> = {
 
 const SAMPLE = ["this", "changed", "my", "life", "$10,000", "in", "30", "days"];
 const KEYWORDS = new Set(["changed", "$10,000", "30"]);
+const SAMPLE_EMOJI = ["⚡", "🔥", "🔥", "❤️‍🔥", "💸", "💸", "📈", "🚀"];
 
 const em = (n: number, size: number) => `${(n / size).toFixed(4)}em`;
 
@@ -21,11 +22,13 @@ export function CaptionPreview({
   frame = 830,
   animate = true,
   showEmoji = false,
+  colorOverride,
 }: {
   style: CaptionStyle;
   frame?: number;
   animate?: boolean;
   showEmoji?: boolean;
+  colorOverride?: string | null;
 }) {
   const [i, setI] = useState(1);
   const box = useRef<HTMLSpanElement>(null);
@@ -49,7 +52,7 @@ export function CaptionPreview({
     const k = Math.min(1, w / words.offsetWidth, h / words.offsetHeight);
     t.style.transform = k < 0.995 ? `scale(${k.toFixed(3)})` : "";
   }, []);
-  useLayoutEffect(fit, [fit, i, style, frame]);
+  useLayoutEffect(fit, [fit, i, style, frame, colorOverride]);
   useEffect(() => {
     if (!box.current) return;
     const ro = new ResizeObserver(fit);
@@ -64,10 +67,13 @@ export function CaptionPreview({
 
   const size = style.size > 0 ? style.size : 90;
   const fmt = (w: string) => (style.uppercase ? w.toUpperCase() : w);
-  const cycle = style.accent_cycle?.length ? style.accent_cycle : [style.accent];
+  const custom = colorOverride?.trim() || "";
+  const hiColor = custom || style.highlight;
+  const acColor = custom || style.accent;
+  const cycle = custom ? [custom, "#FFFFFF", custom] : style.accent_cycle?.length ? style.accent_cycle : [style.accent];
   const isBoxed = style.mode === "boxed";
   const shadow = [
-    style.shadow ? `${em(style.shadow, size)} ${em(style.shadow, size)} 0 rgba(0,0,0,.65)` : "",
+    style.shadow ? `${em(style.shadow, size)} ${em(style.shadow, size)} 0 rgba(0,0,0,.75)` : "0 0.06em 0.14em rgba(0,0,0,.6)",
     style.glow ? `0 0 ${em(style.glow * 1.2, size)} currentColor, 0 0 ${em(style.glow * 2.4, size)} currentColor` : "",
   ]
     .filter(Boolean)
@@ -89,6 +95,7 @@ export function CaptionPreview({
   const start = Math.floor(i / per) * per;
   const chunk = SAMPLE.slice(start, start + per);
   const hasKeywordInChunk = chunk.some((w) => KEYWORDS.has(w));
+  const emojiChar = SAMPLE_EMOJI[i] ?? "🔥";
 
   let body: React.ReactNode;
   if (style.mode === "word") {
@@ -122,7 +129,7 @@ export function CaptionPreview({
       >
         {chunk.map((w, k) => {
           const active = start + k === i;
-          const color = active ? style.highlight : KEYWORDS.has(w) ? style.accent : style.primary;
+          const color = active ? hiColor : KEYWORDS.has(w) ? acColor : style.primary;
           return (
             <span key={k} className={active ? "inline-block animate-in whitespace-nowrap duration-150 zoom-in-110" : "inline-block whitespace-nowrap"} style={{ color }}>
               {fmt(w)}
@@ -136,7 +143,9 @@ export function CaptionPreview({
   return (
     <span ref={box} aria-hidden className="relative block size-full overflow-hidden px-[5cqw] py-[3cqw] select-none">
       {showEmoji && (hasKeywordInChunk || KEYWORDS.has(SAMPLE[i])) && (
-        <span className="absolute top-[6%] left-1/2 -translate-x-1/2 text-[14cqw] leading-none drop-shadow">💸</span>
+        <span className="absolute top-[6%] left-1/2 -translate-x-1/2 text-[14cqw] leading-none drop-shadow-[0_2px_6px_rgba(0,0,0,.75)]">
+          {emojiChar}
+        </span>
       )}
       <span ref={text} data-caption-text className="flex size-full items-center justify-center text-center" style={base}>
         {body}

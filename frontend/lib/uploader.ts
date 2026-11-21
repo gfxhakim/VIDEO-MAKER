@@ -75,7 +75,8 @@ export function isVideoFileName(name: string) {
   return dot > 0 && VIDEO_EXTENSIONS.includes(name.slice(dot).toLowerCase());
 }
 
-const MAX_PARALLEL = 4;
+const MAX_PARALLEL = 6;
+const INITIAL_PARALLEL = 3;
 const CHUNK_TIMEOUT_MS = 240_000; // hard stop, under the proxy's 5 minute limit for a request body
 const STALL_MS = 30_000; // a request that moved no bytes for this long is dropped and retried
 const RESPONSE_STALL_MS = 60_000; // body fully sent, still no answer
@@ -87,17 +88,13 @@ const SPEED_WINDOW_MS = 15_000; // "290 KB/s"
 const ETA_WINDOW_MS = 60_000; // time left is worked out from a longer stretch, so it does not jump
 const EMIT_EVERY_MS = 500; // bytes and bar
 const NUMBERS_EVERY_MS = 2_000; // speed and time left
-// Parallel requests. One request at a time already keeps the line full, because the next chunk
-// starts as soon as the previous one has left the browser (it does not wait for the answer).
-// Over HTTP/2 every request shares one connection, so more of them cannot add bandwidth: they
-// only make each chunk slower and throw more away when the line drops. So the uploader TRIES
-// one more request from time to time and keeps it only when the measured speed really went up
-// (several HTTP/1.1 connections, or a proxy that limits each stream).
-const EPOCH_MS = 10_000; // how long one level is measured
-const SETTLE_MS = 2_000; // ignored after a change of level
-const PROBE_GAIN = 1.2; // one more request must bring 20% more speed to stay
-const PROBE_HOLD_MS = 60_000; // after a try that did not help, wait this long (doubles each time)
-const PROBE_HOLD_MAX_MS = 600_000;
+// Start 3 pipelined streams immediately so TCP/HTTP bandwidth saturates from second 0,
+// while still scaling smoothly up to MAX_PARALLEL or down on unstable links.
+const EPOCH_MS = 5_000; // how long one level is measured
+const SETTLE_MS = 1_000; // ignored after a change of level
+const PROBE_GAIN = 1.06; // one more request stays when throughput rises noticeably
+const PROBE_HOLD_MS = 20_000; // cooldown after a try that did not help
+const PROBE_HOLD_MAX_MS = 180_000;
 const MAX_CHUNK_SECONDS = 30; // never split the line so far that one chunk takes longer than this
 
 type Flight = { xhr: XMLHttpRequest; bytes: number; loaded: number; moved: number; bodySent: boolean; fail: (status: number) => void };
@@ -276,7 +273,7 @@ export class ResumableUpload {
   private etaAt = 0;
 
   // parallel requests
-  private parallel = 1;
+  private parallel = INITIAL_PARALLEL;
   private meter: { t0: number; b0: number } | null = null;
   private meterFrom = 0;
   private probe: { from: number; baseline: number } | null = null;
@@ -302,7 +299,7 @@ export class ResumableUpload {
     this.file = file;
     this.expect = options.expect;
     this.fixedParallel = options.parallel ? Math.max(1, Math.min(MAX_PARALLEL, Math.floor(options.parallel))) : null;
-    if (this.fixedParallel) this.parallel = this.fixedParallel;
+    this.parallel = this.fixedParallel ?? INITIAL_PARALLEL;
     this.state = {
       id: null, phase: "preparing", fileName: file.name, size: file.size, sent: 0, safe: 0, speed: 0, eta: null, resumedFrom: 0,
       message: null, errorCode: null, canRetry: false, autoStart: false, project: null, parallel: this.parallel,

@@ -133,17 +133,17 @@ def test_auto_worker_concurrency(monkeypatch):
 
 
 # ------------------------------------------------------------------ render graph
-def test_zoom_uses_two_fixed_scalers_instead_of_per_frame_scaling():
+def test_zoom_uses_single_pass_dynamic_crop_and_bicubic():
     style = {"zoom_on_emphasis": True, "zoom_amount": 1.15}
     lay = reframe.build_layout("center", src_w=1920, src_h=1080, out_w=1080, out_h=1920, track=reframe.FaceTrack(),
                                style=style, zoom_windows=[(1.0, 2.0), (5.0, 6.1)])
     f = lay.filter
-    assert "eval=frame" not in f and f.count("[0:v]") == 1 and f.endswith("[vbase]")
-    assert "overlay=0:0:enable='gt(between(t,1.00,2.00)+between(t,5.00,6.10),0)'" in f
-    assert "crop=528:940:(iw-528)/2:(ih-940)*0.40" in f  # 608x1080 crop, zoomed in 1.15x
+    assert f.count("[0:v]") == 1 and "split=" not in f and "overlay=" not in f and f.endswith("[vbase]")
+    assert "crop=w='if(gt(between(t,1.00,2.00)+between(t,5.00,6.10),0),528,608)'" in f
+    assert "flags=bicubic:eval=frame" in f
     plain = reframe.build_layout("center", src_w=1920, src_h=1080, out_w=1080, out_h=1920, track=reframe.FaceTrack(),
                                  style=style, zoom_windows=[])
-    assert "overlay" not in plain.filter and "split" not in plain.filter
+    assert "overlay" not in plain.filter and "split" not in plain.filter and "eval=frame" not in plain.filter
 
 
 def test_render_command_caps_threads_bitrate_and_drops_high_fps_early(tmp_path, monkeypatch):

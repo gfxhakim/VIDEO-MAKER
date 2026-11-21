@@ -55,9 +55,12 @@ log = logging.getLogger(__name__)
 # finished or rolled back at once instead of waiting for the next restart.
 _working: set[str] = set()
 _working_lock = threading.Lock()
+_meta_cache: dict[str, tuple[int, int, int, int, float]] = {}  # id -> (user_id, size, chunk_size, total_chunks, ts)
+_meta_lock = threading.Lock()
+_last_purge_at = 0.0
 
 UPLOAD_ID = Path(pattern=r"^[0-9a-f]{32}$")  # never a path: only what uuid4().hex can produce
-WRITE_BUFFER = 1024 * 1024
+WRITE_BUFFER = 4 * 1024 * 1024
 MB = 1024 * 1024
 
 
@@ -183,10 +186,36 @@ def upload_out(u: Upload) -> UploadOut:
     )
 
 
+def _remember_meta(u: Upload) -> None:
+    if u.status != "uploading":
+        return
+    with _meta_lock:
+        if len(_meta_cache) > 512:
+            _meta_cache.clear()
+        _meta_cache[u.id] = (u.user_id, u.size, u.chunk_size, u.total_chunks, time.monotonic())
+
+
+def _evict_meta(upload_id: str) -> None:
+    with _meta_lock:
+        _meta_cache.pop(upload_id, None)
+
+
+def _cached_meta(upload_id: str, user_id: int) -> tuple[int, int, int] | None:
+    with _meta_lock:
+        item = _meta_cache.get(upload_id)
+    if not item:
+        return None
+    uid, size, chunk_size, total_chunks, ts = item
+    if uid != user_id or time.monotonic() - ts > 300.0:
+        return None
+    return size, chunk_size, total_chunks
+
+
 def _discard(session: Session, u: Upload, only: tuple[str, ...] = ("uploading",)) -> bool:
     """Delete the upload, but only if it is still in one of the `only` states (complete() may
     have claimed it since it was read). Commits; the files go only once the row is gone."""
     uid = u.id
+    _evict_meta(uid)
     res = session.exec(delete(Upload).where(col(Upload.id) == uid, col(Upload.status).in_(only))
                        .execution_options(synchronize_session=False))
     session.commit()
@@ -306,11 +335,20 @@ def recover_uploads() -> None:
     purge_stale_uploads()
 
 
+def _maybe_purge_stale(ttl_seconds: float = 120.0) -> None:
+    global _last_purge_at
+    now = time.monotonic()
+    if now - _last_purge_at < ttl_seconds:
+        return
+    _last_purge_at = now
+    purge_stale_uploads()
+
+
 # ------------------------------------------------------------------ endpoints
 @router.post("", response_model=UploadOut)
 def init_upload(body: UploadInit, request: Request, user: User = Depends(current_user), session: Session = Depends(get_session)):
     s = get_settings()
-    purge_stale_uploads()
+    _maybe_purge_stale()
     name = _clean_name(body.filename)
     ext = FsPath(name).suffix.lower()
     if ext not in VIDEO_EXTS:
@@ -324,6 +362,7 @@ def init_upload(body: UploadInit, request: Request, user: User = Depends(current
     for u in mine:
         if body.fingerprint and u.fingerprint == body.fingerprint and u.size == body.size:
             if _data(u.id).exists() and _map(u.id).exists():
+                _remember_meta(u)
                 return upload_out(u)
             _discard(session, u)
             mine.remove(u)
@@ -364,13 +403,14 @@ def init_upload(body: UploadInit, request: Request, user: User = Depends(current
     session.add(u)
     session.commit()
     session.refresh(u)
+    _remember_meta(u)
     log_activity(session, user=user, action="upload_start", target_type="upload", detail=f"Started upload '{name}' ({body.size / 1024**2:.1f} MB)", request=request)
     return upload_out(u)
 
 
 @router.get("", response_model=list[UploadOut])
 def my_uploads(user: User = Depends(current_user), session: Session = Depends(get_session)):
-    purge_stale_uploads()
+    _maybe_purge_stale()
     rows = session.exec(
         select(Upload).where(Upload.user_id == user.id, Upload.status == "uploading").order_by(col(Upload.created_at).desc())
     ).all()
@@ -385,6 +425,10 @@ def upload_status(upload_id: str = UPLOAD_ID, user: User = Depends(current_user)
 def _load(upload_id: str, user_id: int) -> Upload:
     with session_scope() as session:  # short read; no DB connection is held while the chunk streams in
         u = _mine(session, upload_id, user_id)
+        if u.status == "uploading":
+            _remember_meta(u)
+        else:
+            _evict_meta(upload_id)
         session.expunge(u)
         return u
 
@@ -395,22 +439,28 @@ async def put_chunk(request: Request, index: int, upload_id: str = UPLOAD_ID):
     user_id = request_user_id(request)
     if user_id is None:
         raise HTTPException(401, "Not signed in")
-    u = await run_in_threadpool(_load, upload_id, user_id)
-    if u.status != "uploading":
-        raise HTTPException(409, "This upload is already finished")
-    if not 0 <= index < u.total_chunks:
-        raise HTTPException(404, f"Chunk {index} does not exist (this upload has {u.total_chunks})")
-    expected = _chunk_len(u, index)
+    meta = _cached_meta(upload_id, user_id)
+    if meta is None:
+        u = await run_in_threadpool(_load, upload_id, user_id)
+        if u.status != "uploading":
+            raise HTTPException(409, "This upload is already finished")
+        size, chunk_size, total_chunks = u.size, u.chunk_size, u.total_chunks
+    else:
+        size, chunk_size, total_chunks = meta
+    if not 0 <= index < total_chunks:
+        raise HTTPException(404, f"Chunk {index} does not exist (this upload has {total_chunks})")
+    expected = min(chunk_size, size - index * chunk_size)
     declared = request.headers.get("content-length")
     if declared is not None and declared.isdigit() and int(declared) != expected:
         raise HTTPException(400, f"Chunk {index} must be exactly {expected} bytes, not {declared}")
 
     try:
-        fd = os.open(_data(u.id), os.O_WRONLY | getattr(os, "O_BINARY", 0))
+        fd = os.open(_data(upload_id), os.O_WRONLY | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
+        _evict_meta(upload_id)
         await run_in_threadpool(_gone_or_finished, upload_id, user_id)
         raise HTTPException(404, "Upload not found (it may have expired). Start again.") from None
-    offset, got, buf = index * u.chunk_size, 0, bytearray()
+    offset, got, buf = index * chunk_size, 0, bytearray()
     try:
         async for block in request.stream():
             got += len(block)
@@ -434,8 +484,9 @@ async def put_chunk(request: Request, index: int, upload_id: str = UPLOAD_ID):
     if got != expected:
         raise HTTPException(400, f"Chunk {index}: received {got} bytes, expected {expected}")
     try:
-        _mark(u.id, index)  # only now does the chunk count
+        _mark(upload_id, index)  # only now does the chunk count
     except FileNotFoundError:
+        _evict_meta(upload_id)
         await run_in_threadpool(_gone_or_finished, upload_id, user_id)
         raise HTTPException(404, "Upload not found (it was cancelled).") from None
     return {"index": index, "bytes": got}
@@ -444,6 +495,7 @@ async def put_chunk(request: Request, index: int, upload_id: str = UPLOAD_ID):
 def _gone_or_finished(upload_id: str, user_id: int) -> None:
     """The bytes vanished under a chunk. If that is because the upload was just finished (from
     another tab, say), answer 409 like any chunk for a finished upload, not 'start again'."""
+    _evict_meta(upload_id)
     try:
         u = _load(upload_id, user_id)
     except HTTPException:
@@ -457,6 +509,7 @@ def complete_upload(body: UploadComplete, request: Request, upload_id: str = UPL
                     session: Session = Depends(get_session)):
     u = _mine(session, upload_id, user.id)
     if u.status == "completed":  # the client retried after a lost response: same answer, no second project
+        _evict_meta(upload_id)
         p = session.get(Project, u.project_id) if u.project_id else None
         if not p:
             raise HTTPException(404, "Upload not found (it may have expired). Start again.")
@@ -477,6 +530,7 @@ def complete_upload(body: UploadComplete, request: Request, upload_id: str = UPL
 
 def _complete(session: Session, u: Upload, upload_id: str, gs: GenerationSettings, body: UploadComplete, *,
               user: Optional[User] = None, request: Optional[Request] = None) -> ProjectOut:
+    _evict_meta(upload_id)
     claimed = session.exec(update(Upload).where(col(Upload.id) == u.id, col(Upload.status) == "uploading").values(status="completing"))
     session.commit()
     if claimed.rowcount != 1:
@@ -487,8 +541,9 @@ def _complete(session: Session, u: Upload, upload_id: str, gs: GenerationSetting
     try:
         if src.stat().st_size != u.size:
             raise HTTPException(409, "Uploaded file has the wrong size. Start again.")
-        with open(src, "rb") as f:
-            os.fsync(f.fileno())
+        if get_settings().upload_fsync:
+            with open(src, "rb") as f:
+                os.fsync(f.fileno())
         p = Project(user_id=u.user_id, name=(body.name or FsPath(u.filename).stem or "Upload")[:120], source_type="upload", source=u.filename,
                     settings=gs.model_dump())
         session.add(p)

@@ -120,6 +120,7 @@ type FormState = {
   broll_id: string;
   aspect_ratio: string;
   caption_style: string;
+  caption_color: string;
   caption_position: number | null;
   auto_emoji: string;
   hook_title: string;
@@ -156,6 +157,7 @@ const formOf = (c: Clip): FormState => {
     broll_id: ov.broll_id != null ? String(ov.broll_id) : "",
     aspect_ratio: (ov.aspect_ratio as string) || "",
     caption_style: (ov.caption_style as string) || "",
+    caption_color: (ov.caption_color as string) || "",
     caption_position: typeof ov.caption_position === "number" ? ov.caption_position : null,
     auto_emoji: boolStr(ov.auto_emoji),
     hook_title: boolStr(ov.hook_title),
@@ -209,6 +211,7 @@ const EMPTY_FORM: FormState = {
   broll_id: "",
   aspect_ratio: "",
   caption_style: "",
+  caption_color: "",
   caption_position: null,
   auto_emoji: "",
   hook_title: "",
@@ -391,6 +394,7 @@ export function ClipStudio({
     form.video_effect !== initial.video_effect ||
     form.playback_speed !== initial.playback_speed ||
     form.caption_style !== initial.caption_style ||
+    form.caption_color !== initial.caption_color ||
     form.caption_position !== initial.caption_position ||
     form.editing_style !== initial.editing_style ||
     form.broll_id !== initial.broll_id ||
@@ -433,6 +437,7 @@ export function ClipStudio({
         video_effect: form.video_effect || null,
         playback_speed: form.playback_speed ? Number(form.playback_speed) : null,
         caption_style: form.caption_style || null,
+        caption_color: form.caption_color || null,
         caption_position: form.caption_position ?? null,
         editing_style: form.editing_style || null,
         broll_id: form.broll_id ? Number(form.broll_id) : null,
@@ -1048,8 +1053,53 @@ export function ClipStudio({
                                 <option value="dark">Dark pill</option>
                                 <option value="accent">Brand gradient</option>
                                 <option value="glass">Frosted glass</option>
+                                <option value="viral_yellow">Viral Gold Banner</option>
+                                <option value="breaking_red">Breaking Alert</option>
                               </select>
                             </label>
+                            <div className="sm:col-span-2">
+                              <span className="mb-1 block text-muted-foreground">Caption highlight color</span>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {(presets?.caption_colors ?? [
+                                  { key: "", name: "Preset Default" },
+                                  { key: "#FFE600", name: "Cyber Gold" },
+                                  { key: "#00F57A", name: "Electric Mint" },
+                                  { key: "#E879F9", name: "Neon Fuchsia" },
+                                  { key: "#22D3EE", name: "Sky Cyan" },
+                                  { key: "#FF6B35", name: "Flame Orange" },
+                                  { key: "#FF1E2D", name: "Scarlet Red" },
+                                ]).map((sw) => {
+                                  const active = form.caption_color === sw.key;
+                                  return (
+                                    <button
+                                      key={sw.key || "default"}
+                                      type="button"
+                                      onClick={() => setForm({ ...form, caption_color: sw.key })}
+                                      className={cn(
+                                        "inline-flex h-7 items-center gap-1 rounded-full border px-2 text-[11px] transition-colors",
+                                        active ? "border-primary bg-primary/15 text-foreground" : "border-white/15 text-muted-foreground hover:bg-white/5",
+                                      )}
+                                    >
+                                      <span
+                                        className="size-2.5 rounded-full border border-white/25"
+                                        style={sw.key ? { backgroundColor: sw.key } : { background: "conic-gradient(#FFE600, #00F57A, #E879F9, #22D3EE, #FFE600)" }}
+                                      />
+                                      {sw.name}
+                                    </button>
+                                  );
+                                })}
+                                <label className="inline-flex h-7 cursor-pointer items-center gap-1 rounded-full border border-white/15 px-2 text-[11px] text-muted-foreground hover:bg-white/5">
+                                  <input
+                                    type="color"
+                                    aria-label="Clip custom caption color"
+                                    value={form.caption_color || "#FFE600"}
+                                    onChange={(e) => setForm({ ...form, caption_color: e.target.value.toUpperCase() })}
+                                    className="size-3.5 cursor-pointer rounded border-0 bg-transparent p-0"
+                                  />
+                                  Custom
+                                </label>
+                              </div>
+                            </div>
                             <label className="flex items-center justify-between gap-2 text-muted-foreground">
                               <span>Auto emojis</span>
                               <select value={form.auto_emoji} onChange={(e) => setForm({ ...form, auto_emoji: e.target.value })} className={MINI_SELECT}>

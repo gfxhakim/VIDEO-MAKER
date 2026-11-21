@@ -20,7 +20,7 @@ class GenerationSettings(BaseModel):
     playback_speed: float = Field(1.0, ge=0.75, le=1.5)
     auto_emoji: bool = True
     hook_title: bool = False  # force the hook-title card on any style
-    hook_card_style: Literal["light", "dark", "accent", "glass"] = "light"
+    hook_card_style: Literal["light", "dark", "accent", "glass", "viral_yellow", "breaking_red"] = "light"
     hook_card_duration: float = Field(0.0, ge=0.0, le=30.0)  # 0 = full clip, >0 = fade out after N seconds
     music_track_ids: list[int] = Field(default_factory=list)
     music_volume: float = Field(0.18, ge=0.0, le=1.0)
@@ -37,6 +37,15 @@ class GenerationSettings(BaseModel):
     use_ai: bool = False
     language: Optional[str] = None  # None = auto detect
     caption_position: Optional[float] = Field(None, ge=0.1, le=0.9)  # override, fraction of height
+    caption_color: Optional[str] = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
+
+    @field_validator("caption_color", mode="before")
+    @classmethod
+    def _clean_caption_color(cls, v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s.upper() if s else None
 
     @field_validator("max_duration")
     @classmethod

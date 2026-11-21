@@ -73,8 +73,16 @@ def _merge_overrides(current: dict[str, Any] | None, patch: dict[str, Any]) -> d
             if not (0.75 <= spd <= 1.5):
                 raise HTTPException(400, "playback_speed must be between 0.75 and 1.5")
             v = spd
-        if k == "hook_card_style" and v not in ("light", "dark", "accent", "glass"):
+        if k == "hook_card_style" and v not in ("light", "dark", "accent", "glass", "viral_yellow", "breaking_red"):
             raise HTTPException(400, f"Unknown hook_card_style '{v}'")
+        if k == "caption_color":
+            sv = str(v).strip()
+            if not sv:
+                merged.pop(k, None)
+                continue
+            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", sv):
+                raise HTTPException(400, f"Invalid caption_color '{v}'")
+            v = sv.upper()
         if k == "hook_card_duration":
             v = max(0.0, min(30.0, float(v)))
         if k == "music_volume":
@@ -352,7 +360,7 @@ def create_manual_clip(pid: int, body: ManualClipCreate, request: Request, user:
     next_rank = max((c.rank for c in existing), default=0) + 1
     music_ids = list((p.settings or {}).get("music_track_ids") or [])
     title = (body.title or "").strip() or highlights.make_title("", text)
-    hook = (body.hook or "").strip() or title[:90]
+    hook = (body.hook or "").strip() or highlights.make_hook_text("", text)
     clip = Clip(
         project_id=pid,
         rank=next_rank,

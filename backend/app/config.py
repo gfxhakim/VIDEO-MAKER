@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # worker
     embedded_worker: bool = True
     worker_concurrency: int = 0  # jobs run side by side; 0 = decide from the CPU cores and memory available
-    worker_poll_seconds: float = 1.5
+    worker_poll_seconds: float = 0.35
     job_max_attempts: int = 3
 
     # ffmpeg
@@ -65,7 +65,8 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
 
     # uploads (chunked + resumable, see api/uploads.py)
-    upload_chunk_mb: int = 4
+    upload_chunk_mb: int = 8
+    upload_fsync: bool = False  # set true if storing temp uploads and projects on separate devices
     max_upload_gb: float = 10
     upload_ttl_hours: int = 24  # unfinished uploads are deleted after this long without a new chunk
     upload_min_free_mb: int = 512  # keep this much of the volume free for renders
@@ -280,9 +281,9 @@ def memory_limit_bytes() -> int:
 
 
 def auto_worker_concurrency() -> int:
-    by_cpu = min(3, effective_cpus() // 2)
+    by_cpu = min(3, max(1, (effective_cpus() + 1) // 2))
     mem = memory_limit_bytes()
-    by_mem = 3 if not mem else int(mem // (2 * 1024**3))
+    by_mem = 3 if not mem else max(1, int(mem // int(1.6 * 1024**3)))
     return max(1, min(by_cpu, by_mem))
 
 

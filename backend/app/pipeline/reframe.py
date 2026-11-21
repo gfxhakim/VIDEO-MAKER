@@ -119,7 +119,7 @@ def _get_cascades():
     return pair
 
 
-def analyze_faces(src: str | Path, start: float, end: float, sample_fps: float = 4.0, det_width: int = 480) -> FaceTrack:
+def analyze_faces(src: str | Path, start: float, end: float, sample_fps: float = 2.0, det_width: int = 360) -> FaceTrack:
     try:
         import cv2
     except ImportError:
@@ -328,7 +328,7 @@ def build_layout(
 ) -> LayoutResult:
     """Return the video filtergraph for one clip. Input label [0:v], output label [vbase]."""
     zoom_windows = zoom_windows or []
-    lanczos = "flags=lanczos"
+    scaler = "flags=bicubic"
     target_ar = out_w / out_h
     if src_w / src_h > target_ar:
         cw, ch = _even(src_h * target_ar), _even(src_h)
@@ -343,31 +343,32 @@ def build_layout(
 
     def post_zoom(label_in: str, w: int, h: int, fy: float = 0.4, base_w: int | None = None, base_h: int | None = None) -> str:
         if zoom == "1":
-            return f"[{label_in}]scale={w}:{h}:{lanczos},setsar=1[vbase]"
+            return f"[{label_in}]scale={w}:{h}:{scaler},setsar=1[vbase]"
         amount = float(style.get("zoom_amount", 1.15))
         bw, bh = base_w or cw, base_h or ch
         zw, zh = min(bw, _even(bw / amount)), min(bh, _even(bh / amount))
         cond = "gt(" + "+".join(f"between(t,{a:.2f},{b:.2f})" for a, b in zoom_windows[:40]) + ",0)"
-        return (f"[{label_in}]split=2[zn][zz];"
-                f"[zn]scale={w}:{h}:{lanczos}[zbase];"
-                f"[zz]crop={zw}:{zh}:(iw-{zw})/2:(ih-{zh})*{fy:.2f},scale={w}:{h}:{lanczos}[zin];"
-                f"[zbase][zin]overlay=0:0:enable='{cond}',setsar=1[vbase]")
+        return (
+            f"[{label_in}]crop=w='if({cond},{zw},{bw})':h='if({cond},{zh},{bh})':"
+            f"x='if({cond},(iw-{zw})/2,(iw-{bw})/2)':y='if({cond},(ih-{zh})*{fy:.2f},(ih-{bh})/2)':exact=1,"
+            f"scale={w}:{h}:{scaler}:eval=frame,setsar=1[vbase]"
+        )
 
     if layout == "broll_split":
         if has_broll:
-            res = _broll_split(src_w, src_h, out_w, out_h, track, lanczos, scene_cuts=scene_cuts, style=style)
+            res = _broll_split(src_w, src_h, out_w, out_h, track, scaler, scene_cuts=scene_cuts, style=style)
             if res:
                 return res
         layout = "face_track"
 
     if layout == "split_faces":
-        res = _split_faces(src_w, src_h, out_w, out_h, track, lanczos)
+        res = _split_faces(src_w, src_h, out_w, out_h, track, scaler)
         if res:
             return res
         layout = "face_track"
 
     if layout == "gameplay_facecam":
-        res = _gameplay_facecam(src_w, src_h, out_w, out_h, track, lanczos,
+        res = _gameplay_facecam(src_w, src_h, out_w, out_h, track, scaler,
                                 post_zoom=post_zoom if zoom != "1" else None)
         if res:
             return res
@@ -378,8 +379,8 @@ def build_layout(
         return LayoutResult(
             f"[0:v]split=2[bgsrc][fgsrc];"
             f"[bgsrc]scale={out_w // 4}:{out_h // 4}:force_original_aspect_ratio=increase,crop={out_w // 4}:{out_h // 4},"
-            f"gblur=sigma=12,eq=brightness=-0.06:saturation=1.1,scale={out_w}:{out_h}[bg];"
-            f"[fgsrc]scale={out_w}:-2:{lanczos}[fg];"
+            f"gblur=sigma=12,eq=brightness=-0.06:saturation=1.1,scale={out_w}:{out_h}:flags=fast_bilinear[bg];"
+            f"[fgsrc]scale={out_w}:-2:{scaler}[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)*{fy:.2f},setsar=1[vbase]",
             "blur_fill",
         )

@@ -97,8 +97,96 @@ class _Background:
             raise self._error
         return self._result
 
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
     def wait(self, timeout: Optional[float] = None) -> None:
         self._thread.join(timeout)
+
+
+_CACHE_LOCK = threading.Lock()
+_PROBE_CACHE: dict[tuple[str, int, int, int], media.MediaInfo] = {}
+_WORDS_CACHE: dict[tuple[str, int, int, int], list[dict]] = {}
+_ENERGY_CACHE: dict[tuple[str, int, int, int], np.ndarray] = {}
+
+
+def _stat_key(path: Path) -> Optional[tuple[str, int, int, int]]:
+    try:
+        st = path.stat()
+        return (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _probe_cached(source: Path, pdir: Path) -> media.MediaInfo:
+    skey = _stat_key(source)
+    if skey is not None:
+        with _CACHE_LOCK:
+            hit = _PROBE_CACHE.get(skey)
+        if hit is not None:
+            return hit
+    info_path = pdir / "source_info.json"
+    if _fresh(info_path, source):
+        d = _load_json(info_path)
+        if isinstance(d, dict) and {"duration", "width", "height", "fps", "has_audio"} <= set(d):
+            info = media.MediaInfo(
+                duration=float(d["duration"]), width=int(d["width"]),
+                height=int(d["height"]), fps=float(d["fps"]), has_audio=bool(d["has_audio"]),
+            )
+            if skey is not None:
+                with _CACHE_LOCK:
+                    if len(_PROBE_CACHE) > 64:
+                        _PROBE_CACHE.clear()
+                    _PROBE_CACHE[skey] = info
+            return info
+    info = media.probe(source)
+    try:
+        _write_json(info_path, {
+            "duration": info.duration, "width": info.width,
+            "height": info.height, "fps": info.fps, "has_audio": info.has_audio,
+        })
+    except OSError:
+        pass
+    if skey is not None:
+        with _CACHE_LOCK:
+            if len(_PROBE_CACHE) > 64:
+                _PROBE_CACHE.clear()
+            _PROBE_CACHE[skey] = info
+    return info
+
+
+def _transcript_words_cached(tpath: Path) -> list[dict]:
+    skey = _stat_key(tpath)
+    if skey is None:
+        return []
+    with _CACHE_LOCK:
+        hit = _WORDS_CACHE.get(skey)
+    if hit is not None:
+        return hit
+    data = _load_json(tpath)
+    words = data.get("words", []) if isinstance(data, dict) else []
+    with _CACHE_LOCK:
+        if len(_WORDS_CACHE) > 32:
+            _WORDS_CACHE.clear()
+        _WORDS_CACHE[skey] = words
+    return words
+
+
+def _energy_cached(epath: Path) -> np.ndarray:
+    skey = _stat_key(epath)
+    if skey is None:
+        return np.zeros(0)
+    with _CACHE_LOCK:
+        hit = _ENERGY_CACHE.get(skey)
+    if hit is not None:
+        return hit
+    arr = np.load(epath)
+    arr.setflags(write=False)
+    with _CACHE_LOCK:
+        if len(_ENERGY_CACHE) > 16:
+            _ENERGY_CACHE.clear()
+        _ENERGY_CACHE[skey] = arr
+    return arr
 
 
 def _fresh(cache: Path, source: Path) -> bool:
@@ -137,8 +225,7 @@ def words_for_clip(clip: Clip, pdir: Path) -> list[dict]:
             for w in clip.words_override
             if str(w.get("word", "")).strip()
         ]
-    tpath = pdir / "transcript.json"
-    all_words = _load_json(tpath).get("words", []) if tpath.exists() and isinstance(_load_json(tpath), dict) else []
+    all_words = _transcript_words_cached(pdir / "transcript.json")
     return captions.clip_words(all_words, clip.start, clip.end)
 
 
@@ -224,10 +311,14 @@ def _analyze(payload: dict) -> None:
         if not path.exists():
             raise media.MediaError("Uploaded file is missing (or raw source was deleted)")
 
-    info = media.probe(path)
+    info = _probe_cached(path, pdir)
     _update_project(pid, created=created, duration=info.duration, width=info.width, height=info.height)
     if info.duration < 8:
         raise media.MediaError("Video is too short (need at least 8 seconds)")
+
+    win_start = max(0.0, float(source_start or 0.0))
+    win_end = min(info.duration, float(source_end)) if source_end and source_end > win_start + 5 else info.duration
+    is_trimmed = win_start > 0.0 or win_end < info.duration - 0.5
 
     # 2. scene cuts start now, in the background ---------------------------------
     scenes_path = pdir / "scenes.json"
@@ -237,7 +328,11 @@ def _analyze(payload: dict) -> None:
     if not isinstance(cuts, list):
         cuts = None
         spare = max(1, effective_cpus() - transcribe.whisper_cpu_threads())
-        scan = _Background(media.scan_scene_changes, path, threads=min(spare, ffmpeg_thread_count()), stop=stop_scan)
+        scan_kw: dict[str, Any] = {"threads": min(spare, ffmpeg_thread_count()), "stop": stop_scan}
+        if is_trimmed:
+            scan_kw["start"] = win_start
+            scan_kw["end"] = win_end
+        scan = _Background(media.scan_scene_changes, path, **scan_kw)
 
     try:
         words: list[dict] = []
@@ -247,15 +342,23 @@ def _analyze(payload: dict) -> None:
             words = [w for w in words if w["start"] < info.duration]
 
         if scan is not None:
-            stage("Detecting scene changes", 0.62)
-            try:
-                cuts = scan.result()
-            except media.MediaError as e:
-                log.warning("%s", e)
+            if words:
+                scan.wait(12.0)
+            if words and not scan.done():
+                log.info("project %s: scene scan exceeded 12s grace window after speech transcription; continuing", pid)
+                stop_scan.set()
                 cuts = []
             else:
-                _still_current(pid, created)
-                _write_json(scenes_path, cuts)
+                stage("Detecting scene changes", 0.62)
+                try:
+                    cuts = scan.result()
+                except media.MediaError as e:
+                    log.warning("%s", e)
+                    cuts = []
+                else:
+                    _still_current(pid, created)
+                    if not is_trimmed:
+                        _write_json(scenes_path, cuts)
     finally:
         stop_scan.set()
         if scan is not None:
@@ -263,8 +366,6 @@ def _analyze(payload: dict) -> None:
 
     # 5. scoring (respecting optional source_start / source_end range) ----------
     stage("Scoring viral moments", 0.68)
-    win_start = max(0.0, float(source_start or 0.0))
-    win_end = min(info.duration, float(source_end)) if source_end and source_end > win_start + 5 else info.duration
     if win_start > 0 or win_end < info.duration:
         sub_dur = win_end - win_start
         sub_words = captions.clip_words(words, win_start, win_end)
@@ -307,7 +408,7 @@ def _analyze(payload: dict) -> None:
         for rank, c in enumerate(chosen, start=1):
             clip = Clip(
                 project_id=pid, rank=rank, start=round(c.start, 3), end=round(c.end, 3), score=c.score,
-                score_breakdown=c.breakdown, transcript=c.text, hook=highlights.make_title(c.hook, c.text, 90),
+                score_breakdown=c.breakdown, transcript=c.text, hook=highlights.make_hook_text(c.hook, c.text),
                 title=highlights.make_title(c.hook, c.text), hashtags=highlights.make_hashtags(c.text),
                 description=(c.text[:280] + ("…" if len(c.text) > 280 else "")),
                 music_track_id=music_ids[(rank - 1) % len(music_ids)] if music_ids else None,
@@ -555,13 +656,13 @@ def _render(payload: dict) -> None:
             words = [{"word": str(w["word"]).strip(), "start": float(w["start"]), "end": float(w["end"])}
                      for w in words_override if str(w.get("word", "")).strip()]
         else:
-            all_words = json.loads(tpath.read_text()).get("words", []) if tpath.exists() else []
+            all_words = _transcript_words_cached(tpath)
             words = captions.clip_words(all_words, start, end)
 
-        energy = np.load(pdir / "energy.npy") if (pdir / "energy.npy").exists() else np.zeros(0)
+        energy = _energy_cached(pdir / "energy.npy")
         scenes_all = _load_json(pdir / "scenes.json")
         scene_cuts = [float(c) - start for c in (scenes_all or []) if start < float(c) < end] if isinstance(scenes_all, list) else []
-        info = media.probe(source)
+        info = _probe_cached(source, pdir)
 
         # optional silence removal (jump-cut)
         keep_segments = None
@@ -627,21 +728,9 @@ def _render(payload: dict) -> None:
             fps=info.fps,
         )
 
-        # captions
-        caption_y = settings.get("caption_position") or style.get("caption_y", 0.62)
-        if lay.layout_used in ("split_faces", "gameplay_facecam", "broll_split") and not settings.get("caption_position"):
-            caption_y = 0.55 if lay.layout_used in ("gameplay_facecam", "broll_split") else 0.5
-        if cap_style and words:
-            ass, cues = captions.build_ass(words, cap_style, out_w=out_w, out_h=out_h, caption_y=caption_y,
-                                           clip_duration=dur, auto_emoji=bool(settings.get("auto_emoji", True)))
-            spec.ass_path = captions.write_ass(work / "captions.ass", ass)
-            spec.emoji = cues
-            scale_factor = min(out_w, out_h) / 1080.0
-            cap_px = int(cap_style.get("size", 90)) * scale_factor
-            em_offset = int(cap_px * 1.45 + 140 * scale_factor)
-            spec.emoji_y = max(int(out_h * 0.04), int(out_h * caption_y) - em_offset)
-
         # hook title card
+        scale_factor = min(out_w, out_h) / 1080.0
+        hook_bottom = int(out_h * 0.04)
         if (style.get("hook_card") or settings.get("hook_title")) and hook_text:
             png, cw, ch = hook_card.render_hook_card(
                 hook_text, work / "hook.png", out_w=out_w,
@@ -655,6 +744,23 @@ def _render(payload: dict) -> None:
                 y = int(out_h * 0.08)
             spec.hook_png, spec.hook_xy = png, ((out_w - cw) // 2, y)
             spec.hook_duration = float(settings.get("hook_card_duration", 0.0) or 0.0)
+            hook_bottom = y + ch + int(round(16 * scale_factor))
+
+        # captions
+        caption_y = settings.get("caption_position") or style.get("caption_y", 0.62)
+        if lay.layout_used in ("split_faces", "gameplay_facecam", "broll_split") and not settings.get("caption_position"):
+            caption_y = 0.55 if lay.layout_used in ("gameplay_facecam", "broll_split") else 0.5
+        if cap_style and words:
+            ass, cues = captions.build_ass(
+                words, cap_style, out_w=out_w, out_h=out_h, caption_y=caption_y,
+                clip_duration=dur, auto_emoji=bool(settings.get("auto_emoji", True)),
+                caption_color=settings.get("caption_color"),
+            )
+            spec.ass_path = captions.write_ass(work / "captions.ass", ass)
+            spec.emoji = cues
+            cap_px = int(cap_style.get("size", 90)) * scale_factor
+            em_offset = int(cap_px * 1.45 + 150 * scale_factor)
+            spec.emoji_y = max(hook_bottom, int(out_h * caption_y) - em_offset)
 
         # music + drop sync
         if music_info and music_info[0].exists():

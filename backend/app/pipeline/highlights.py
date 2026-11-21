@@ -571,6 +571,44 @@ def make_title(hook: str, text: str, max_len: int = 80) -> str:
     return base
 
 
+def make_hook_text(hook: str, text: str, max_len: int = 58) -> str:
+    """Short, punchy headline with a contextual iOS emoji for the visual hook card."""
+    base = (hook or text or "").strip()
+    base = re.sub(r"\s+", " ", base)
+    cleaned = LEADING_FILLER.sub("", base).strip()
+    if len(cleaned) >= 10:
+        base = cleaned
+    if not base:
+        return "Wait for it 🔥"
+    clauses = [c.strip(" ,;:-") for c in re.split(r"(?<=[.!?])\s+|[,;—–]\s+", base) if c.strip(" ,;:-")]
+    picked = clauses[0] if clauses else base
+    if len(picked.split()) < 3 and len(clauses) > 1 and len(picked) + len(clauses[1]) + 2 <= max_len - 3:
+        picked = f"{picked}, {clauses[1]}"
+    base = picked.rstrip(".,;:-") or "Wait for it"
+    base = base[0].upper() + base[1:]
+    has_emoji = any(ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27BF for ch in base)
+    limit = max_len - (0 if has_emoji else 3)
+    if len(base) > limit:
+        cut = base[: limit - 1].rsplit(" ", 1)[0].rstrip(".,;:-")
+        base = (cut or base[: limit - 1]) + "…"
+    if not has_emoji:
+        from .captions import emoji_for
+        found = None
+        for tok in base.split():
+            found = emoji_for(tok)
+            if found:
+                break
+        if not found and text:
+            for tok in text.split()[:20]:
+                found = emoji_for(tok)
+                if found:
+                    break
+        if not found:
+            found = "🤯" if ("?" in base or "!" in base) else "🔥"
+        base = f"{base} {found}"
+    return base
+
+
 def make_hashtags(text: str, n: int = 4) -> list[str]:
     toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z']{3,}", text)]
     counts = Counter(t for t in toks if t not in STOPWORDS and "'" not in t)

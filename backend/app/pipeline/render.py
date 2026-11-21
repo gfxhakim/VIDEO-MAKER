@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from ..config import ffmpeg_thread_count, get_settings, nice_prefix
 from .captions import EmojiCue
@@ -88,6 +89,34 @@ def _render_watermark_png(text: str, dst: Path, out_w: int) -> tuple[Path, int, 
     return dst, w, h
 
 
+def _prepare_emoji_png(src_png: Path, size: int, work_dir: Path) -> Path:
+    """Cache pre-scaled iOS emoji PNGs with a soft drop shadow so overlays pop cleanly without per-render FFmpeg scaling."""
+    if not src_png.exists():
+        return src_png
+    pad = max(8, size // 12)
+    key = f"{src_png.stem}_{size}.png"
+    for base_dir in (get_settings().models_dir / "emoji_cache", work_dir):
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+            dst = base_dir / key
+            if dst.exists() and dst.stat().st_size > 0 and dst.stat().st_mtime >= src_png.stat().st_mtime:
+                return dst
+            em = Image.open(src_png).convert("RGBA").resize((size, size), Image.LANCZOS)
+            w = size + pad * 2
+            alpha = em.split()[3]
+            sh = Image.new("RGBA", (w, w), (0, 0, 0, 0))
+            sh.paste(Image.new("RGBA", (size, size), (0, 0, 0, 145)), (pad, pad + max(3, pad // 2)), mask=alpha)
+            sh = sh.filter(ImageFilter.GaussianBlur(max(4, pad // 2)))
+            sh.paste(em, (pad, pad), em)
+            tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+            sh.save(tmp, format="PNG")
+            os.replace(tmp, dst)
+            return dst
+        except OSError:
+            continue
+    return src_png
+
+
 def build_command(spec: RenderSpec) -> list[str]:
     s = get_settings()
     src_dur = spec.end - spec.start
@@ -115,8 +144,13 @@ def build_command(spec: RenderSpec) -> list[str]:
         music_idx = n_inputs
         n_inputs += 1
     hook_idx = None
+    hook_fade = False
     if spec.hook_png:
-        cmd += ["-i", str(spec.hook_png)]
+        if spec.hook_duration > 0.35:
+            cmd += ["-loop", "1", "-r", "30", "-t", f"{spec.hook_duration + 0.08:.2f}", "-i", str(spec.hook_png)]
+            hook_fade = True
+        else:
+            cmd += ["-i", str(spec.hook_png)]
         hook_idx = n_inputs
         n_inputs += 1
     wm_idx = None
@@ -125,9 +159,11 @@ def build_command(spec: RenderSpec) -> list[str]:
         cmd += ["-i", str(wm_path)]
         wm_idx = n_inputs
         n_inputs += 1
+    em_size = max(84, min(164, int(round(160 * (min(spec.out_w, spec.out_h) / 1080.0)))))
+    prep_emoji = [_prepare_emoji_png(cue.png, em_size, spec.work_dir) for cue in spec.emoji]
     emoji_idx = []
-    for cue in spec.emoji:
-        cmd += ["-i", str(cue.png)]
+    for png in prep_emoji:
+        cmd += ["-i", str(png)]
         emoji_idx.append(n_inputs)
         n_inputs += 1
 
@@ -173,14 +209,29 @@ def build_command(spec: RenderSpec) -> list[str]:
         last = "vsub"
     if hook_idx is not None:
         x, y = spec.hook_xy
-        en = f":enable='between(t,0,{spec.hook_duration:.2f})'" if spec.hook_duration > 0 else ""
-        parts.append(f"[{last}][{hook_idx}:v]overlay={x}:{y}:format=auto{en}[vhook]")
+        slide_y = f"'{y}-round(max(0,1-t/0.18)*22)'"
+        if hook_fade:
+            d_in = min(0.14, spec.hook_duration / 3.0)
+            d_out = min(0.25, spec.hook_duration / 2.0)
+            st_out = max(0.0, spec.hook_duration - d_out)
+            parts.append(
+                f"[{hook_idx}:v]format=rgba,fade=t=in:st=0:d={d_in:.2f}:alpha=1,fade=t=out:st={st_out:.2f}:d={d_out:.2f}:alpha=1[hkfade]"
+            )
+            parts.append(
+                f"[{last}][hkfade]overlay=x={x}:y={slide_y}:format=auto:eof_action=pass:enable='between(t,0,{spec.hook_duration:.2f})'[vhook]"
+            )
+        else:
+            en = f":enable='between(t,0,{spec.hook_duration:.2f})'" if spec.hook_duration > 0 else ""
+            parts.append(f"[{last}][{hook_idx}:v]overlay=x={x}:y={slide_y}:format=auto{en}[vhook]")
         last = "vhook"
-    em_size = max(84, min(156, int(round(150 * (min(spec.out_w, spec.out_h) / 1080.0)))))
-    for i, (cue, idx) in enumerate(zip(spec.emoji, emoji_idx)):
-        parts.append(f"[{idx}:v]scale={em_size}:{em_size}[em{i}]")
+    for i, (cue, prep, idx) in enumerate(zip(spec.emoji, prep_emoji, emoji_idx)):
+        src_ref = f"[{idx}:v]"
+        if prep == cue.png:
+            parts.append(f"[{idx}:v]scale={em_size}:{em_size}[em{i}]")
+            src_ref = f"[em{i}]"
+        em_y = f"'{spec.emoji_y}-round(max(0,1-(t-{cue.start:.2f})/0.16)*26)'"
         parts.append(
-            f"[{last}][em{i}]overlay=(W-w)/2:{spec.emoji_y}:enable='between(t,{cue.start:.2f},{cue.end:.2f})'[ve{i}]"
+            f"[{last}]{src_ref}overlay=x=(W-w)/2:y={em_y}:enable='between(t,{cue.start:.2f},{cue.end:.2f})'[ve{i}]"
         )
         last = f"ve{i}"
     if wm_idx is not None:
@@ -213,7 +264,7 @@ def build_command(spec: RenderSpec) -> list[str]:
         if spec.denoise_audio:
             achain.append("highpass=f=80,afftdn=nf=-22")
         if spec.normalize_audio:
-            achain.append("loudnorm=I=-14:TP=-1.5:LRA=11")
+            achain.append("acompressor=threshold=-18dB:ratio=3:attack=8:release=120:makeup=2,alimiter=limit=0.89:attack=5:release=50")
         if dur > 0.2:
             achain.append(f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, dur - 0.05):.3f}:d=0.05")
         voice_filters = ",".join(achain)

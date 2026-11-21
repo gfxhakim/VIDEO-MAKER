@@ -63,7 +63,18 @@ def _emoji_png(emoji: str) -> Optional[Path]:
 
 
 def emoji_for(word: str) -> Optional[str]:
-    """Match a spoken word (or safe inflected form) to an emoji without false substring hits."""
+    """Match a spoken word (or safe inflected form) or viral token pattern to an emoji."""
+    raw = word.strip()
+    if raw:
+        trimmed = raw.strip(".,\"'()")
+        if "?!" in raw or "!?" in raw:
+            return "🤯"
+        if re.search(r"[$€£]", trimmed) or re.match(r"^\d+(?:[.,]\d+)?[kKbB]$", trimmed):
+            return "💸"
+        if re.match(r"^\d+(?:[.,]\d+)?%$", trimmed.rstrip("!?")):
+            return "📈"
+        if re.match(r"^\d+(?:[.,]\d+)?[xX]$", trimmed.rstrip("!?")):
+            return "🚀"
     w = re.sub(r"[^a-z]", "", word.lower())
     if len(w) < 2:
         return None
@@ -155,7 +166,7 @@ def _wrap_chunk(chunk: list[dict], fmt_fn, *, max_px: float, font_name: str, siz
 
 
 def build_ass(words: list[dict], style: dict, *, out_w: int, out_h: int, caption_y: float, clip_duration: float,
-              auto_emoji: bool = True) -> tuple[str, list[EmojiCue]]:
+              auto_emoji: bool = True, caption_color: Optional[str] = None) -> tuple[str, list[EmojiCue]]:
     """words: clip-relative [{word,start,end}]. Returns (ass_text, emoji cues)."""
     font = style.get("font", "Montserrat")
     # Scale font gently for square/landscape ratios while keeping 1080-wide defaults identical
@@ -169,7 +180,12 @@ def build_ass(words: list[dict], style: dict, *, out_w: int, out_h: int, caption
     primary = style.get("primary", "#FFFFFF")
     highlight = style.get("highlight", "#FFE500")
     accent = style.get("accent", highlight)
-    cycle = style.get("accent_cycle") or [accent]
+    cycle = list(style.get("accent_cycle") or [accent])
+    if caption_color and re.fullmatch(r"#[0-9A-Fa-f]{6}", caption_color.strip()):
+        cc = caption_color.strip().upper()
+        highlight = cc
+        accent = cc
+        cycle = [cc, "#FFFFFF", cc]
     glow = float(style.get("glow", 0)) * scale_factor
     bounce = float(style.get("bounce", 1.0))
     upper = bool(style.get("uppercase", False))
@@ -193,7 +209,7 @@ YCbCr Matrix: TV.709
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Main,{font},{size},{_ass_color(primary)},{_ass_color(highlight)},{_ass_color(outline_col, outline_alpha)},&H96000000,{-1 if weight >= 600 else 0},{italic},0,0,100,100,{spacing:.1f},0,{border_style},{outline:.1f},{shadow:.1f},5,70,70,0,1
+Style: Main,{font},{size},{_ass_color(primary)},{_ass_color(highlight)},{_ass_color(outline_col, outline_alpha)},&H44000000,{-1 if weight >= 600 else 0},{italic},0,0,100,100,{spacing:.1f},0,{border_style},{outline:.1f},{shadow:.1f},5,70,70,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -202,6 +218,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     cues: list[EmojiCue] = []
     base = f"\\an5\\pos({x},{y})\\b{weight}"
     pop = (f"\\fscx{int(bounce * 100)}\\fscy{int(bounce * 100)}\\t(0,110,\\fscx100\\fscy100)" if bounce > 1.0 else "")
+    active_pop = (
+        f"\\fscx{max(110, int(round(bounce * 100)))}\\fscy{max(110, int(round(bounce * 100)))}\\t(0,95,\\fscx100\\fscy100)"
+        if bounce > 1.0 else ""
+    )
     cyc = 0
 
     def fmt(w: str) -> str:
@@ -223,13 +243,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     def maybe_emoji(ws: list[dict], a: float, b: float):
         if not auto_emoji:
             return
-        if cues and a - cues[-1].end < 1.2:
+        if cues and a - cues[-1].end < 0.85:
             return
         for w in ws:
             e = emoji_for(w["word"])
             png = _emoji_png(e) if e else None
             if png:
-                cues.append(EmojiCue(a, b, png))
+                end_t = min(clip_duration, max(b, a + 0.85))
+                if end_t - a >= 0.18:
+                    cues.append(EmojiCue(a, end_t, png))
                 return
 
     if mode == "word":
@@ -284,7 +306,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     for k, o in ln:
                         plain_parts.append(fmt(o["word"]))
                         if k == j:
-                            parts.append(f"{{\\1c{_ass_color(highlight)}{pop}}}{fmt(o['word'])}{{\\r}}")
+                            parts.append(f"{{\\1c{_ass_color(highlight)}{active_pop}}}{fmt(o['word'])}{{\\r}}")
                         elif is_keyword(o["word"]):
                             parts.append(f"{{\\1c{_ass_color(accent)}}}{fmt(o['word'])}{{\\r}}")
                         else:

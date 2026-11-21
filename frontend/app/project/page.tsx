@@ -275,6 +275,8 @@ function ProjectView() {
   const [batchEffect, setBatchEffect] = useState("");
   const [batchSpeed, setBatchSpeed] = useState("");
   const [batchCaption, setBatchCaption] = useState("");
+  const [batchCaptionColor, setBatchCaptionColor] = useState("");
+  const [batchHookTheme, setBatchHookTheme] = useState("");
   const [batchMusic, setBatchMusic] = useState("__keep__");
   const [batchSilences, setBatchSilences] = useState("");
 
@@ -350,11 +352,13 @@ function ProjectView() {
     if (batchEffect) overrides.video_effect = batchEffect;
     if (batchSpeed) overrides.playback_speed = Number(batchSpeed);
     if (batchCaption) overrides.caption_style = batchCaption;
+    if (batchCaptionColor) overrides.caption_color = batchCaptionColor;
+    if (batchHookTheme) overrides.hook_card_style = batchHookTheme;
     if (batchSilences) overrides.remove_silences = batchSilences === "true";
     const clear_music = batchMusic === "__clear__";
     const music_track_id = !clear_music && batchMusic !== "__keep__" ? Number(batchMusic) : undefined;
     if (!Object.keys(overrides).length && !clear_music && music_track_id == null) {
-      return void toast("Pick at least one FX, speed, caption, or music change to apply");
+      return void toast("Pick at least one FX, speed, caption, hook, or music change to apply");
     }
     setBulkBusy(true);
     try {
@@ -363,6 +367,8 @@ function ProjectView() {
       setBatchEffect("");
       setBatchSpeed("");
       setBatchCaption("");
+      setBatchCaptionColor("");
+      setBatchHookTheme("");
       setBatchMusic("__keep__");
       setBatchSilences("");
       setSelected(new Set());
@@ -727,6 +733,29 @@ function ProjectView() {
                     <option key={s.key} value={s.key}>{s.name}</option>
                   ))}
                   <option value="none">No captions</option>
+                </select>
+              </label>
+              <label className="text-muted-foreground">Caption highlight color
+                <select value={batchCaptionColor} onChange={(e) => setBatchCaptionColor(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="">Keep existing</option>
+                  {(presets?.caption_colors ?? []).filter((c) => c.key).map((c) => (
+                    <option key={c.key} value={c.key}>{c.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-muted-foreground">Hook card theme
+                <select value={batchHookTheme} onChange={(e) => setBatchHookTheme(e.target.value)} className="mt-1 h-9 w-full rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-xs text-foreground">
+                  <option value="">Keep existing</option>
+                  {(presets?.hook_card_styles ?? [
+                    { key: "light", name: "Light pill" },
+                    { key: "dark", name: "Dark pill" },
+                    { key: "accent", name: "Brand gradient" },
+                    { key: "glass", name: "Frosted glass" },
+                    { key: "viral_yellow", name: "Viral Gold Banner" },
+                    { key: "breaking_red", name: "Breaking Alert" },
+                  ]).map((h) => (
+                    <option key={h.key} value={h.key}>{h.name}</option>
+                  ))}
                 </select>
               </label>
               <label className="text-muted-foreground">Auto jump-cut awkward silences

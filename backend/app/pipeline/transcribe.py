@@ -93,8 +93,10 @@ def _local(audio_path: Path, language, on_progress, duration) -> dict:
     t0 = time.monotonic()
     segments_iter, info = model.transcribe(
         samples, language=language, word_timestamps=True, vad_filter=True,
-        beam_size=1,  # greedy decoding: much faster on CPU, tiny accuracy cost
-        best_of=2, temperature=(0.0, 0.4, 0.8),  # fewer, cheaper retries on hard segments
+        vad_parameters={"min_silence_duration_ms": 400},
+        beam_size=1,
+        best_of=1,
+        temperature=(0.0, 0.4),
         condition_on_previous_text=False,
     )
     words, segments = [], []

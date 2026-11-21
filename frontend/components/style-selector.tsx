@@ -306,7 +306,7 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
                     data-caption-tile={c.key}
                     className="@container-[size] block aspect-[5/2] w-full overflow-hidden rounded-t-[calc(var(--radius)-1px)] bg-gradient-to-br from-zinc-700 via-zinc-800 to-zinc-900"
                   >
-                    <CaptionPreview style={c} animate={on || hover === c.key} showEmoji={value.auto_emoji} />
+                    <CaptionPreview style={c} animate={on || hover === c.key} showEmoji={value.auto_emoji} colorOverride={value.caption_color} />
                   </span>
                   <span className="block px-2 py-1.5">
                     <span className="line-clamp-2 text-xs leading-tight font-medium wrap-anywhere">{c.name}</span>
@@ -342,9 +342,60 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
           </div>
         </section>
 
-        {/* Hook card style + Caption height */}
+        {/* Hook card style + Caption highlight color + Caption height */}
         {(value.caption_style !== "none" || hookOn) && (
           <section className="grid gap-x-8 gap-y-4 rounded-2xl border border-white/10 bg-white/[.02] p-3.5 @2xl:grid-cols-2">
+            {value.caption_style !== "none" && (
+              <div className="@2xl:col-span-2">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-medium">Caption highlight color</span>
+                  <span className="text-[11px] text-muted-foreground">
+                    {value.caption_color ? `Custom accent ${value.caption_color}` : "Using style preset colors"}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(presets.caption_colors ?? [
+                    { key: "", name: "Preset Default" },
+                    { key: "#FFE600", name: "Cyber Gold" },
+                    { key: "#00F57A", name: "Electric Mint" },
+                    { key: "#E879F9", name: "Neon Fuchsia" },
+                    { key: "#22D3EE", name: "Sky Cyan" },
+                    { key: "#FF6B35", name: "Flame Orange" },
+                    { key: "#FF1E2D", name: "Scarlet Red" },
+                  ]).map((sw) => {
+                    const active = (value.caption_color ?? "") === sw.key;
+                    return (
+                      <button
+                        key={sw.key || "default"}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => set("caption_color", sw.key || null)}
+                        className={cn(
+                          "inline-flex min-h-8 items-center gap-1.5 rounded-full border px-2.5 text-xs transition-colors",
+                          active ? "border-primary bg-primary/15 text-foreground" : "border-white/15 text-muted-foreground hover:bg-white/5",
+                        )}
+                      >
+                        <span
+                          className="size-3 rounded-full border border-white/25"
+                          style={sw.key ? { backgroundColor: sw.key } : { background: "conic-gradient(#FFE600, #00F57A, #E879F9, #22D3EE, #FFE600)" }}
+                        />
+                        {sw.name}
+                      </button>
+                    );
+                  })}
+                  <label className="inline-flex min-h-8 cursor-pointer items-center gap-1.5 rounded-full border border-white/15 px-2.5 text-xs text-muted-foreground hover:bg-white/5">
+                    <input
+                      type="color"
+                      aria-label="Custom caption highlight color"
+                      value={value.caption_color || "#FFE600"}
+                      onChange={(e) => set("caption_color", e.target.value.toUpperCase())}
+                      className="size-4 cursor-pointer rounded border-0 bg-transparent p-0"
+                    />
+                    Custom
+                  </label>
+                </div>
+              </div>
+            )}
             {value.caption_style !== "none" && (
               <div>
                 <div className="flex items-center justify-between text-xs">
@@ -384,6 +435,8 @@ export function StyleSelector({ value, onChange }: { value: GenerationSettings; 
                       { key: "dark", name: "Dark pill" },
                       { key: "accent", name: "Brand gradient" },
                       { key: "glass", name: "Frosted glass" },
+                      { key: "viral_yellow", name: "Viral Gold Banner" },
+                      { key: "breaking_red", name: "Breaking Alert" },
                     ]).map((h) => (
                       <option key={h.key} value={h.key}>{h.name}</option>
                     ))}

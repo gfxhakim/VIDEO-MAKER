@@ -165,19 +165,23 @@ def load_pcm(path: str | Path, sr: int = 16000, start: float | None = None, dura
 
 
 def scan_scene_changes(src: str | Path, threshold: float = 0.32, *, threads: int | None = None,
-                       stop: threading.Event | None = None) -> list[float]:
-    """Timestamps of hard cuts. Raises MediaError if ffmpeg fails or the scan is stopped.
-
-    The comparison runs on 2 fps, 160 px wide frames, but ffmpeg still has to decode every
-    frame of the source to get there, so this costs 1.5 to 3 minutes per hour of 1080p
-    video. It needs nothing but the source file, which is why analyze_project runs it in
-    the background next to transcription. Set `stop` to end it early.
-    """
+                       stop: threading.Event | None = None,
+                       start: float | None = None, end: float | None = None) -> list[float]:
+    """Timestamps of hard cuts. Raises MediaError if ffmpeg fails or the scan is stopped."""
     s = get_settings()
+    t_off = max(0.0, float(start or 0.0))
     cmd = [
         *nice_prefix(), s.ffmpeg_bin, "-hide_banner", "-nostats", "-v", "info",
-        "-threads", str(threads or ffmpeg_thread_count()), "-i", str(src), "-an", "-sn", "-dn",
-        "-vf", f"fps=2,scale=160:-2,select='gt(scene,{threshold})',showinfo", "-f", "null", "-",
+        "-skip_frame", "bidir",
+        "-threads", str(threads or ffmpeg_thread_count()),
+    ]
+    if t_off > 0:
+        cmd += ["-ss", f"{t_off:.3f}"]
+    if end is not None and end > t_off + 1.0:
+        cmd += ["-t", f"{end - t_off:.3f}"]
+    cmd += [
+        "-i", str(src), "-an", "-sn", "-dn",
+        "-vf", f"fps=1.5,scale=128:-2:flags=fast_bilinear,select='gt(scene,{threshold})',showinfo", "-f", "null", "-",
     ]
     log.debug("run: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -196,7 +200,7 @@ def scan_scene_changes(src: str | Path, threshold: float = 0.32, *, threads: int
             line = raw.decode(errors="replace")
             if "pts_time:" in line:
                 try:
-                    times.append(float(line.split("pts_time:")[1].split()[0]))
+                    times.append(t_off + float(line.split("pts_time:")[1].split()[0]))
                 except (IndexError, ValueError):
                     pass
             else:
